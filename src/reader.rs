@@ -1,11 +1,15 @@
 //! Bounded Markdown parsing and layout for large documents. Only visible sections
 //! are parsed. The outer variable-height list owns scrolling, never the document.
 use gpui_kit::component::text::TextView;
-use gpui_kit::*;
+use gpui_kit::{prelude::FluentBuilder, *};
 use std::{ops::Range, path::PathBuf, sync::Arc};
 
 const SECTION_BYTES: usize = 2048;
 pub const LARGE_DOCUMENT_BYTES: usize = 256 * 1024;
+/// Above this the editor stops soft-wrapping: wrapping measures every line up
+/// front, which stalls on files this big. Below it, long lines wrap like the
+/// reading view does.
+pub const NO_WRAP_BYTES: usize = 4 * 1024 * 1024;
 
 pub struct Section {
     range: Range<usize>,
@@ -176,6 +180,7 @@ impl Render for LargeReader {
         let source = self.source.clone();
         let sections = self.sections.clone();
         let base = self.base.clone();
+        let last = sections.len().saturating_sub(1);
         let content = list(self.list.clone(), move |index, _, _| {
             let section = &sections[index];
             let text = format!(
@@ -190,6 +195,10 @@ impl Render for LargeReader {
                 .w_full()
                 .min_h(px(24.))
                 .px_10()
+                // Breathing room above the first section and below the last;
+                // part of the list, so it scrolls away with the text.
+                .when(index == 0, |d| d.pt_8())
+                .when(index == last, |d| d.pb_8())
                 .child(
                     div().max_w(px(800.)).mx_auto().w_full().child(
                         TextView::markdown(("section", index), text)

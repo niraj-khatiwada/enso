@@ -3849,7 +3849,9 @@ extern "C" fn blurred_view_init_with_frame(
         // `blurred_view_update_layer` strips, leaving only the blur. `Selection`, used before,
         // has no `CABackdropLayer` on macOS 27, so nothing behind the window was blurred. (Setting
         // a material also avoids the deprecated default, `AppearanceBased`.)
-        let _: () = msg_send![view, setMaterial: NSVisualEffectMaterial::UnderWindowBackground];
+        // Enso: the Finder-style sidebar material, with its desktop tint kept (see
+        // `blurred_view_update_layer`), so a translucent sidebar reads as native.
+        let _: () = msg_send![view, setMaterial: NSVisualEffectMaterial::Sidebar];
         // The default, but blurring what's behind the window is this view's whole purpose.
         let _: () = msg_send![view, setBlendingMode: NSVisualEffectBlendingMode::BehindWindow];
         let _: () = msg_send![view, setState: NSVisualEffectState::Active];
@@ -3860,6 +3862,14 @@ extern "C" fn blurred_view_init_with_frame(
 extern "C" fn blurred_view_update_layer(this: &AnyObject, _: Sel) {
     unsafe {
         let _: () = msg_send![super(this, class!(NSVisualEffectView)), updateLayer];
+        // Enso keeps the material's desktop tint and saturation; upstream strips
+        // them here (`remove_layer_background`) to leave a plain blur.
+    }
+}
+
+#[allow(dead_code)]
+fn upstream_blurred_view_update_layer(this: &AnyObject) {
+    unsafe {
         let layer: *mut AnyObject = msg_send![this, layer];
         if !layer.is_null() {
             remove_layer_background(layer);

@@ -5,16 +5,18 @@ mod onboarding;
 mod reader;
 mod settings;
 mod stats;
+mod workspaces;
 
 use gpui_kit::assets::IconName;
 use gpui_kit::base::{Transition, transition};
 #[cfg(all(test, feature = "ui-tests"))]
 extern crate gpui_kit as gpui;
 use gpui_kit::component::{
-    ActiveTheme, Disableable, Sizable, TitleBar,
+    ActiveTheme, Disableable, Icon, Sizable, TitleBar,
     button::{Button, ButtonVariants},
     h_flex,
     input::{Editor, EditorState, Input, InputEvent, InputState},
+    popover::Popover,
     resizable::{HandleEdge, h_resizable, resizable_panel, resize_handle},
     text::{RenderedText, TextView, TextViewState},
     v_flex,
@@ -37,6 +39,7 @@ actions!(
         Save,
         ToggleView,
         ToggleSplit,
+        NewFolder,
         Quit
     ]
 );
@@ -82,10 +85,120 @@ impl Document {
 }
 
 #[derive(Clone)]
-struct SidebarResize {
-    width: Pixels,
-    pointer_x: Pixels,
+struct SidebarResize;
+
+/// An entry being named in the sidebar before it exists on disk.
+struct NewEntry {
+    dir: PathBuf,
+    folder: bool,
 }
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CloseTarget {
+    Window,
+    App,
+}
+
+/// Every open workspace window, so a workspace is only ever open in one.
+#[derive(Default)]
+struct OpenWindows(Vec<(AnyWindowHandle, WeakEntity<Enso>)>);
+impl Global for OpenWindows {}
+
+fn open_views(cx: &App) -> Vec<(AnyWindowHandle, Entity<Enso>)> {
+    cx.try_global::<OpenWindows>()
+        .map(|w| {
+            w.0.iter()
+                .filter_map(|(handle, view)| Some((*handle, view.upgrade()?)))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The window already showing the workspace at `path`, if any. `except` is
+/// the view asking: it is mid-update, so reading it would panic.
+fn window_for(path: &PathBuf, except: EntityId, cx: &App) -> Option<AnyWindowHandle> {
+    open_views(cx)
+        .into_iter()
+        .filter(|(_, view)| view.entity_id() != except)
+        .find(|(_, view)| view.read(cx).root.as_ref() == Some(path))
+        .map(|(handle, _)| handle)
+}
+
+fn activate(handle: AnyWindowHandle, cx: &mut App) {
+    let _ = handle.update(cx, |_, window, _| window.activate_window());
+}
+
+/// Quit once no window has unsaved or in-flight edits left.
+fn quit_when_saved(cx: &mut App) {
+    let pending = open_views(cx).into_iter().any(|(_, view)| {
+        let view = view.read(cx);
+        view.documents.iter().any(|d| d.dirty || d.saving)
+    });
+    if !pending {
+        cx.quit();
+    }
+}
+
+fn quit_all(cx: &mut App) {
+    let views = open_views(cx);
+    if views.is_empty() {
+        cx.quit();
+        return;
+    }
+    for (handle, view) in views {
+        let _ = handle.update(cx, |_, window, cx| {
+            view.update(cx, |view, cx| view.request_close(CloseTarget::App, window, cx))
+        });
+    }
+}
+
+/// One visible line of the file tree.
+struct TreeRow {
+    entry: files::Entry,
+    /// For each ancestor below the root, whether it has siblings after it, so
+    /// its thread keeps running down past this row.
+    threads: Vec<bool>,
+    last: bool,
+    /// The placeholder for a file or folder being named, not yet on disk.
+    pending: bool,
+}
+
+const TREE_INDENT: f32 = 16.;
+/// Height of the macOS title bar strip that sits over the top of the window.
+const TITLEBAR_HEIGHT: f32 = 38.;
+/// Left inset GPUI Kit's macOS title bar keeps clear for the traffic lights.
+const TRAFFIC_LIGHTS_WIDTH: f32 = 80.;
+
+/// The system backdrop behind the window: a blurred tint of the desktop on
+/// macOS, Mica on Windows 11, nothing elsewhere. Only the sidebar lets it show.
+fn window_backdrop() -> WindowBackgroundAppearance {
+    if cfg!(target_os = "macos") {
+        WindowBackgroundAppearance::Blurred
+    } else if cfg!(target_os = "windows") {
+        WindowBackgroundAppearance::MicaBackdrop
+    } else {
+        WindowBackgroundAppearance::Opaque
+    }
+}
+
+fn translucent() -> bool {
+    window_backdrop() != WindowBackgroundAppearance::Opaque
+}
+
+/// The content column's background. Over a system backdrop it lets a little of
+/// the tint through, so the sidebar and content read as one surface rather
+/// than a hard light/dark split.
+fn content_background(cx: &App) -> Hsla {
+    let theme = cx.theme();
+    if translucent() {
+        theme
+            .background
+            .opacity(if theme.mode.is_dark() { 0.72 } else { 0.78 })
+    } else {
+        theme.background
+    }
+}
+const TREE_ROW_HEIGHT: f32 = 26.;
 impl Render for SidebarResize {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
         div()
@@ -103,9 +216,19 @@ struct Enso {
     previous_mode: Mode,
     status: String,
     error: bool,
-    naming: bool,
+    /// Whether the last error is still on the status bar; it hides itself.
+    error_shown: bool,
+    _error_task: Option<Task<()>>,
+    naming: Option<NewEntry>,
     filename: Entity<InputState>,
-    closing: bool,
+    /// The tree row last clicked, file or folder; new entries go beside it.
+    selected: Option<PathBuf>,
+    switcher_open: bool,
+    switcher_hovered: bool,
+    window_handle: AnyWindowHandle,
+    renaming: Option<PathBuf>,
+    rename_input: Entity<InputState>,
+    closing: Option<CloseTarget>,
     sidebar_open: bool,
     sidebar_width: Pixels,
     focus_after_close: bool,
@@ -118,17 +241,33 @@ impl Enso {
         window.set_window_title("Enso");
         let focus = cx.focus_handle();
         focus.focus(window, cx);
-        let filename = cx.new(|cx| InputState::new(window, cx).placeholder("Untitled.md"));
+        let filename = cx.new(|cx| InputState::new(window, cx));
         let subscription = cx.subscribe_in(&filename, window, |this, _, event, window, cx| {
-            if matches!(event, InputEvent::PressEnter { .. }) {
-                this.create_file(window, cx);
+            match event {
+                InputEvent::PressEnter { .. } => this.create_entry(window, cx),
+                // Clicking away abandons the new entry rather than creating
+                // one by accident.
+                InputEvent::Blur => this.cancel_naming(window, cx),
+                _ => {}
             }
         });
+        let rename_input = cx.new(|cx| InputState::new(window, cx));
+        let rename_subscription =
+            cx.subscribe_in(&rename_input, window, |this, _, event, window, cx| {
+                // Enter commits, and so does clicking away, as in Finder.
+                if matches!(event, InputEvent::PressEnter { .. } | InputEvent::Blur) {
+                    this.commit_rename(window, cx);
+                }
+            });
         let weak = cx.entity().downgrade();
+        let window_handle = window.window_handle();
+        cx.default_global::<OpenWindows>()
+            .0
+            .push((window_handle, weak.clone()));
         window.on_window_should_close(cx, move |window, cx| {
             weak.update(cx, |this, cx| {
                 if this.documents.iter().any(|d| d.dirty(cx)) {
-                    this.request_quit(window, cx);
+                    this.request_close(CloseTarget::Window, window, cx);
                     false
                 } else {
                     true
@@ -136,6 +275,15 @@ impl Enso {
             })
             .unwrap_or(true)
         });
+        let history = cx.observe_global::<workspaces::Workspaces>(|_, cx| cx.notify());
+        let preferences =
+            cx.observe_global_in::<settings::Preferences>(window, |this, window, cx| {
+                let on = settings::line_numbers(cx);
+                for doc in &this.documents {
+                    doc.editor
+                        .update(cx, |editor, cx| editor.set_line_number(on, window, cx));
+                }
+            });
         Self {
             focus,
             documents: Vec::new(),
@@ -147,14 +295,28 @@ impl Enso {
             previous_mode: Mode::Read,
             status: "A little space for your thoughts.".into(),
             error: false,
-            naming: false,
+            error_shown: false,
+            _error_task: None,
+            naming: None,
             filename,
-            closing: false,
+            selected: None,
+            switcher_open: false,
+            switcher_hovered: false,
+            window_handle,
+            renaming: None,
+            rename_input,
+            closing: None,
             sidebar_open: true,
             sidebar_width: px(248.),
             focus_after_close: false,
             hovered_tab: None,
-            _subscriptions: vec![subscription, settings::watch_system(window)],
+            _subscriptions: vec![
+                subscription,
+                rename_subscription,
+                history,
+                preferences,
+                settings::watch_system(window),
+            ],
         }
     }
 
@@ -319,6 +481,20 @@ impl Enso {
     fn message(&mut self, message: impl Into<String>, error: bool, cx: &mut Context<Self>) {
         self.status = message.into();
         self.error = error;
+        self.error_shown = error;
+        // Errors fade from the bar after a while; `error` itself stays set,
+        // since quitting relies on it to know auto-save failed.
+        self._error_task = error.then(|| {
+            cx.spawn(async move |this, cx| {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_secs(5))
+                    .await;
+                let _ = this.update(cx, |this, cx| {
+                    this.error_shown = false;
+                    cx.notify();
+                });
+            })
+        });
         cx.notify();
     }
 
@@ -363,16 +539,19 @@ impl Enso {
                 } else {
                     "plaintext"
                 })
-                .folding(!large)
+                // No fold column: it widens the line-number gutter for a
+                // feature prose rarely needs.
+                .folding(false)
                 .auto_close(!large)
-                .line_number(true)
+                .line_number(settings::line_numbers(cx))
                 .default_value(if large && markdown {
                     String::new()
                 } else {
                     source.as_ref().clone()
                 })
         });
-        editor.update(cx, |editor, cx| editor.set_soft_wrap(!large, window, cx));
+        let wrap = source.len() < reader::NO_WRAP_BYTES;
+        editor.update(cx, |editor, cx| editor.set_soft_wrap(wrap, window, cx));
         let preview =
             cx.new(|cx| TextViewState::markdown(if large || !markdown { "" } else { &source }, cx));
         let preview_ref = preview.clone();
@@ -513,7 +692,7 @@ impl Enso {
 
     fn open_path(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
         if path.is_dir() {
-            self.open_folder(path, cx);
+            self.switch_workspace(path, false, window, cx);
             return;
         }
         if let Some(index) = self
@@ -582,8 +761,109 @@ impl Enso {
         self.root = Some(path.clone());
         self.folders.clear();
         self.expanded.clear();
+        self.selected = None;
+        self.naming = None;
+        self.renaming = None;
         self.expanded.insert(path.clone());
+        workspaces::record(&path, cx);
+        let title = path
+            .file_name()
+            .map(|n| format!("{} — Enso", n.to_string_lossy()))
+            .unwrap_or_else(|| "Enso".into());
+        let handle = self.window_handle;
+        cx.defer(move |cx| {
+            let _ = handle.update(cx, |_, window, _| window.set_window_title(&title));
+        });
         self.load_folder(path, cx);
+    }
+
+    /// Show the workspace at `path`: in the window that already has it, in a
+    /// new window, or in place of this window's workspace.
+    fn switch_workspace(
+        &mut self,
+        path: PathBuf,
+        new_window: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.switcher_open = false;
+        cx.notify();
+        if !path.is_dir() {
+            self.message(
+                format!("“{}” is no longer available.", path.display()),
+                true,
+                cx,
+            );
+            return;
+        }
+        if self.root.as_ref() == Some(&path) {
+            return;
+        }
+        if let Some(handle) = window_for(&path, cx.entity_id(), cx) {
+            cx.defer(move |cx| activate(handle, cx));
+            return;
+        }
+        if new_window {
+            cx.defer(move |cx| open_workspace_window(Some(path), cx));
+            return;
+        }
+        // Tabs belong to the workspace they were opened from. Closing flushes
+        // pending edits first, as closing a tab by hand does.
+        for index in (0..self.documents.len()).rev() {
+            self.close_document(index, cx);
+        }
+        self.open_folder(path, cx);
+        self.focus.focus(window, cx);
+    }
+
+    /// Where a new file or folder goes: into the selected folder, beside the
+    /// selected file, or at the top of the workspace.
+    fn target_dir(&self) -> Option<PathBuf> {
+        let root = self.root.as_ref()?;
+        let dir = match &self.selected {
+            Some(path) if path.is_dir() => path.clone(),
+            Some(path) => path.parent()?.to_path_buf(),
+            None => root.clone(),
+        };
+        Some(if dir.starts_with(root) { dir } else { root.clone() })
+    }
+
+    fn start_naming(&mut self, folder: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(dir) = self.target_dir() else {
+            return;
+        };
+        if dir != *self.root.as_ref().unwrap() && self.expanded.insert(dir.clone()) {
+            self.load_folder(dir.clone(), cx);
+        }
+        let (value, stem) = if folder {
+            ("New Folder", "New Folder".len())
+        } else {
+            ("Untitled.md", "Untitled".len())
+        };
+        self.naming = Some(NewEntry { dir, folder });
+        self.filename.update(cx, |s, cx| {
+            s.set_value(value, window, cx);
+            s.set_selected_range(0..stem, cx);
+        });
+        self.filename.focus_handle(cx).focus(window, cx);
+        cx.notify();
+    }
+
+    fn cancel_naming(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.naming.take().is_some() {
+            if self.filename.focus_handle(cx).is_focused(window) {
+                self.focus.focus(window, cx);
+            }
+            cx.notify();
+        }
+    }
+
+    fn new_folder(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.root.is_some() {
+            self.start_naming(true, window, cx);
+        } else {
+            self.message("Open a folder to add folders to it.", true, cx);
+        }
     }
 
     fn load_folder(&mut self, path: PathBuf, cx: &mut Context<Self>) {
@@ -611,11 +891,7 @@ impl Enso {
 
     fn new_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.root.is_some() {
-            self.naming = true;
-            self.filename
-                .update(cx, |s, cx| s.set_value("Untitled.md", window, cx));
-            self.filename.focus_handle(cx).focus(window, cx);
-            cx.notify();
+            self.start_naming(false, window, cx);
         } else {
             let folder = std::env::current_dir().unwrap_or_default();
             let receiver = cx.prompt_for_new_path(&folder, Some("Untitled.md"));
@@ -640,25 +916,108 @@ impl Enso {
         }
     }
 
-    fn create_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.naming {
-            return;
-        }
-        let Some(root) = self.root.clone() else {
+    fn create_entry(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(NewEntry { dir, folder }) = self.naming.take() else {
             return;
         };
-        match files::create_file(&root, &self.filename.read(cx).value()) {
+        let name = self.filename.read(cx).value().to_string();
+        let created = if folder {
+            files::create_folder(&dir, &name)
+        } else {
+            files::create_file(&dir, &name)
+        };
+        match created {
             Ok(path) => {
-                self.naming = false;
-                self.load_folder(root, cx);
-                self.add_document(Some(path), String::new(), None, window, cx);
-                self.mode = Mode::Edit;
-                if let Some(i) = self.active {
-                    self.documents[i].editor.focus_handle(cx).focus(window, cx);
+                self.load_folder(dir, cx);
+                self.selected = Some(path.clone());
+                if folder {
+                    self.focus.focus(window, cx);
+                } else {
+                    self.add_document(Some(path), String::new(), None, window, cx);
+                    self.mode = Mode::Edit;
+                    if let Some(i) = self.active {
+                        self.documents[i].editor.focus_handle(cx).focus(window, cx);
+                    }
+                }
+                cx.notify();
+            }
+            Err(error) => {
+                // Keep the field open so the name can be corrected.
+                self.naming = Some(NewEntry { dir, folder });
+                self.message(error.to_string(), true, cx);
+            }
+        }
+    }
+
+    fn start_rename(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        let name = path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
+        // Select the name without its extension, as Finder does.
+        let stem = match name.rfind('.') {
+            Some(dot) if dot > 0 => dot,
+            _ => name.len(),
+        };
+        self.renaming = Some(path);
+        self.rename_input.update(cx, |input, cx| {
+            input.set_value(name, window, cx);
+            input.set_selected_range(0..stem, cx);
+        });
+        self.rename_input.focus_handle(cx).focus(window, cx);
+        cx.notify();
+    }
+
+    fn cancel_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.renaming.take().is_some() {
+            self.focus.focus(window, cx);
+            cx.notify();
+        }
+    }
+
+    fn commit_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(old) = self.renaming.take() else {
+            return;
+        };
+        let name = self.rename_input.read(cx).value().to_string();
+        match files::rename(&old, &name) {
+            Ok(new) if new != old => {
+                let moved = |path: &PathBuf| {
+                    path.strip_prefix(&old)
+                        .ok()
+                        .map(|rest| if rest.as_os_str().is_empty() { new.clone() } else { new.join(rest) })
+                };
+                if let Some(path) = self.selected.as_ref().and_then(|p| moved(p)) {
+                    self.selected = Some(path);
+                }
+                for doc in &mut self.documents {
+                    if let Some(path) = doc.path.as_ref().and_then(|p| moved(p)) {
+                        doc.markdown = files::is_markdown(&path);
+                        doc.path = Some(path);
+                    }
+                }
+                self.folders.retain(|path, _| !path.starts_with(&old));
+                self.expanded = self
+                    .expanded
+                    .drain()
+                    .map(|path| moved(&path).unwrap_or(path))
+                    .collect();
+                let reload: Vec<_> = old
+                    .parent()
+                    .map(PathBuf::from)
+                    .into_iter()
+                    .chain(self.expanded.iter().filter(|p| p.starts_with(&new)).cloned())
+                    .collect();
+                for path in reload {
+                    self.load_folder(path, cx);
                 }
             }
+            Ok(_) => {}
             Err(error) => self.message(error.to_string(), true, cx),
         }
+        self.focus.focus(window, cx);
+        cx.notify();
     }
 
     fn close_current_file(&mut self, cx: &mut Context<Self>) {
@@ -758,13 +1117,15 @@ impl Enso {
                             this.remove_document(index, cx);
                         }
                         this.message("", false, cx);
-                        if this.closing && this.documents.iter().all(|d| !d.dirty && !d.saving) {
-                            cx.quit();
+                        if let Some(target) = this.closing
+                            && this.documents.iter().all(|d| !d.dirty && !d.saving)
+                        {
+                            this.finish_close(target, cx);
                         }
                     }
                     Err(error) => {
                         doc.close_after_save = false;
-                        this.closing = false;
+                        this.closing = None;
                         this.message(format!("Auto-save failed: {error}"), true, cx);
                     }
                 }
@@ -774,48 +1135,99 @@ impl Enso {
         .detach();
     }
 
-    fn request_quit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.closing {
+    /// Close this window, or take part in quitting the app: flush every
+    /// pending edit first, and ask only when auto-save has already failed.
+    fn request_close(&mut self, target: CloseTarget, window: &mut Window, cx: &mut Context<Self>) {
+        if self.closing.is_some() {
             return;
         }
         if !self.documents.iter().any(|d| d.dirty(cx)) {
-            cx.quit();
+            self.finish_close(target, cx);
             return;
         }
         if !self.error {
-            self.closing = true;
+            self.closing = Some(target);
             for index in 0..self.documents.len() {
                 self.start_save(index, cx);
             }
             return;
         }
-        self.closing = true;
+        self.closing = Some(target);
+        let (detail, discard) = match target {
+            CloseTarget::Window => (
+                "Automatic saving failed. Keep editing to preserve your changes, or discard them and close the window.",
+                "Discard and close",
+            ),
+            CloseTarget::App => (
+                "Automatic saving failed. Keep editing to preserve your changes, or discard and quit.",
+                "Discard and quit",
+            ),
+        };
         let receiver = window.prompt(
             PromptLevel::Warning,
             "You have unsaved changes",
-            Some("Automatic saving failed. Keep editing to preserve your changes, or discard and quit."),
-            &["Keep editing", "Discard and quit"],
+            Some(detail),
+            &["Keep editing", discard],
             cx,
         );
         cx.spawn_in(window, async move |this, cx| {
             let answer = receiver.await;
             let _ = this.update_in(cx, |this, _, cx| {
-                this.closing = false;
+                this.closing = None;
                 if answer == Ok(1) {
-                    cx.quit();
+                    match target {
+                        CloseTarget::Window => this.remove_window(cx),
+                        CloseTarget::App => cx.quit(),
+                    }
                 }
             });
         })
         .detach();
     }
 
-    fn tree_rows(&self, path: &PathBuf, depth: usize, rows: &mut Vec<(files::Entry, usize)>) {
-        if let Some(entries) = self.folders.get(path) {
-            for entry in entries {
-                rows.push((entry.clone(), depth));
-                if entry.directory && self.expanded.contains(&entry.path) {
-                    self.tree_rows(&entry.path, depth + 1, rows);
-                }
+    fn finish_close(&mut self, target: CloseTarget, cx: &mut Context<Self>) {
+        self.closing = None;
+        match target {
+            CloseTarget::Window => self.remove_window(cx),
+            CloseTarget::App => cx.defer(quit_when_saved),
+        }
+    }
+
+    fn remove_window(&mut self, cx: &mut Context<Self>) {
+        let handle = self.window_handle;
+        cx.defer(move |cx| {
+            let _ = handle.update(cx, |_, window, _| window.remove_window());
+        });
+    }
+
+    fn tree_rows(&self, path: &PathBuf, threads: &mut Vec<bool>, rows: &mut Vec<TreeRow>) {
+        let entries = self.folders.get(path).map(Vec::as_slice).unwrap_or_default();
+        // A new entry is named in place, at the top of the folder it goes in.
+        if let Some(NewEntry { dir, folder }) = &self.naming
+            && dir == path
+        {
+            rows.push(TreeRow {
+                entry: files::Entry {
+                    path: dir.join(".enso-new-entry"),
+                    directory: *folder,
+                },
+                threads: threads.clone(),
+                last: entries.is_empty(),
+                pending: true,
+            });
+        }
+        for (i, entry) in entries.iter().enumerate() {
+            let last = i + 1 == entries.len();
+            rows.push(TreeRow {
+                entry: entry.clone(),
+                threads: threads.clone(),
+                last,
+                pending: false,
+            });
+            if entry.directory && self.expanded.contains(&entry.path) {
+                threads.push(!last);
+                self.tree_rows(&entry.path, threads, rows);
+                threads.pop();
             }
         }
     }
@@ -834,7 +1246,7 @@ impl Render for Enso {
         }
         let mut rows = Vec::new();
         if let Some(root) = &self.root {
-            self.tree_rows(root, 0, &mut rows);
+            self.tree_rows(root, &mut Vec::new(), &mut rows);
         }
         let theme = cx.theme().clone();
         let motion = theme.motion_tokens();
@@ -916,6 +1328,7 @@ impl Render for Enso {
                                     .documents
                                     .iter()
                                     .position(|doc| doc.editor.entity_id() == editor_id);
+                                this.selected = None;
                                 cx.notify();
                             })),
                     )
@@ -951,13 +1364,236 @@ impl Render for Enso {
                     ),
             );
         }
+        let highlighted = self.selected.clone().or_else(|| active_path.clone());
+        let switcher = {
+            let weak = cx.entity().downgrade();
+            let recent = workspaces::recent(cx);
+            let current_root = self.root.clone();
+            let name = self
+                .root
+                .as_ref()
+                .and_then(|p| p.file_name())
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "No workspace".into());
+            Popover::new("workspace-switcher")
+                .open(self.switcher_open)
+                .on_open_change({
+                    let weak = weak.clone();
+                    move |open, _, cx| {
+                        let _ = weak.update(cx, |this, cx| {
+                            this.switcher_open = *open;
+                            cx.notify();
+                        });
+                    }
+                })
+                .trigger(
+                    Button::new("workspace")
+                        .ghost()
+                        .small()
+                        // Icon, name and caret stay packed to the left; the caret
+                        // is always laid out and only fades in, so hovering or
+                        // switching never shifts the name.
+                        .child(
+                            h_flex()
+                                .min_w_0()
+                                .gap_1p5()
+                                .items_center()
+                                .child(
+                                    Icon::new(if self.root.is_some() {
+                                        IconName::FolderOpen
+                                    } else {
+                                        IconName::Folder
+                                    })
+                                    .size_4()
+                                    .flex_shrink_0(),
+                                )
+                                .child(div().min_w_0().truncate().child(name))
+                                .child(
+                                    Icon::new(IconName::ChevronDown)
+                                        .size_3p5()
+                                        .flex_shrink_0()
+                                        .text_color(theme.muted_foreground)
+                                        .when(!(self.switcher_hovered || self.switcher_open), |icon| {
+                                            icon.opacity(0.)
+                                        }),
+                                ),
+                        )
+                        .accessibility_label("Switch workspace")
+                        .on_hover({
+                            let weak = weak.clone();
+                            move |hovered, _, cx| {
+                                let _ = weak.update(cx, |this, cx| {
+                                    if this.switcher_hovered != *hovered {
+                                        this.switcher_hovered = *hovered;
+                                        cx.notify();
+                                    }
+                                });
+                            }
+                        }),
+                )
+                .content(move |_, _, cx| {
+                    let theme = cx.theme().clone();
+                    let muted = theme.muted_foreground;
+                    let item = |id: ElementId| {
+                        h_flex()
+                            .id(id)
+                            .h(px(28.))
+                            .px_2()
+                            .gap_1p5()
+                            .items_center()
+                            .rounded_md()
+                            .cursor_pointer()
+                            .text_sm()
+                            .hover(|row| row.bg(theme.secondary.opacity(0.6)))
+                    };
+                    v_flex()
+                        .w(px(240.))
+                        .p_1()
+                        .children(recent.iter().enumerate().map(|(i, recent)| {
+                            let path = recent.path.clone();
+                            let current = current_root.as_ref() == Some(&recent.path);
+                            let exists = recent.exists();
+                            let weak = weak.clone();
+                            item(("workspace", i).into())
+                                .when(!exists, |row| row.opacity(0.55))
+                                .child(
+                                    Icon::new(if current {
+                                        IconName::Check
+                                    } else {
+                                        IconName::Folder
+                                    })
+                                    .size_3p5()
+                                    .flex_shrink_0()
+                                    .text_color(muted),
+                                )
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .truncate()
+                                        .when(current, |d| d.font_weight(FontWeight::MEDIUM))
+                                        .child(recent.name()),
+                                )
+                                .when(!exists, |row| {
+                                    row.child(div().text_xs().text_color(muted).child("Missing"))
+                                })
+                                .when(exists, |row| {
+                                    let group = SharedString::from(format!("workspace-row-{i}"));
+                                    let reveal = if cfg!(target_os = "macos") {
+                                        "Show in Finder"
+                                    } else {
+                                        "Show in File Explorer"
+                                    };
+                                    let reveal_path = recent.path.clone();
+                                    let reveal_weak = weak.clone();
+                                    let open_path = recent.path.clone();
+                                    let open_weak = weak.clone();
+                                    row.group(group.clone()).child(
+                                        // Only shown on the row under the pointer.
+                                        h_flex()
+                                            .flex_shrink_0()
+                                            .opacity(0.)
+                                            .group_hover(group, |s| s.opacity(1.))
+                                            .child(
+                                                Button::new(("reveal-workspace", i))
+                                                    .ghost()
+                                                    .xsmall()
+                                                    .icon(IconName::FolderOpen)
+                                                    .tooltip(reveal)
+                                                    .accessibility_label(reveal)
+                                                    .on_click(move |_, _, cx| {
+                                                        cx.stop_propagation();
+                                                        cx.reveal_path(&reveal_path);
+                                                        let _ = reveal_weak.update(cx, |this, cx| {
+                                                            this.switcher_open = false;
+                                                            cx.notify();
+                                                        });
+                                                    }),
+                                            )
+                                            // The current workspace is already in this window.
+                                            .when(!current, |buttons| {
+                                                buttons.child(
+                                                    Button::new(("window-workspace", i))
+                                                        .ghost()
+                                                        .xsmall()
+                                                        .icon(IconName::ExternalLink)
+                                                        .tooltip("Open in new window")
+                                                        .accessibility_label("Open in new window")
+                                                        .on_click(move |_, window, cx| {
+                                                            cx.stop_propagation();
+                                                            let path = open_path.clone();
+                                                            let _ = open_weak.update(cx, |this, cx| {
+                                                                this.switch_workspace(
+                                                                    path, true, window, cx,
+                                                                )
+                                                            });
+                                                        }),
+                                                )
+                                            }),
+                                    )
+                                })
+                                .when(!exists, |row| {
+                                    let path = recent.path.clone();
+                                    row.child(
+                                        Button::new(("forget-workspace", i))
+                                            .ghost()
+                                            .xsmall()
+                                            .icon(IconName::X)
+                                            .tooltip("Remove from list")
+                                            .accessibility_label("Remove from list")
+                                            .on_click(move |_, _, cx| {
+                                                cx.stop_propagation();
+                                                workspaces::forget(&path, cx);
+                                            }),
+                                    )
+                                })
+                                .on_click(move |event: &ClickEvent, window, cx| {
+                                    let modifiers = event.modifiers();
+                                    let new_window = modifiers.control || modifiers.platform;
+                                    let path = path.clone();
+                                    let _ = weak.update(cx, |this, cx| {
+                                        this.switch_workspace(path, new_window, window, cx)
+                                    });
+                                })
+                        }))
+                        .child(div().my_1().h(px(1.)).bg(theme.border))
+                        .child({
+                            let weak = weak.clone();
+                            item("workspace-open".into())
+                                .child(
+                                    Icon::new(IconName::Plus)
+                                        .size_3p5()
+                                        .flex_shrink_0()
+                                        .text_color(muted),
+                                )
+                                .child("Open new workspace…")
+                                .on_click(move |_, window, cx| {
+                                    let _ = weak.update(cx, |this, cx| {
+                                        this.switcher_open = false;
+                                        this.pick(true, window, cx);
+                                    });
+                                })
+                        })
+                })
+        };
         let sidebar = v_flex()
             .w_full()
             .h_full()
             .flex_shrink_0()
-            .bg(theme.sidebar)
+            // Over a system backdrop the native sidebar material (tinted by the
+            // desktop) shows through. Dark mode lets far more of the wallpaper
+            // through, so only there it gets a veil of the sidebar color.
+            .when(!translucent(), |sidebar| sidebar.bg(theme.sidebar))
+            .when(translucent() && theme.mode.is_dark(), |sidebar| {
+                sidebar.bg(theme.sidebar.opacity(0.6))
+            })
             .border_r_1()
             .border_color(theme.border)
+            // The title bar floats over the top of the sidebar on macOS; this
+            // keeps the sidebar's own content below it.
+            .when(cfg!(target_os = "macos"), |sidebar| {
+                sidebar.child(div().h(px(TITLEBAR_HEIGHT)).flex_shrink_0())
+            })
             .when(!cfg!(target_os = "macos"), |sidebar| {
                 sidebar.child(
                     h_flex()
@@ -976,41 +1612,16 @@ impl Render for Enso {
             })
             .child(
                 h_flex()
-                    .px_3()
-                    .when(cfg!(target_os = "macos"), |row| row.pt_3())
-                    .gap_1()
-                    .child(
-                        Button::new("open-file")
-                            .ghost()
-                            .small()
-                            .icon(IconName::File)
-                            .tooltip("Open file")
-                            .accessibility_label("Open file")
-                            .on_click(cx.listener(|this, _, w, cx| this.pick(false, w, cx))),
-                    )
-                    .child(
-                        Button::new("open-folder")
-                            .ghost()
-                            .small()
-                            .icon(IconName::FolderOpen)
-                            .tooltip("Open folder")
-                            .accessibility_label("Open folder")
-                            .on_click(cx.listener(|this, _, w, cx| this.pick(true, w, cx))),
-                    ),
-            )
-            .child(
-                h_flex()
-                    .px_5()
-                    .pt_6()
+                    // The workspace folder sits further left than the tree, so
+                    // the tree's threads read as hanging from it.
+                    .pl_2()
+                    .pr_5()
+                    .pt_4()
                     .pb_2()
+                    .gap_2()
                     .justify_between()
                     .items_center()
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(theme.muted_foreground)
-                            .child("WORKSPACE"),
-                    )
+                    .child(h_flex().flex_1().min_w_0().child(switcher))
                     .child(
                         h_flex()
                             .gap_1()
@@ -1029,6 +1640,32 @@ impl Render for Enso {
                                         }
                                     })),
                             )
+                            // With a workspace open, other folders are reached
+                            // through the switcher instead.
+                            .when(self.root.is_none(), |row| {
+                                row.child(
+                                    Button::new("open-file")
+                                        .ghost()
+                                        .xsmall()
+                                        .icon(IconName::File)
+                                        .tooltip("Open file")
+                                        .accessibility_label("Open file")
+                                        .on_click(
+                                            cx.listener(|this, _, w, cx| this.pick(false, w, cx)),
+                                        ),
+                                )
+                                .child(
+                                    Button::new("open-folder")
+                                        .ghost()
+                                        .xsmall()
+                                        .icon(IconName::FolderOpen)
+                                        .tooltip("Open folder")
+                                        .accessibility_label("Open folder")
+                                        .on_click(
+                                            cx.listener(|this, _, w, cx| this.pick(true, w, cx)),
+                                        ),
+                                )
+                            })
                             .child(
                                 Button::new("new")
                                     .ghost()
@@ -1041,86 +1678,188 @@ impl Render for Enso {
                     ),
             )
             .child(
-                div()
-                    .px_5()
-                    .pb_3()
-                    .text_sm()
-                    .font_weight(FontWeight::MEDIUM)
-                    .child(
-                        self.root
-                            .as_ref()
-                            .and_then(|p| p.file_name())
-                            .map(|p| p.to_string_lossy().into_owned())
-                            .unwrap_or_else(|| "No folder open".into()),
-                    ),
-            )
-            .when(self.naming, |s| {
-                s.child(
-                    v_flex()
-                        .px_3()
-                        .pb_3()
-                        .gap_2()
-                        .child(Input::new(&self.filename).small())
-                        .child(
-                            h_flex()
-                                .gap_2()
-                                .child(
-                                    Button::new("create")
-                                        .small()
-                                        .primary()
-                                        .label("Create")
-                                        .on_click(
-                                            cx.listener(|this, _, w, cx| this.create_file(w, cx)),
-                                        ),
-                                )
-                                .child(
-                                    Button::new("cancel")
-                                        .small()
-                                        .ghost()
-                                        .label("Cancel")
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            this.naming = false;
-                                            cx.notify();
-                                        })),
-                                ),
-                        ),
-                )
-            })
-            .child(
                 v_flex()
                     .id("files")
                     .flex_1()
                     .min_h_0()
                     .overflow_y_scroll()
                     .px_2()
-                    .children(rows.into_iter().enumerate().map(|(i, (entry, depth))| {
+                    .children(rows.into_iter().enumerate().map(|(i, row)| {
+                        let TreeRow {
+                            entry,
+                            threads,
+                            last,
+                            pending,
+                        } = row;
                         let path = entry.path.clone();
                         let expanded = self.expanded.contains(&path);
+                        let active = highlighted.as_ref() == Some(&path);
                         let label = path
                             .file_name()
                             .unwrap_or_default()
                             .to_string_lossy()
                             .into_owned();
-                        Button::new(("file", i))
-                            .ghost()
-                            .small()
+                        // Tree threads use the text color, faded: light lines on
+                        // dark, dark lines on light, and visible over the tint.
+                        let line = theme.foreground.opacity(0.25);
+                        let half = px(TREE_INDENT / 2.);
+                        let mid = px(TREE_ROW_HEIGHT / 2.);
+                        let depth = threads.len();
+                        let renaming = pending || self.renaming.as_ref() == Some(&path);
+                        let name_input = if pending {
+                            self.filename.clone()
+                        } else {
+                            self.rename_input.clone()
+                        };
+                        // Threads: every row hangs off the workspace root. A
+                        // straight line for each ancestor that continues below,
+                        // and a rounded elbow into this row.
+                        let guides = (0..=depth).map(|level| {
+                            let own = level == depth;
+                            let continues = threads.get(level).copied().unwrap_or(false);
+                            div()
+                                .relative()
+                                .flex_shrink_0()
+                                .w(px(TREE_INDENT))
+                                .h_full()
+                                .when(!own && continues, |col| {
+                                    col.child(
+                                        div()
+                                            .absolute()
+                                            .left(half)
+                                            .top_0()
+                                            .bottom_0()
+                                            .border_l_1()
+                                            .border_color(line),
+                                    )
+                                })
+                                .when(own, |col| {
+                                    col.child(
+                                        div()
+                                            .absolute()
+                                            .left(half)
+                                            .top_0()
+                                            .w(half)
+                                            .h(mid)
+                                            .border_l_1()
+                                            .border_b_1()
+                                            .rounded_bl(px(6.))
+                                            .border_color(line),
+                                    )
+                                    .when(!last, |col| {
+                                        col.child(
+                                            div()
+                                                .absolute()
+                                                .left(half)
+                                                .top(mid)
+                                                .bottom_0()
+                                                .border_l_1()
+                                                .border_color(line),
+                                        )
+                                    })
+                                })
+                        });
+                        let muted = theme.muted_foreground;
+                        h_flex()
+                            .id(("file", i))
+                            .h(px(TREE_ROW_HEIGHT))
                             .w_full()
-                            .justify_start()
-                            .pl(px(8. + depth as f32 * 14.))
-                            .icon(if entry.directory {
-                                if expanded {
-                                    IconName::FolderOpen
+                            .pl_1()
+                            .pr_2()
+                            .items_center()
+                            .rounded_md()
+                            .cursor_pointer()
+                            .text_sm()
+                            // Selection is a soft tint; the darker text carries it.
+                            .when(active, |row| row.font_weight(FontWeight::MEDIUM))
+                            .when(active || renaming, |row| {
+                                row.bg(theme.secondary.opacity(0.5))
+                            })
+                            .when(!active && !renaming, |row| {
+                                row.text_color(muted)
+                                    .hover(|row| row.bg(theme.secondary.opacity(0.35)))
+                            })
+                            .children(guides)
+                            .child(
+                                div()
+                                    .flex_shrink_0()
+                                    .w(px(16.))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .when(entry.directory, |slot| {
+                                        slot.child(
+                                            Icon::new(if expanded {
+                                                IconName::ChevronDown
+                                            } else {
+                                                IconName::ChevronRight
+                                            })
+                                            .size_3p5()
+                                            .text_color(muted),
+                                        )
+                                    }),
+                            )
+                            .child(
+                                Icon::new(if entry.directory {
+                                    if expanded {
+                                        IconName::FolderOpen
+                                    } else {
+                                        IconName::Folder
+                                    }
                                 } else {
-                                    IconName::Folder
+                                    IconName::File
+                                })
+                                .size_4()
+                                .flex_shrink_0()
+                                .mr_1p5()
+                                .text_color(muted),
+                            )
+                            .when(!renaming, |row| {
+                                row.child(div().min_w_0().truncate().child(label))
+                            })
+                            .when(renaming, |row| {
+                                row.child(
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        // Keep presses in the field from opening the row.
+                                        .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                            cx.stop_propagation()
+                                        })
+                                        .capture_key_down(cx.listener(
+                                            move |this, event: &KeyDownEvent, window, cx| {
+                                                if event.keystroke.key == "escape" {
+                                                    cx.stop_propagation();
+                                                    if pending {
+                                                        this.cancel_naming(window, cx);
+                                                    } else {
+                                                        this.cancel_rename(window, cx);
+                                                    }
+                                                }
+                                            },
+                                        ))
+                                        // Borderless and unpadded, so the name is
+                                        // edited where it sits on the row.
+                                        .child(
+                                            Input::new(&name_input)
+                                                .xsmall()
+                                                .appearance(false)
+                                                .px_0()
+                                                .py_0()
+                                                .text_sm(),
+                                        ),
+                                )
+                            })
+                            .when(active, |row| row.text_color(theme.foreground))
+                            .on_click(cx.listener(move |this, event: &ClickEvent, w, cx| {
+                                if pending {
+                                    return;
                                 }
-                            } else {
-                                IconName::File
-                            })
-                            .label(label)
-                            .when(active_path.as_ref() == Some(&path), |b| {
-                                b.bg(theme.secondary)
-                            })
-                            .on_click(cx.listener(move |this, _, w, cx| {
+                                this.selected = Some(path.clone());
+                                if event.click_count() >= 2 {
+                                    this.start_rename(path.clone(), w, cx);
+                                    return;
+                                }
                                 if entry.directory {
                                     if !this.expanded.remove(&path) {
                                         this.expanded.insert(path.clone());
@@ -1290,7 +2029,6 @@ impl Render for Enso {
                             .child(
                                 Button::new("start-open")
                                     .small()
-                                    .primary()
                                     .icon(IconName::File)
                                     .label("Open file")
                                     .on_click(
@@ -1307,7 +2045,6 @@ impl Render for Enso {
                             .child(
                                 Button::new("start-new")
                                     .small()
-                                    .ghost()
                                     .icon(IconName::Plus)
                                     .label("New note")
                                     .on_click(cx.listener(|this, _, w, cx| this.new_file(w, cx))),
@@ -1382,10 +2119,20 @@ impl Render for Enso {
             } else {
                 "Expand sidebar"
             };
+            // Keeps the document header lined up with the content column as the
+            // sidebar opens, closes and resizes beneath the title bar.
+            let toggle_width = 28.;
+            let header_offset = (f32::from(sidebar_width) * sidebar_reveal
+                - TRAFFIC_LIGHTS_WIDTH
+                - toggle_width
+                - 8.)
+                .max(0.);
+            // Transparent and borderless: it floats over the sidebar and the
+            // content's own top strip, which draws the only horizontal border.
             let titlebar = TitleBar::new()
-                .h(px(44.))
-                .bg(theme.background)
-                .border_color(theme.border)
+                .h(px(TITLEBAR_HEIGHT))
+                .bg(gpui_kit::transparent_black())
+                .border_color(gpui_kit::transparent_black())
                 .child(
                     h_flex()
                         .w_full()
@@ -1394,30 +2141,25 @@ impl Render for Enso {
                         .gap_2()
                         .pr_2()
                         .child(
-                            h_flex()
-                                .gap_2()
-                                .items_center()
-                                .flex_shrink_0()
-                                .child(brand::logo(24., cx))
+                            // The title bar starts a window move on any press
+                            // that then moves; keep presses on the toggle to
+                            // itself so a slightly shaky click still toggles.
+                            div()
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                                 .child(
-                                    div()
-                                        .text_sm()
-                                        .font_weight(FontWeight::SEMIBOLD)
-                                        .child("enso"),
+                                    Button::new("toggle-sidebar")
+                                        .ghost()
+                                        .small()
+                                        .icon(IconName::PanelLeft)
+                                        .tooltip(toggle_label)
+                                        .accessibility_label(toggle_label)
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.sidebar_open = !this.sidebar_open;
+                                            cx.notify();
+                                        })),
                                 ),
                         )
-                        .child(
-                            Button::new("toggle-sidebar")
-                                .ghost()
-                                .small()
-                                .icon(IconName::PanelLeft)
-                                .tooltip(toggle_label)
-                                .accessibility_label(toggle_label)
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.sidebar_open = !this.sidebar_open;
-                                    cx.notify();
-                                })),
-                        )
+                        .child(div().flex_shrink_0().w(px(header_offset)))
                         .child(document_header),
                 );
             (Some(titlebar.into_any_element()), None)
@@ -1432,15 +2174,18 @@ impl Render for Enso {
             .id("enso")
             .key_context("Enso")
             .track_focus(&self.focus)
+            .relative()
             .size_full()
-            .bg(theme.background)
+            // Over a translucent backdrop the window itself stays clear; the
+            // content column paints its own opaque background.
+            .when(!translucent(), |view| view.bg(theme.background))
             .text_color(theme.foreground)
             .on_action(cx.listener(|this, _: &OpenFile, w, cx| this.pick(false, w, cx)))
             .on_action(cx.listener(|this, _: &OpenFolder, w, cx| this.pick(true, w, cx)))
             .on_action(cx.listener(|this, _: &NewFile, w, cx| this.new_file(w, cx)))
             .on_action(cx.listener(|this, _: &Save, _, cx| this.save(cx)))
             .on_action(cx.listener(|this, _: &CloseFile, _, cx| this.close_current_file(cx)))
-            .on_action(cx.listener(|this, _: &Quit, w, cx| this.request_quit(w, cx)))
+            .on_action(cx.listener(|this, _: &NewFolder, w, cx| this.new_folder(w, cx)))
             .on_action(cx.listener(|this, _: &ToggleView, window, cx| {
                 let next = if this.mode == Mode::Edit {
                     Mode::Read
@@ -1457,7 +2202,6 @@ impl Render for Enso {
                 };
                 this.set_mode(next, window, cx);
             }))
-            .when_some(mac_titlebar, |view, titlebar| view.child(titlebar))
             .child(
                 div().flex_1().min_h_0().w_full().child(
                     h_flex()
@@ -1468,8 +2212,9 @@ impl Render for Enso {
                                 if !this.sidebar_open {
                                     return;
                                 }
-                                let drag = event.drag(cx);
-                                let width = (drag.width + event.event.position.x - drag.pointer_x)
+                                // The sidebar starts at the panels' left edge, so the
+                                // pointer's offset from it is the new width.
+                                let width = (event.event.position.x - event.bounds.left())
                                     .clamp(px(160.), px(480.));
                                 if this.sidebar_width != width {
                                     this.sidebar_width = width;
@@ -1491,19 +2236,9 @@ impl Render for Enso {
                                     sidebar.child(
                                         resize_handle("sidebar-resize", Axis::Horizontal)
                                             .inside(HandleEdge::Trailing)
-                                            .on_drag(
-                                                SidebarResize {
-                                                    width: sidebar_width,
-                                                    pointer_x: px(0.),
-                                                },
-                                                |drag, _, window, cx| {
-                                                    let value = SidebarResize {
-                                                        width: drag.width,
-                                                        pointer_x: window.mouse_position().x,
-                                                    };
-                                                    cx.new(|_| value)
-                                                },
-                                            ),
+                                            .on_drag(SidebarResize, |_, _, _, cx| {
+                                                cx.new(|_| SidebarResize)
+                                            }),
                                     )
                                 }),
                         )
@@ -1512,6 +2247,18 @@ impl Render for Enso {
                                 .flex_1()
                                 .min_w_0()
                                 .h_full()
+                                .bg(content_background(cx))
+                                // Room for the floating title bar; its bottom
+                                // border stops at the sidebar.
+                                .when(mac_titlebar.is_some(), |view| {
+                                    view.child(
+                                        div()
+                                            .h(px(TITLEBAR_HEIGHT))
+                                            .flex_shrink_0()
+                                            .border_b_1()
+                                            .border_color(theme.border),
+                                    )
+                                })
                                 .when_some(standard_header, |view, header| view.child(header))
                                 .when_some(standard_tabs, |view, tabs| {
                                     view.when(!self.documents.is_empty(), |view| view.child(tabs))
@@ -1519,6 +2266,7 @@ impl Render for Enso {
                                 .child(body)
                                 .child(
                                     h_flex()
+                                        .relative()
                                         .h(px(20.))
                                         .flex_shrink_0()
                                         .items_center()
@@ -1526,25 +2274,23 @@ impl Render for Enso {
                                         .px_3()
                                         .py_0()
                                         .gap_3()
-                                        .justify_between()
+                                        .justify_end()
                                         .border_t_1()
                                         .border_color(theme.border)
                                         .text_size(px(10.))
                                         .line_height(relative(1.))
-                                        .child(
-                                            div()
-                                                .flex_1()
-                                                .text_color(if self.error {
-                                                    theme.danger
-                                                } else {
-                                                    theme.muted_foreground
-                                                })
-                                                .child(if self.error {
-                                                    self.status.clone()
-                                                } else {
-                                                    String::new()
-                                                }),
-                                        )
+                                        .when(self.error && self.error_shown, |bar| {
+                                            bar.child(
+                                                div()
+                                                    .absolute()
+                                                    .inset_0()
+                                                    .flex()
+                                                    .items_center()
+                                                    .justify_center()
+                                                    .text_color(theme.danger)
+                                                    .child(self.status.clone()),
+                                            )
+                                        })
                                         .child(
                                             div().text_color(theme.muted_foreground).child(stats),
                                         ),
@@ -1552,6 +2298,9 @@ impl Render for Enso {
                         ),
                 ),
             )
+            .when_some(mac_titlebar, |view, titlebar| {
+                view.child(div().absolute().top_0().left_0().right_0().child(titlebar))
+            })
     }
 }
 
@@ -1574,6 +2323,70 @@ fn bind_view_keys(cx: &mut App) {
     }
 }
 
+fn open_enso_window(
+    cx: &mut App,
+    setup: impl FnOnce(&mut Enso, &mut Window, &mut Context<Enso>) + 'static,
+) {
+    // Cascade each new window off the ones already open.
+    let offset = px(28. * open_views(cx).len() as f32);
+    let mut bounds = Bounds::centered(None, size(px(1180.), px(780.)), cx);
+    bounds.origin.x += offset;
+    bounds.origin.y += offset;
+    let opened = gpui_kit::open_window(
+        WindowOptions {
+            titlebar: Some(if cfg!(target_os = "macos") {
+                TitlebarOptions {
+                    traffic_light_position: Some(point(px(12.), px(TITLEBAR_HEIGHT / 2. - 7.))),
+                    ..TitleBar::title_bar_options()
+                }
+            } else {
+                TitlebarOptions {
+                    title: Some("Enso".into()),
+                    ..Default::default()
+                }
+            }),
+            app_owns_titlebar_drag: cfg!(target_os = "macos"),
+            window_bounds: Some(WindowBounds::Windowed(bounds)),
+            window_min_size: Some(size(px(800.), px(500.))),
+            window_background: window_backdrop(),
+            ..Default::default()
+        },
+        cx,
+        move |window, cx| {
+            cx.new(|cx| {
+                let mut app = Enso::new(window, cx);
+                setup(&mut app, window, cx);
+                app
+            })
+        },
+    );
+    match opened {
+        // GPUI Kit's window root paints the theme background under everything,
+        // which would hide the system backdrop; clear it so the translucent
+        // sidebar shows through. Enso's content column paints its own.
+        Ok((handle, _)) if translucent() => {
+            let _ = handle.update(cx, |_, window, cx| {
+                if let Some(Some(root)) = window.root::<gpui_kit::base::Root>() {
+                    root.update(cx, |root, cx| {
+                        root.style().background = Some(gpui_kit::transparent_black().into());
+                        cx.notify();
+                    });
+                }
+            });
+        }
+        Ok(_) => {}
+        Err(error) => eprintln!("Unable to open an Enso window: {error}"),
+    }
+}
+
+fn open_workspace_window(root: Option<PathBuf>, cx: &mut App) {
+    open_enso_window(cx, move |app, _, cx| {
+        if let Some(root) = root {
+            app.open_folder(root, cx);
+        }
+    });
+}
+
 fn main() {
     let initial = std::env::args_os().nth(1).map(PathBuf::from);
     gpui_kit::application()
@@ -1582,6 +2395,7 @@ fn main() {
             gpui_kit::init(cx);
             app_icon::init();
             settings::init(cx);
+            workspaces::init(cx);
             cx.on_action(|_: &OpenSettings, cx| settings::open(cx));
             cx.bind_keys([
                 KeyBinding::new("cmd-,", OpenSettings, None),
@@ -1608,6 +2422,11 @@ fn main() {
                 shortcut!("e", ToggleView),
                 shortcut!("q", Quit),
             ]);
+            cx.bind_keys([
+                KeyBinding::new("ctrl-shift-n", NewFolder, Some("Enso")),
+                #[cfg(target_os = "macos")]
+                KeyBinding::new("cmd-shift-n", NewFolder, Some("Enso")),
+            ]);
             bind_view_keys(cx);
             cx.set_menus(vec![
                 Menu {
@@ -1625,6 +2444,7 @@ fn main() {
                         MenuItem::action("Open File…", OpenFile),
                         MenuItem::action("Open Folder…", OpenFolder),
                         MenuItem::action("New File", NewFile),
+                        MenuItem::action("New Folder", NewFolder),
                         MenuItem::action("Close File", CloseFile),
                         #[cfg(not(target_os = "macos"))]
                         MenuItem::action("Settings…", OpenSettings),
@@ -1634,53 +2454,35 @@ fn main() {
                     disabled: false,
                 },
             ]);
-            let (main_window, main_view) = gpui_kit::open_window(
-                WindowOptions {
-                    titlebar: Some(if cfg!(target_os = "macos") {
-                        TitlebarOptions {
-                            traffic_light_position: Some(point(px(12.), px(14.))),
-                            ..TitleBar::title_bar_options()
-                        }
-                    } else {
-                        TitlebarOptions {
-                            title: Some("Enso".into()),
-                            ..Default::default()
-                        }
-                    }),
-                    app_owns_titlebar_drag: cfg!(target_os = "macos"),
-                    window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
-                        None,
-                        size(px(1180.), px(780.)),
-                        cx,
-                    ))),
-                    window_min_size: Some(size(px(800.), px(500.))),
-                    ..Default::default()
-                },
-                cx,
-                move |window, cx| {
-                    cx.new(|cx| {
-                        let mut app = Enso::new(window, cx);
-                        if let Some(path) = initial {
-                            app.open_path(std::fs::canonicalize(&path).unwrap_or(path), window, cx);
-                        } else {
-                            app.open_first_launch_sample(window, cx);
-                        }
-                        app
-                    })
-                },
-            )
-            .expect("Unable to open Enso window");
-            let main_view = main_view.downgrade();
-            cx.on_action(move |_: &Quit, cx| {
-                if main_window
-                    .update(cx, |_, window, cx| {
-                        let _ = main_view.update(cx, |view, cx| view.request_quit(window, cx));
-                    })
-                    .is_err()
-                {
+            cx.on_action(|_: &Quit, cx| cx.defer(quit_all));
+            cx.on_window_closed(|cx, _| {
+                let windows = cx.windows();
+                cx.default_global::<OpenWindows>()
+                    .0
+                    .retain(|(handle, _)| windows.contains(handle));
+                if open_views(cx).is_empty() {
                     cx.quit();
                 }
-            });
+            })
+            .detach();
+            if let Some(path) = initial {
+                let path = std::fs::canonicalize(&path).unwrap_or(path);
+                open_enso_window(cx, move |app, window, cx| app.open_path(path, window, cx));
+            } else {
+                match workspaces::last(cx) {
+                    Some(last) if last.exists() => open_workspace_window(Some(last.path), cx),
+                    Some(last) => open_enso_window(cx, move |app, _, cx| {
+                        app.message(
+                            format!("Your last workspace “{}” is no longer available.", last.name()),
+                            true,
+                            cx,
+                        )
+                    }),
+                    None => open_enso_window(cx, |app, window, cx| {
+                        app.open_first_launch_sample(window, cx)
+                    }),
+                }
+            }
             cx.activate(true);
         });
 }
