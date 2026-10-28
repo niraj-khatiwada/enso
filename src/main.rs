@@ -1698,56 +1698,49 @@ impl Render for Enso {
                     .child(
                         h_flex()
                             .gap_1()
-                            .child(
-                                Button::new("refresh")
-                                    .ghost()
-                                    .xsmall()
-                                    .icon(IconName::RefreshCw)
-                                    .tooltip("Refresh folder")
-                                    .accessibility_label("Refresh folder")
-                                    .disabled(self.root.is_none())
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        let paths: Vec<_> = this.expanded.iter().cloned().collect();
-                                        for path in paths {
-                                            this.load_folder(path, cx);
-                                        }
-                                    })),
-                            )
-                            // With a workspace open, other folders are reached
-                            // through the switcher instead.
+                            // Without a workspace there is nothing to refresh or
+                            // add to: the one action is choosing a folder.
                             .when(self.root.is_none(), |row| {
                                 row.child(
-                                    Button::new("open-file")
+                                    Button::new("open-workspace")
                                         .ghost()
                                         .xsmall()
-                                        .icon(IconName::File)
-                                        .tooltip("Open file")
-                                        .accessibility_label("Open file")
-                                        .on_click(
-                                            cx.listener(|this, _, w, cx| this.pick(false, w, cx)),
-                                        ),
-                                )
-                                .child(
-                                    Button::new("open-folder")
-                                        .ghost()
-                                        .xsmall()
-                                        .icon(IconName::FolderOpen)
-                                        .tooltip("Open folder")
-                                        .accessibility_label("Open folder")
+                                        .icon(IconName::Plus)
+                                        .tooltip("Open new workspace")
+                                        .accessibility_label("Open new workspace")
                                         .on_click(
                                             cx.listener(|this, _, w, cx| this.pick(true, w, cx)),
                                         ),
                                 )
                             })
-                            .child(
-                                Button::new("new")
-                                    .ghost()
-                                    .xsmall()
-                                    .icon(IconName::Plus)
-                                    .tooltip("New file")
-                                    .accessibility_label("New file")
-                                    .on_click(cx.listener(|this, _, w, cx| this.new_file(w, cx))),
-                            ),
+                            .when(self.root.is_some(), |row| {
+                                row.child(
+                                    Button::new("refresh")
+                                        .ghost()
+                                        .xsmall()
+                                        .icon(IconName::RefreshCw)
+                                        .tooltip("Refresh folder")
+                                        .accessibility_label("Refresh folder")
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            let paths: Vec<_> =
+                                                this.expanded.iter().cloned().collect();
+                                            for path in paths {
+                                                this.load_folder(path, cx);
+                                            }
+                                        })),
+                                )
+                                .child(
+                                    Button::new("new")
+                                        .ghost()
+                                        .xsmall()
+                                        .icon(IconName::Plus)
+                                        .tooltip("New file")
+                                        .accessibility_label("New file")
+                                        .on_click(
+                                            cx.listener(|this, _, w, cx| this.new_file(w, cx)),
+                                        ),
+                                )
+                            }),
                     ),
             )
             .child(
@@ -2060,14 +2053,21 @@ impl Render for Enso {
                             .min_w_0()
                             .h_full()
                             .overflow_hidden()
-                            .px_10()
-                            .py_8()
                             .child(
-                                div().max_w(px(800.)).mx_auto().size_full().child(
+                                div().size_full().child(
+                                    // Spans the whole pane, like the editor, so its
+                                    // scrollbar sits at the pane's right edge. The
+                                    // padding is inside the scroll box: text starts
+                                    // where the editor's does (Read and Edit swap in
+                                    // place) and stops short of the overlaid bar.
                                     TextView::new(&document.preview)
                                         .selectable(true)
                                         .scrollable(true)
                                         .size_full()
+                                        .pl(px(reader::TEXT_INSET_X))
+                                        .pr_4()
+                                        .pt(px(reader::TEXT_INSET_Y))
+                                        .pb_8()
                                         .image_source(move |uri| {
                                             let source = uri.to_string();
                                             if !source.contains(':') {

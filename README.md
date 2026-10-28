@@ -18,7 +18,7 @@ cargo run -- /absolute/path/to/note.md
 cargo run -- /absolute/path/to/folder
 ```
 
-On macOS, `./scripts/bundle-macos.sh` also creates `target/Enso.app`, which you can open in Finder. The bundle uses `assets/Enso.icns`; `assets/enso.png` also supplies the Dock icon during `cargo run`.
+On macOS, `make` lists the build targets. `make build.macos` produces the release: an optimized `target/Enso.app` with its Quick Look extension (Space-bar previews of Markdown in Finder), ad-hoc signed, and `target/Enso-<version>-<arch>.dmg`. `make app` stops at the app, `make app.debug` makes a quick unoptimized one, and `make install` copies it to `/Applications` and registers it and its Quick Look preview. The bundle uses `assets/Enso.icns`; `assets/enso.png` also supplies the Dock icon during `cargo run`.
 
 The initial build downloads and compiles GPUI's native dependencies. Subsequent builds are incremental. Development builds optimize GPUI Base, Ropey, and the text index to avoid slow million-line editor initialization under `cargo run`; the first rebuild after a profile change takes longer.
 

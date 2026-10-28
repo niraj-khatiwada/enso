@@ -54,13 +54,13 @@ fn line_numbers_path() -> Option<PathBuf> {
     dirs::config_dir().map(|p| p.join("Enso").join("line-numbers"))
 }
 fn load_line_numbers(path: &Path) -> bool {
-    std::fs::read_to_string(path).map_or(true, |value| value.trim() != "off")
+    std::fs::read_to_string(path).is_ok_and(|value| value.trim() == "on")
 }
 
-/// Whether editors show line numbers; on unless turned off in Settings.
+/// Whether editors show line numbers; off unless turned on in Settings.
 pub fn line_numbers(cx: &App) -> bool {
     cx.try_global::<Preferences>()
-        .map_or(true, |p| p.line_numbers)
+        .is_some_and(|p| p.line_numbers)
 }
 
 fn set_line_numbers(on: bool, cx: &mut App) -> io::Result<()> {
@@ -87,7 +87,7 @@ fn load(path: &Path) -> Appearance {
 pub fn init(cx: &mut App) {
     let path = path();
     let appearance = path.as_ref().map(|p| load(p)).unwrap_or_default();
-    let line_numbers = line_numbers_path().as_deref().map_or(true, load_line_numbers);
+    let line_numbers = line_numbers_path().as_deref().is_some_and(load_line_numbers);
     cx.set_global(Preferences {
         appearance,
         line_numbers,
@@ -99,7 +99,7 @@ pub fn init(cx: &mut App) {
     // themes finishing loading, a theme file edited on disk), which replaces
     // the gutter color set above. Registered after the kit's own observer, so
     // this runs once its reload is done.
-    cx.observe_global::<ThemeRegistry>(blend_gutter).detach();
+    cx.observe_global::<ThemeRegistry>(tune_theme).detach();
     cx.bind_keys([
         KeyBinding::new("cmd-w", CloseSettings, Some("EnsoSettings")),
         KeyBinding::new("ctrl-w", CloseSettings, Some("EnsoSettings")),
@@ -138,9 +138,31 @@ fn blend_gutter(cx: &mut App) {
     }
 }
 
+/// Enso's adjustments on top of GPUI Kit's theme. The kit rebuilds its theme
+/// on every change, so this runs again after each one.
+fn tune_theme(cx: &mut App) {
+    blend_gutter(cx);
+    thin_scrollbars(cx);
+}
+
+/// Hairline scrollbar thumbs, a little wider while hovered or dragged. The kit's
+/// own are 6 and 8 px.
+fn thin_scrollbars(cx: &mut App) {
+    let base = gpui_kit::base::Theme::global_mut(cx);
+    let styles = base
+        .scrollbar
+        .styles()
+        .clone()
+        .thumb(|thumb| thumb.width(px(3.)).inset(px(2.)))
+        .thumb_hover(|thumb| thumb.width(px(4.)).inset(px(2.)))
+        .thumb_active(|thumb| thumb.width(px(4.)).inset(px(2.)));
+    base.scrollbar = base.scrollbar.clone().with_styles(styles);
+    cx.refresh_windows();
+}
+
 fn apply(appearance: Appearance, cx: &mut App) {
     apply_theme(appearance, cx);
-    blend_gutter(cx);
+    tune_theme(cx);
 }
 
 fn apply_theme(appearance: Appearance, cx: &mut App) {
@@ -166,7 +188,7 @@ pub fn watch_system(window: &Window) -> Subscription {
             let mode = ThemeMode::from(window.appearance());
             if cx.theme().mode != mode {
                 Theme::change(mode, None, cx);
-                blend_gutter(cx);
+                tune_theme(cx);
             }
         }
     })
