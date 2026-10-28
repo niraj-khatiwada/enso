@@ -54,7 +54,8 @@ pub fn list_folder(path: &Path) -> io::Result<Vec<Entry>> {
     Ok(entries)
 }
 
-pub fn create_file(root: &Path, name: &str) -> io::Result<PathBuf> {
+/// A single path component the user typed, never a route out of its folder.
+fn plain_name(name: &str) -> io::Result<&Path> {
     let name = name.trim();
     let relative = Path::new(name);
     if name.is_empty()
@@ -67,12 +68,44 @@ pub fn create_file(root: &Path, name: &str) -> io::Result<PathBuf> {
             "Enter a filename without folders, such as Notes.md.",
         ));
     }
-    let path = root.join(relative);
+    Ok(relative)
+}
+
+pub fn create_file(root: &Path, name: &str) -> io::Result<PathBuf> {
+    let path = root.join(plain_name(name)?);
     OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(&path)?;
     Ok(path)
+}
+
+pub fn create_folder(root: &Path, name: &str) -> io::Result<PathBuf> {
+    let path = root.join(plain_name(name)?);
+    fs::create_dir(&path)?;
+    Ok(path)
+}
+
+/// Rename a file or folder in place. Never replaces another entry, though a
+/// change of case alone is allowed on case-insensitive volumes.
+pub fn rename(path: &Path, name: &str) -> io::Result<PathBuf> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "This item cannot be renamed."))?;
+    let target = parent.join(plain_name(name)?);
+    if target == path {
+        return Ok(target);
+    }
+    if fs::symlink_metadata(&target).is_ok()
+        && fs::canonicalize(&target)? != fs::canonicalize(path)?
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "Another file already has that name.",
+        ));
+    }
+    fs::rename(path, &target)?;
+    Ok(target)
 }
 
 /// Detect changes by another application before writing. Keep the original file
@@ -129,6 +162,15 @@ mod tests {
         assert!(create_file(&root, "a\\b.md").is_err());
         let path = create_file(&root, "note.md").unwrap();
         assert!(create_file(&root, "note.md").is_err());
+        let folder = create_folder(&root, "drafts").unwrap();
+        assert!(folder.is_dir());
+        assert!(create_folder(&root, "drafts").is_err());
+        assert!(create_folder(&root, "../out").is_err());
+        create_file(&root, "other.md").unwrap();
+        assert!(rename(&path, "other.md").is_err());
+        assert!(rename(&path, "../escape.md").is_err());
+        let path = rename(&path, "renamed.md").unwrap();
+        let path = rename(&path, "note.md").unwrap();
         save(&path, "", "# Hello\nनमस्ते").unwrap();
         assert_eq!(read_text(&path).unwrap(), "# Hello\nनमस्ते");
         fs::write(&path, "external edit").unwrap();

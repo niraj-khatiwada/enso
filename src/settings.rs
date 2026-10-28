@@ -1,8 +1,10 @@
 use gpui_kit::assets::IconName;
 use gpui_kit::component::{
-    ActiveTheme, Sizable, Theme, ThemeMode, TitleBar,
+    ActiveTheme, Theme, ThemeMode, ThemeRegistry, TitleBar,
     button::{Button, ButtonVariants},
-    h_flex, v_flex,
+    h_flex,
+    switch::Switch,
+    v_flex,
 };
 use gpui_kit::{prelude::FluentBuilder, *};
 use std::{
@@ -36,6 +38,8 @@ impl Appearance {
 
 pub struct Preferences {
     pub appearance: Appearance,
+    /// Show line numbers beside the editor's text.
+    pub line_numbers: bool,
     window: Option<AnyWindowHandle>,
     path: Option<PathBuf>,
 }
@@ -46,6 +50,34 @@ actions!(settings, [CloseSettings]);
 fn path() -> Option<PathBuf> {
     dirs::config_dir().map(|p| p.join("Enso").join("appearance"))
 }
+fn line_numbers_path() -> Option<PathBuf> {
+    dirs::config_dir().map(|p| p.join("Enso").join("line-numbers"))
+}
+fn load_line_numbers(path: &Path) -> bool {
+    std::fs::read_to_string(path).map_or(true, |value| value.trim() != "off")
+}
+
+/// Whether editors show line numbers; on unless turned off in Settings.
+pub fn line_numbers(cx: &App) -> bool {
+    cx.try_global::<Preferences>()
+        .map_or(true, |p| p.line_numbers)
+}
+
+fn set_line_numbers(on: bool, cx: &mut App) -> io::Result<()> {
+    if !cx.has_global::<Preferences>() {
+        init(cx);
+    }
+    // Observers (every open workspace window) restyle their editors from this.
+    cx.update_global::<Preferences, _>(|prefs, _| prefs.line_numbers = on);
+    if let Some(path) = line_numbers_path() {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(path, if on { "on" } else { "off" })?;
+    }
+    Ok(())
+}
+
 fn load(path: &Path) -> Appearance {
     std::fs::read_to_string(path)
         .map(|value| Appearance::parse(&value))
@@ -55,12 +87,19 @@ fn load(path: &Path) -> Appearance {
 pub fn init(cx: &mut App) {
     let path = path();
     let appearance = path.as_ref().map(|p| load(p)).unwrap_or_default();
+    let line_numbers = line_numbers_path().as_deref().map_or(true, load_line_numbers);
     cx.set_global(Preferences {
         appearance,
+        line_numbers,
         window: None,
         path,
     });
     apply(appearance, cx);
+    // The kit reloads the active theme whenever its registry changes (bundled
+    // themes finishing loading, a theme file edited on disk), which replaces
+    // the gutter color set above. Registered after the kit's own observer, so
+    // this runs once its reload is done.
+    cx.observe_global::<ThemeRegistry>(blend_gutter).detach();
     cx.bind_keys([
         KeyBinding::new("cmd-w", CloseSettings, Some("EnsoSettings")),
         KeyBinding::new("ctrl-w", CloseSettings, Some("EnsoSettings")),
@@ -72,7 +111,39 @@ fn current(cx: &App) -> Appearance {
         .map(|p| p.appearance)
         .unwrap_or_default()
 }
+/// Give the editor's line-number gutter exactly the color its text area shows.
+/// (Over a translucent window that means none at all: see below.)
+/// The editor background is translucent in dark mode, and the gutter paints it
+/// a second time over the text area's, which reads as a lighter panel; so the
+/// gutter gets the already-composited, opaque color instead.
+fn blend_gutter(cx: &mut App) {
+    let theme = Theme::global_mut(cx);
+    let editor = theme
+        .highlight_theme
+        .style
+        .editor_background
+        .unwrap_or_else(|| theme.input_background());
+    // Over a translucent window the text area's color depends on the desktop
+    // behind it, so no fixed color can match it: leave the gutter clear.
+    let gutter = if cfg!(any(target_os = "macos", target_os = "windows")) {
+        gpui_kit::transparent_black()
+    } else {
+        theme.background.blend(editor)
+    };
+    if theme.highlight_theme.style.editor_gutter_background != Some(gutter) {
+        let mut highlight = (*theme.highlight_theme).clone();
+        highlight.style.editor_gutter_background = Some(gutter);
+        theme.highlight_theme = std::sync::Arc::new(highlight);
+        cx.refresh_windows();
+    }
+}
+
 fn apply(appearance: Appearance, cx: &mut App) {
+    apply_theme(appearance, cx);
+    blend_gutter(cx);
+}
+
+fn apply_theme(appearance: Appearance, cx: &mut App) {
     match appearance {
         Appearance::System => {
             cx.set_window_appearance(None);
@@ -95,6 +166,7 @@ pub fn watch_system(window: &Window) -> Subscription {
             let mode = ThemeMode::from(window.appearance());
             if cx.theme().mode != mode {
                 Theme::change(mode, None, cx);
+                blend_gutter(cx);
             }
         }
     })
@@ -143,10 +215,10 @@ pub fn open(cx: &mut App) {
             app_owns_titlebar_drag: cfg!(target_os = "macos"),
             window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
                 None,
-                size(px(640.), px(440.)),
+                size(px(760.), px(480.)),
                 cx,
             ))),
-            window_min_size: Some(size(px(580.), px(400.))),
+            window_min_size: Some(size(px(680.), px(420.))),
             ..Default::default()
         },
         cx,
@@ -157,6 +229,7 @@ pub fn open(cx: &mut App) {
                 focus.focus(window, cx);
                 SettingsWindow {
                     focus,
+                    category: Category::Appearance,
                     error: None,
                     _appearance: watch_system(window),
                 }
@@ -168,8 +241,33 @@ pub fn open(cx: &mut App) {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Category {
+    Appearance,
+    Editor,
+}
+
+impl Category {
+    const ALL: [Category; 2] = [Category::Appearance, Category::Editor];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Appearance => "Appearance",
+            Self::Editor => "Editor",
+        }
+    }
+
+    fn icon(self) -> IconName {
+        match self {
+            Self::Appearance => IconName::Palette,
+            Self::Editor => IconName::Pencil,
+        }
+    }
+}
+
 struct SettingsWindow {
     focus: FocusHandle,
+    category: Category,
     error: Option<String>,
     _appearance: Subscription,
 }
@@ -214,10 +312,136 @@ fn preview(appearance: Appearance) -> impl IntoElement {
         }))
 }
 
+fn page_header(title: &'static str, description: &'static str, muted: Hsla) -> impl IntoElement {
+    v_flex()
+        .gap_1()
+        .child(div().text_xl().font_weight(FontWeight::SEMIBOLD).child(title))
+        .child(div().text_sm().text_color(muted).child(description))
+}
+
+impl SettingsWindow {
+    fn appearance_page(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme().clone();
+        let selected = current(cx);
+        v_flex()
+            .gap_6()
+            .child(page_header(
+                "Appearance",
+                "Choose how Enso looks on your device.",
+                theme.muted_foreground,
+            ))
+            .child(
+                v_flex()
+                    .gap_3()
+                    .child(div().text_sm().font_weight(FontWeight::MEDIUM).child("Theme"))
+                    .child(
+                        h_flex().gap_3().children(
+                            [
+                                (Appearance::System, "System", IconName::Monitor),
+                                (Appearance::Dark, "Dark", IconName::Moon),
+                                (Appearance::Light, "Light", IconName::Sun),
+                            ]
+                            .into_iter()
+                            .enumerate()
+                            .map(|(index, (appearance, label, icon))| {
+                                Button::new(("appearance", index))
+                                    .ghost()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .h(px(132.))
+                                    .p_3()
+                                    .border_1()
+                                    .border_color(if selected == appearance {
+                                        theme.primary
+                                    } else {
+                                        theme.border
+                                    })
+                                    .when(selected == appearance, |button| {
+                                        button.bg(theme.secondary)
+                                    })
+                                    .accessibility_label(format!("{label} theme"))
+                                    .child(
+                                        v_flex()
+                                            .w_full()
+                                            .gap_3()
+                                            .child(preview(appearance))
+                                            .child(
+                                                h_flex()
+                                                    .items_center()
+                                                    .justify_center()
+                                                    .gap_2()
+                                                    .child(icon)
+                                                    .child(div().text_sm().child(label)),
+                                            ),
+                                    )
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.error = choose(appearance, cx).err().map(|error| {
+                                            format!("Could not save appearance: {error}")
+                                        });
+                                        cx.notify();
+                                    }))
+                            }),
+                        ),
+                    ),
+            )
+    }
+
+    fn editor_page(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme().clone();
+        let line_numbers = line_numbers(cx);
+        let weak = cx.entity().downgrade();
+        v_flex()
+            .gap_6()
+            .child(page_header(
+                "Editor",
+                "How the writing pane looks while you edit.",
+                theme.muted_foreground,
+            ))
+            .child(
+                h_flex()
+                    .gap_4()
+                    .items_center()
+                    .justify_between()
+                    .py_3()
+                    .border_b_1()
+                    .border_color(theme.border)
+                    .child(
+                        v_flex()
+                            .gap_0p5()
+                            .child(div().text_sm().font_weight(FontWeight::MEDIUM).child("Line numbers"))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(theme.muted_foreground)
+                                    .child("Show line numbers beside the text in Edit and Split views."),
+                            ),
+                    )
+                    .child(
+                        Switch::new("line-numbers")
+                            .checked(line_numbers)
+                            .accessibility_label("Line numbers")
+                            .on_change(move |on, _, cx| {
+                                let error = set_line_numbers(*on, cx)
+                                    .err()
+                                    .map(|error| format!("Could not save editor settings: {error}"));
+                                let _ = weak.update(cx, |this, cx| {
+                                    this.error = error;
+                                    cx.notify();
+                                });
+                            }),
+                    ),
+            )
+    }
+}
+
 impl Render for SettingsWindow {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
-        let selected = current(cx);
+        let category = self.category;
+        let page = match category {
+            Category::Appearance => self.appearance_page(cx).into_any_element(),
+            Category::Editor => self.editor_page(cx).into_any_element(),
+        };
         v_flex()
             .id("settings-window")
             .key_context("EnsoSettings")
@@ -237,107 +461,58 @@ impl Render for SettingsWindow {
                 )
             })
             .child(
-                v_flex()
+                h_flex()
                     .flex_1()
-                    .p_8()
-                    .gap_6()
+                    .min_h_0()
+                    .items_start()
                     .child(
                         v_flex()
-                            .gap_2()
-                            .child(
-                                div()
-                                    .text_2xl()
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .child("Appearance"),
-                            )
-                            .child(
-                                div()
+                            .w(px(180.))
+                            .h_full()
+                            .flex_shrink_0()
+                            .p_3()
+                            .gap_0p5()
+                            .bg(theme.sidebar)
+                            .border_r_1()
+                            .border_color(theme.border)
+                            .children(Category::ALL.into_iter().enumerate().map(|(i, item)| {
+                                let active = item == category;
+                                h_flex()
+                                    .id(("settings-category", i))
+                                    .h(px(30.))
+                                    .px_2()
+                                    .gap_2()
+                                    .items_center()
+                                    .rounded_md()
+                                    .cursor_pointer()
                                     .text_sm()
-                                    .text_color(theme.muted_foreground)
-                                    .child("Choose how Enso looks on your device."),
-                            ),
-                    )
-                    .child(
-                        v_flex()
-                            .gap_3()
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .font_weight(FontWeight::MEDIUM)
-                                    .child("Theme"),
-                            )
-                            .child(
-                                h_flex().gap_3().children(
-                                    [
-                                        (Appearance::System, "System", IconName::Monitor),
-                                        (Appearance::Dark, "Dark", IconName::Moon),
-                                        (Appearance::Light, "Light", IconName::Sun),
-                                    ]
-                                    .into_iter()
-                                    .enumerate()
-                                    .map(
-                                        |(index, (appearance, label, icon))| {
-                                            Button::new(("appearance", index))
-                                                .ghost()
-                                                .flex_1()
-                                                .min_w_0()
-                                                .h(px(132.))
-                                                .p_3()
-                                                .border_1()
-                                                .border_color(if selected == appearance {
-                                                    theme.primary
-                                                } else {
-                                                    theme.border
-                                                })
-                                                .when(selected == appearance, |button| {
-                                                    button.bg(theme.secondary)
-                                                })
-                                                .accessibility_label(format!("{label} theme"))
-                                                .child(
-                                                    v_flex()
-                                                        .w_full()
-                                                        .gap_3()
-                                                        .child(preview(appearance))
-                                                        .child(
-                                                            h_flex()
-                                                                .items_center()
-                                                                .justify_center()
-                                                                .gap_2()
-                                                                .child(icon)
-                                                                .child(
-                                                                    div().text_sm().child(label),
-                                                                ),
-                                                        ),
-                                                )
-                                                .on_click(cx.listener(move |this, _, _, cx| {
-                                                    this.error =
-                                                        choose(appearance, cx).err().map(|error| {
-                                                            format!(
-                                                                "Could not save appearance: {error}"
-                                                            )
-                                                        });
-                                                    cx.notify();
-                                                }))
-                                        },
-                                    ),
-                                ),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(if self.error.is_some() {
-                                theme.danger
-                            } else {
-                                theme.muted_foreground
-                            })
-                            .child(self.error.clone().unwrap_or_else(|| {
-                                if selected == Appearance::System {
-                                    "Follows your system appearance automatically.".into()
-                                } else {
-                                    "Applies to all Enso windows. Saved automatically.".into()
-                                }
+                                    .when(active, |row| {
+                                        row.bg(theme.secondary.opacity(0.5))
+                                            .font_weight(FontWeight::MEDIUM)
+                                    })
+                                    .when(!active, |row| {
+                                        row.text_color(theme.muted_foreground)
+                                            .hover(|row| row.bg(theme.secondary.opacity(0.35)))
+                                    })
+                                    .child(item.icon())
+                                    .child(item.label())
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.category = item;
+                                        this.error = None;
+                                        cx.notify();
+                                    }))
                             })),
+                    )
+                    .child(
+                        v_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .p_8()
+                            .gap_6()
+                            .child(page)
+                            .when_some(self.error.clone(), |page, error| {
+                                page.child(div().text_xs().text_color(theme.danger).child(error))
+                            }),
                     ),
             )
     }
