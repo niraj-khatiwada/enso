@@ -21,6 +21,10 @@ debug = 0
 [profile.release]
 lto = "thin"
 codegen-units = 1
+# Optimize for size and drop debug symbols: about a quarter smaller. Not
+# `panic = "abort"`: GPUI and GPUI Kit catch panics internally.
+opt-level = "s"
+strip = true
 
 # Upstream 0.3.10 uses unstable Option::map_or_default on macOS.
 # Keep the supplied GPUI Kit version working with stable Rust.
