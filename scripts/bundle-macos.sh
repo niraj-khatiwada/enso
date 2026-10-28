@@ -37,11 +37,44 @@ cat > "$bundle/Contents/Info.plist" <<PLIST
 <key>LSMinimumSystemVersion</key><string>11.0</string>
 <key>NSHighResolutionCapable</key><true/>
 <key>NSSupportsAutomaticGraphicsSwitching</key><true/>
+<key>CFBundleDocumentTypes</key>
+<array>
+  <dict>
+    <key>CFBundleTypeName</key><string>Markdown Document</string>
+    <key>CFBundleTypeRole</key><string>Editor</string>
+    <key>LSHandlerRank</key><string>Default</string>
+    <key>LSItemContentTypes</key><array><string>net.daringfireball.markdown</string></array>
+  </dict>
+  <dict>
+    <key>CFBundleTypeName</key><string>Folder</string>
+    <key>CFBundleTypeRole</key><string>Viewer</string>
+    <key>LSHandlerRank</key><string>None</string>
+    <key>LSItemContentTypes</key><array><string>public.folder</string></array>
+  </dict>
+</array>
+<key>UTImportedTypeDeclarations</key>
+<array>
+  <dict>
+    <key>UTTypeIdentifier</key><string>net.daringfireball.markdown</string>
+    <key>UTTypeDescription</key><string>Markdown Document</string>
+    <key>UTTypeConformsTo</key><array><string>public.plain-text</string></array>
+    <key>UTTypeTagSpecification</key>
+    <dict>
+      <key>public.filename-extension</key>
+      <array><string>md</string><string>markdown</string><string>mdown</string><string>mkd</string></array>
+      <key>public.mime-type</key><array><string>text/markdown</string></array>
+    </dict>
+  </dict>
+</array>
 </dict></plist>
 PLIST
 
+# The Quick Look preview for Markdown files, signed with its own entitlements.
+./scripts/build-quicklook.sh "$bundle"
+
 # Ad-hoc signature: Apple Silicon refuses to run unsigned binaries. This is not
-# a Developer ID signature, so Gatekeeper still warns on other Macs.
-codesign --force --deep --sign - "$bundle"
+# a Developer ID signature, so Gatekeeper still warns on other Macs. Not
+# --deep: that would re-sign the extension without its sandbox entitlements.
+codesign --force --sign - "$bundle"
 
 printf '%s\n' "$bundle"
