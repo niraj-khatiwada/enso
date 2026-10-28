@@ -1,0 +1,42 @@
+[package]
+name = "enso"
+version = "0.1.0"
+edition = "2024"
+description = "A quiet, native Markdown workspace"
+license = "MIT"
+
+[dependencies]
+dirs = "6.0.0"
+gpui-test = { package = "gpui-pre", version = "=0.3.10", features = ["test-support"], optional = true }
+gpui-kit = { path = "../gpui-kit-main/crates/kit" }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", default-features = false, features = ["NSApplication", "NSImage"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["NSData"] }
+
+[profile.dev]
+debug = 0
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
+# Upstream 0.3.10 uses unstable Option::map_or_default on macOS.
+# Keep the supplied GPUI Kit version working with stable Rust.
+[patch.crates-io]
+gpui-pre-macos = { path = "vendor/gpui-pre-macos" }
+
+[features]
+ui-tests = ["dep:gpui-test"]
+
+# Keep the text engine fast during `cargo run`: building a million-line
+# display index with unoptimized rope/tree iterators stalls the UI for seconds.
+[profile.dev.package.gpui-base]
+opt-level = 2
+
+[profile.dev.package.ropey]
+opt-level = 3
+
+[profile.dev.package.gpui-pre-sum-tree]
+opt-level = 3
