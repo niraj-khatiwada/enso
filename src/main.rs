@@ -87,6 +87,13 @@ impl Document {
 #[derive(Clone)]
 struct SidebarResize;
 
+/// An image pasted into a note: raw data (a screenshot) or a file copied in a
+/// file manager.
+enum PastedImage {
+    Data(gpui_kit::Image),
+    File(PathBuf),
+}
+
 /// An entry being named in the sidebar before it exists on disk.
 struct NewEntry {
     dir: PathBuf,
@@ -946,6 +953,72 @@ impl Enso {
                 self.naming = Some(NewEntry { dir, folder });
                 self.message(error.to_string(), true, cx);
             }
+        }
+    }
+
+    /// Save pasted images under the workspace's hidden `.assets/images` and
+    /// insert an `<img>` for each at the cursor, one per line. A file outside the workspace keeps
+    /// its images beside it instead, in its own folder's `.assets/images`.
+    fn paste_images(
+        &mut self,
+        images: Vec<PastedImage>,
+        editor: Entity<EditorState>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(doc_path) = self
+            .documents
+            .iter()
+            .find(|doc| doc.editor.entity_id() == editor.entity_id())
+            .and_then(|doc| doc.path.clone())
+        else {
+            self.message("Save this note before pasting images into it.", true, cx);
+            return;
+        };
+        let Some(doc_dir) = doc_path.parent().map(PathBuf::from) else {
+            return;
+        };
+        let root = self
+            .root
+            .clone()
+            .filter(|root| doc_dir.starts_with(root))
+            .unwrap_or_else(|| doc_dir.clone());
+        let mut links = Vec::new();
+        for image in images {
+            let saved = match &image {
+                PastedImage::Data(image) => {
+                    files::save_image(&root, None, &image.bytes, image.format.extension())
+                }
+                PastedImage::File(path) => files::import_image(&root, path),
+            };
+            match saved {
+                Ok(saved) => {
+                    let alt = saved
+                        .file_stem()
+                        .map(|s| s.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| "image".into());
+                    // An <img> tag rather than ![](): Markdown images cannot be
+                    // sized, and this one starts at the reading column's width.
+                    let attr = |value: &str| {
+                        value
+                            .replace('&', "&amp;")
+                            .replace('"', "&quot;")
+                            .replace('<', "&lt;")
+                    };
+                    let link = files::relative_link(&doc_dir, &saved);
+                    links.push(format!(
+                        "<img src=\"{}\" alt=\"{}\" width=\"100%\" />",
+                        attr(&link),
+                        attr(&alt)
+                    ));
+                }
+                Err(error) => {
+                    self.message(format!("Could not save the image: {error}"), true, cx)
+                }
+            }
+        }
+        if !links.is_empty() {
+            editor.update(cx, |editor, cx| editor.replace(links.join("\n"), window, cx));
         }
     }
 
@@ -1815,7 +1888,24 @@ impl Render for Enso {
                                 .text_color(muted),
                             )
                             .when(!renaming, |row| {
-                                row.child(div().min_w_0().truncate().child(label))
+                                let path = path.clone();
+                                row.child(
+                                    // Only a double-click on the name itself renames;
+                                    // the label is as wide as its text.
+                                    div()
+                                        .id(("file-name", i))
+                                        .min_w_0()
+                                        .truncate()
+                                        .child(label)
+                                        .on_click(cx.listener(
+                                            move |this, event: &ClickEvent, w, cx| {
+                                                if event.click_count() >= 2 {
+                                                    cx.stop_propagation();
+                                                    this.start_rename(path.clone(), w, cx);
+                                                }
+                                            },
+                                        )),
+                                )
                             })
                             .when(renaming, |row| {
                                 row.child(
@@ -1855,11 +1945,12 @@ impl Render for Enso {
                                 if pending {
                                     return;
                                 }
-                                this.selected = Some(path.clone());
+                                // The second click of a double-click only renames,
+                                // and only on the name (see the label above).
                                 if event.click_count() >= 2 {
-                                    this.start_rename(path.clone(), w, cx);
                                     return;
                                 }
+                                this.selected = Some(path.clone());
                                 if entry.directory {
                                     if !this.expanded.remove(&path) {
                                         this.expanded.insert(path.clone());
@@ -1904,7 +1995,41 @@ impl Render for Enso {
                                 .bordered(false)
                                 .size_full()
                                 .font_family(theme.mono_font_family.clone())
-                                .text_sm(),
+                                .text_sm()
+                                .on_paste({
+                                    let weak = cx.entity().downgrade();
+                                    let editor = document.editor.clone();
+                                    move |item, window, cx| {
+                                        // Text pastes as usual. Image data (a screenshot)
+                                        // or image files (copied in Finder) are saved into
+                                        // the workspace and linked instead.
+                                        let mut images = Vec::new();
+                                        for entry in item.entries() {
+                                            match entry {
+                                                ClipboardEntry::Image(image) => {
+                                                    images.push(PastedImage::Data(image.clone()))
+                                                }
+                                                ClipboardEntry::ExternalPaths(paths) => images.extend(
+                                                    paths
+                                                        .paths()
+                                                        .iter()
+                                                        .filter(|p| files::is_image(p))
+                                                        .cloned()
+                                                        .map(PastedImage::File),
+                                                ),
+                                                _ => {}
+                                            }
+                                        }
+                                        if images.is_empty() {
+                                            return false;
+                                        }
+                                        let editor = editor.clone();
+                                        let _ = weak.update(cx, |this, cx| {
+                                            this.paste_images(images, editor, window, cx)
+                                        });
+                                        true
+                                    }
+                                }),
                         )
                         .into_any_element(),
                 );
@@ -2379,6 +2504,71 @@ fn open_enso_window(
     }
 }
 
+/// Open files and folders handed to Enso by the system (double-clicking a
+/// Markdown file in Finder, Open With, dropping on the Dock icon).
+fn open_urls(urls: Vec<String>, cx: &mut App) {
+    for url in urls {
+        let Some(path) = url::Url::parse(&url)
+            .ok()
+            .and_then(|url| url.to_file_path().ok())
+        else {
+            continue;
+        };
+        let views = open_views(cx);
+        if path.is_dir() {
+            match window_for(&path, EntityId::from(0u64), cx) {
+                Some(handle) => activate(handle, cx),
+                None => match views
+                    .iter()
+                    .find(|(_, view)| view.read(cx).root.is_none())
+                    .cloned()
+                {
+                    // A window with no workspace yet takes the folder.
+                    Some((handle, view)) => {
+                        let _ = handle.update(cx, |_, window, cx| {
+                            view.update(cx, |view, cx| view.open_folder(path, cx));
+                            window.activate_window();
+                        });
+                    }
+                    None => open_workspace_window(Some(path), cx),
+                },
+            }
+            continue;
+        }
+        // A file goes to the window whose workspace holds it (the deepest one),
+        // else the window in front, else a new window.
+        let target = views
+            .iter()
+            .filter(|(_, view)| {
+                view.read(cx)
+                    .root
+                    .as_ref()
+                    .is_some_and(|root| path.starts_with(root))
+            })
+            .max_by_key(|(_, view)| {
+                view.read(cx)
+                    .root
+                    .as_ref()
+                    .map_or(0, |root| root.components().count())
+            })
+            .or_else(|| {
+                let active = cx.active_window();
+                views.iter().find(|(handle, _)| Some(*handle) == active)
+            })
+            .or(views.first())
+            .cloned();
+        match target {
+            Some((handle, view)) => {
+                let _ = handle.update(cx, |_, window, cx| {
+                    view.update(cx, |view, cx| view.open_path(path, window, cx));
+                    window.activate_window();
+                });
+            }
+            None => open_enso_window(cx, move |app, window, cx| app.open_path(path, window, cx)),
+        }
+    }
+}
+
 fn open_workspace_window(root: Option<PathBuf>, cx: &mut App) {
     open_enso_window(cx, move |app, _, cx| {
         if let Some(root) = root {
@@ -2389,9 +2579,14 @@ fn open_workspace_window(root: Option<PathBuf>, cx: &mut App) {
 
 fn main() {
     let initial = std::env::args_os().nth(1).map(PathBuf::from);
-    gpui_kit::application()
-        .with_assets(gpui_kit::assets::AllAssets)
-        .run(move |cx| {
+    let app = gpui_kit::application().with_assets(gpui_kit::assets::AllAssets);
+    // The system can hand over files before the app has a context to open them
+    // with; queue them until the run loop below picks them up.
+    let (opened_tx, mut opened_rx) = futures::channel::mpsc::unbounded::<Vec<String>>();
+    app.on_open_urls(move |urls| {
+        let _ = opened_tx.unbounded_send(urls);
+    });
+    app.run(move |cx| {
             gpui_kit::init(cx);
             app_icon::init();
             settings::init(cx);
@@ -2483,6 +2678,13 @@ fn main() {
                     }),
                 }
             }
+            cx.spawn(async move |cx| {
+                use futures::StreamExt as _;
+                while let Some(urls) = opened_rx.next().await {
+                    cx.update(|cx| open_urls(urls, cx));
+                }
+            })
+            .detach();
             cx.activate(true);
         });
 }

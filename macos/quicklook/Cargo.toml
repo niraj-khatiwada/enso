@@ -1,0 +1,22 @@
+[package]
+name = "enso-quicklook"
+version = "0.1.0"
+edition = "2024"
+description = "Markdown to HTML for Enso's Quick Look extension"
+license = "MIT"
+publish = false
+
+# Built on its own, not as part of the Enso app crate.
+[workspace]
+
+[lib]
+crate-type = ["staticlib"]
+
+[dependencies]
+markdown = "1.0.0"
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = true

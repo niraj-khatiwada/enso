@@ -40,6 +40,10 @@ pub fn list_folder(path: &Path) -> io::Result<Vec<Entry>> {
         if kind.is_symlink() || !(kind.is_dir() || kind.is_file()) {
             continue;
         }
+        // Hidden entries (.git, .DS_Store, Enso's own .assets) stay out of the tree.
+        if entry.file_name().to_string_lossy().starts_with('.') {
+            continue;
+        }
         entries.push(Entry {
             path: entry.path(),
             directory: kind.is_dir(),
@@ -84,6 +88,82 @@ pub fn create_folder(root: &Path, name: &str) -> io::Result<PathBuf> {
     let path = root.join(plain_name(name)?);
     fs::create_dir(&path)?;
     Ok(path)
+}
+
+/// Where pasted images are kept, relative to the workspace root.
+pub const IMAGES_DIR: &str = ".assets/images";
+
+/// Whether `path` names an image the reading view can show.
+pub fn is_image(path: &Path) -> bool {
+    path.extension().and_then(|v| v.to_str()).is_some_and(|v| {
+        matches!(
+            v.to_ascii_lowercase().as_str(),
+            "png" | "jpg" | "jpeg" | "gif" | "webp" | "svg" | "bmp" | "tif" | "tiff" | "ico"
+        )
+    })
+}
+
+/// Store pasted image bytes under `root/.assets/images`, named after `stem`
+/// (or a timestamp) and never replacing an image already there.
+pub fn save_image(
+    root: &Path,
+    stem: Option<&str>,
+    bytes: &[u8],
+    extension: &str,
+) -> io::Result<PathBuf> {
+    let dir = root.join(IMAGES_DIR);
+    fs::create_dir_all(&dir)?;
+    let stem = stem.map(str::to_owned).unwrap_or_else(|| {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        format!("image-{stamp}")
+    });
+    for attempt in 0.. {
+        let name = if attempt == 0 {
+            format!("{stem}.{extension}")
+        } else {
+            format!("{stem}-{attempt}.{extension}")
+        };
+        let path = dir.join(name);
+        match OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(mut file) => {
+                file.write_all(bytes)?;
+                return Ok(path);
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    unreachable!()
+}
+
+/// Copy an image file (say, one copied in Finder) into `root/.assets/images`,
+/// keeping its name.
+pub fn import_image(root: &Path, source: &Path) -> io::Result<PathBuf> {
+    let bytes = fs::read(source)?;
+    let stem = source.file_stem().map(|s| s.to_string_lossy().into_owned());
+    let extension = source
+        .extension()
+        .map(|e| e.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_else(|| "png".into());
+    save_image(root, stem.as_deref(), &bytes, &extension)
+}
+
+/// `to` written relative to the folder `from`, with forward slashes, as a
+/// Markdown link expects.
+pub fn relative_link(from: &Path, to: &Path) -> String {
+    let from: Vec<_> = from.components().collect();
+    let to: Vec<_> = to.components().collect();
+    let shared = from.iter().zip(&to).take_while(|(a, b)| a == b).count();
+    let mut parts: Vec<String> = vec!["..".into(); from.len() - shared];
+    parts.extend(
+        to[shared..]
+            .iter()
+            .map(|c| c.as_os_str().to_string_lossy().into_owned()),
+    );
+    parts.join("/")
 }
 
 /// Rename a file or folder in place. Never replaces another entry, though a
@@ -154,6 +234,17 @@ fn replace(path: &Path, content: &str) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn links_are_relative_to_the_document() {
+        let root = Path::new("/w");
+        let image = Path::new("/w/.assets/images/a.png");
+        assert_eq!(relative_link(root, image), ".assets/images/a.png");
+        assert_eq!(
+            relative_link(Path::new("/w/notes/daily"), image),
+            "../../.assets/images/a.png"
+        );
+    }
     #[test]
     fn file_lifecycle_guards_existing_data() {
         let root = std::env::temp_dir().join(format!("enso-test-{}", std::process::id()));
@@ -177,6 +268,25 @@ mod tests {
         assert!(save(&path, "# Hello\nनमस्ते", "my edit").is_err());
         assert!(save_as(&path, "overwrite").is_err());
         assert_eq!(read_text(&path).unwrap(), "external edit");
+        let image = save_image(&root, None, b"png bytes", "png").unwrap();
+        assert!(image.starts_with(root.join(".assets/images")));
+        assert_ne!(save_image(&root, None, b"again", "png").unwrap(), image);
+        let source = root.join("Photo.JPG");
+        fs::write(&source, b"jpeg bytes").unwrap();
+        let imported = import_image(&root, &source).unwrap();
+        assert_eq!(imported, root.join(".assets/images/Photo.jpg"));
+        assert_eq!(fs::read(&imported).unwrap(), b"jpeg bytes");
+        assert_eq!(
+            import_image(&root, &source).unwrap(),
+            root.join(".assets/images/Photo-1.jpg")
+        );
+        assert!(is_image(&source) && !is_image(&root.join("notes.md")));
+        assert!(
+            list_folder(&root)
+                .unwrap()
+                .iter()
+                .all(|e| !e.path.file_name().unwrap().to_string_lossy().starts_with('.'))
+        );
         fs::write(root.join("binary"), [0, 1, 2]).unwrap();
         assert!(read_text(&root.join("binary")).is_err());
         assert!(is_markdown(Path::new("NOTE.MD")));
