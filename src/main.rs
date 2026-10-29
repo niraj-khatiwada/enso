@@ -18,6 +18,7 @@ use gpui_kit::component::{
     h_flex,
     input::{Editor, EditorState, Input, InputEvent, InputState},
     menu::{ContextMenuExt, PopupMenuItem},
+    tooltip::Tooltip,
     popover::Popover,
     resizable::{HandleEdge, h_resizable, resizable_panel, resize_handle},
     text::{RenderedText, TextView, TextViewState},
@@ -208,6 +209,8 @@ struct TreeRow {
 }
 
 const TREE_INDENT: f32 = 16.;
+/// Widest a tab's file name gets before it ends in "…".
+const TAB_TITLE_WIDTH: f32 = 200.;
 /// Height of the macOS title bar strip that sits over the top of the window.
 const TITLEBAR_HEIGHT: f32 = 38.;
 /// Left inset GPUI Kit's title bar keeps: room for the macOS traffic lights,
@@ -1579,11 +1582,20 @@ impl Render for Enso {
                         tab.text_color(theme.muted_foreground)
                             .hover(|tab| tab.bg(theme.secondary.opacity(0.6)))
                     })
-                    .child(format!(
-                        "{}{}",
-                        document.title(),
-                        if document.dirty(cx) { " •" } else { "" }
-                    ))
+                    // Long names end in "…" at a fixed width; the full name is in
+                    // the tooltip, and the unsaved dot stays outside the cut.
+                    .child(
+                        div()
+                            .max_w(px(TAB_TITLE_WIDTH))
+                            .min_w_0()
+                            .truncate()
+                            .child(document.title()),
+                    )
+                    .when(document.dirty(cx), |tab| tab.child("•"))
+                    .tooltip({
+                        let title = document.title();
+                        move |window, cx| Tooltip::new(title.clone()).build(window, cx)
+                    })
                     // Built only while shown: a hidden button per tab made every
                     // frame cost more with each open file.
                     .when(reveal > 0.001, |tab| tab.child(
