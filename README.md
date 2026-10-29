@@ -36,6 +36,16 @@ On the first launch without a file/folder argument, Enso creates and opens an ed
 
 Use Cmd on macOS and Ctrl on Windows/Linux: O opens a file, Shift O opens a folder, N creates a file, W closes the current file after saving pending edits, S saves, E toggles Edit/Read, backslash toggles Split (press again to return to the previous view), and Q quits. Ctrl+E and Ctrl+backslash also work on macOS; Split no longer requires Shift.
 
+## Releases
+
+`.github/workflows/release.yml` builds release packages on GitHub Actions: a macOS disk image for Apple silicon (with the Quick Look extension), Windows zips for x64 and ARM64, and Linux tarballs for x64 and ARM64. Push a version tag to publish them as a GitHub Release:
+
+```sh
+git tag v0.1.0 && git push origin v0.1.0
+```
+
+Or run the workflow by hand from the Actions tab to only build them. The macOS app is ad-hoc signed, not notarized, so Gatekeeper asks on first open. On Linux, unpack the tarball and run `./install.sh` to add Enso to the app launcher.
+
 ## Keyboard shortcuts
 
 ⌘ on macOS, Ctrl on Windows and Linux.
