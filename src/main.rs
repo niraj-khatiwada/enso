@@ -237,9 +237,22 @@ fn translucent() -> bool {
 /// The content column's background. Over a system backdrop it lets a little of
 /// the tint through, so the sidebar and content read as one surface rather
 /// than a hard light/dark split.
-fn content_background(cx: &App) -> Hsla {
+/// Whether the system backdrop actually shows: there is one, and it is as
+/// light or dark as Enso's theme. macOS's follows the appearance Enso sets;
+/// Windows' Mica follows the system theme, so a Light Enso on a dark Windows
+/// (or the reverse) would show a dark backdrop under light content. Then
+/// everything is painted solid instead.
+fn backdrop_visible(window: &Window, cx: &App) -> bool {
+    let backdrop_dark = matches!(
+        window.appearance(),
+        WindowAppearance::Dark | WindowAppearance::VibrantDark
+    );
+    translucent() && backdrop_dark == cx.theme().mode.is_dark()
+}
+
+fn content_background(window: &Window, cx: &App) -> Hsla {
     let theme = cx.theme();
-    if translucent() {
+    if backdrop_visible(window, cx) {
         theme
             .background
             .opacity(if theme.mode.is_dark() { 0.72 } else { 0.78 })
@@ -1489,6 +1502,7 @@ impl Render for Enso {
             self.tree_rows(root, &mut Vec::new(), &mut rows);
         }
         let theme = cx.theme().clone();
+        let backdrop = backdrop_visible(window, cx);
         let motion = theme.motion_tokens();
         let sidebar_reveal = transition(
             "sidebar-reveal",
@@ -1866,8 +1880,8 @@ impl Render for Enso {
             // Over a system backdrop the native sidebar material (tinted by the
             // desktop) shows through. Dark mode lets far more of the wallpaper
             // through, so only there it gets a veil of the sidebar color.
-            .when(!translucent(), |sidebar| sidebar.bg(theme.sidebar))
-            .when(translucent() && theme.mode.is_dark(), |sidebar| {
+            .when(!backdrop, |sidebar| sidebar.bg(theme.sidebar))
+            .when(backdrop && theme.mode.is_dark(), |sidebar| {
                 sidebar.bg(theme.sidebar.opacity(0.6))
             })
             .border_r_1()
@@ -2555,7 +2569,7 @@ impl Render for Enso {
             .size_full()
             // Over a translucent backdrop the window itself stays clear; the
             // content column paints its own opaque background.
-            .when(!translucent(), |view| view.bg(theme.background))
+            .when(!backdrop, |view| view.bg(theme.background))
             .text_color(theme.foreground)
             .on_action(cx.listener(|this, _: &OpenFile, w, cx| this.pick(false, w, cx)))
             .on_action(cx.listener(|this, _: &OpenFolder, w, cx| this.pick(true, w, cx)))
@@ -2647,7 +2661,7 @@ impl Render for Enso {
                                 .flex_1()
                                 .min_w_0()
                                 .h_full()
-                                .bg(content_background(cx))
+                                .bg(content_background(window, cx))
                                 // Room for the floating title bar; its bottom
                                 // border stops at the sidebar.
                                 .when(custom_titlebar.is_some(), |view| {
