@@ -48,10 +48,10 @@ impl Global for Preferences {}
 actions!(settings, [CloseSettings]);
 
 fn path() -> Option<PathBuf> {
-    dirs::config_dir().map(|p| p.join("Enso").join("appearance"))
+    dirs::config_dir().map(|p| crate::files::app_folder(p).join("appearance"))
 }
 fn line_numbers_path() -> Option<PathBuf> {
-    dirs::config_dir().map(|p| p.join("Enso").join("line-numbers"))
+    dirs::config_dir().map(|p| crate::files::app_folder(p).join("line-numbers"))
 }
 fn load_line_numbers(path: &Path) -> bool {
     std::fs::read_to_string(path).is_ok_and(|value| value.trim() == "on")
@@ -230,7 +230,7 @@ pub fn open(cx: &mut App) {
                 }
             } else {
                 TitlebarOptions {
-                    title: Some("Enso Settings".into()),
+                    title: Some("enso Settings".into()),
                     ..Default::default()
                 }
             }),
@@ -246,7 +246,7 @@ pub fn open(cx: &mut App) {
         cx,
         |window, cx| {
             cx.new(|cx| {
-                window.set_window_title("Enso Settings");
+                window.set_window_title("enso Settings");
                 let focus = cx.focus_handle();
                 focus.focus(window, cx);
                 SettingsWindow {
@@ -349,7 +349,7 @@ impl SettingsWindow {
             .gap_6()
             .child(page_header(
                 "Appearance",
-                "Choose how Enso looks on your device.",
+                "Choose how enso looks on your device.",
                 theme.muted_foreground,
             ))
             .child(

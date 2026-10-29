@@ -1,7 +1,7 @@
 #!/bin/sh
-# Build Enso's Quick Look extension into an app bundle: the Rust Markdown
+# Build enso's Quick Look extension into an app bundle: the Rust Markdown
 # renderer as a static library, linked into a Swift preview provider.
-# Usage: scripts/build-quicklook.sh path/to/Enso.app
+# Usage: scripts/build-quicklook.sh path/to/enso.app
 set -eu
 cd "$(dirname "$0")/.."
 

@@ -4,6 +4,19 @@ use std::{
     path::{Component, Path, PathBuf},
 };
 
+/// enso's own folder inside a system folder (config or app data). Earlier
+/// versions called it "Enso"; that folder is renamed once, so settings,
+/// workspaces and the welcome note carry over (on case-sensitive file systems
+/// the two names would otherwise be separate folders).
+pub fn app_folder(base: PathBuf) -> PathBuf {
+    let folder = base.join("enso");
+    let earlier = base.join("Enso");
+    if !folder.exists() && earlier.is_dir() {
+        let _ = fs::rename(&earlier, &folder);
+    }
+    folder
+}
+
 pub fn is_markdown(path: &Path) -> bool {
     path.extension().and_then(|v| v.to_str()).is_some_and(|v| {
         matches!(
@@ -18,7 +31,7 @@ pub fn read_text(path: &Path) -> io::Result<String> {
     if bytes.contains(&0) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "This appears to be a binary file. Enso opens UTF-8 text files.",
+            "This appears to be a binary file. enso opens UTF-8 text files.",
         ));
     }
     String::from_utf8(bytes)
@@ -257,7 +270,7 @@ pub fn rename(path: &Path, name: &str) -> io::Result<PathBuf> {
 pub fn save(path: &Path, expected: &str, content: &str) -> io::Result<()> {
     if read_text(path)? != expected {
         return Err(io::Error::other(
-            "The file changed on disk. Automatic saving stopped to preserve both versions; your edits remain open in Enso.",
+            "The file changed on disk. Automatic saving stopped to preserve both versions; your edits remain open in enso.",
         ));
     }
     replace(path, content)

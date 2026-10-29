@@ -1,4 +1,4 @@
-# Enso
+# enso
 
 A native, reading-first Markdown workspace built in Rust with GPUI Kit. No webview or Tauri.
 
@@ -12,20 +12,20 @@ cargo run -- /absolute/path/to/note.md
 cargo run -- /absolute/path/to/folder
 ```
 
-On macOS, `make` lists the build targets. `make build.macos` produces the release: an optimized `target/Enso.app` with its Quick Look extension (Space-bar previews of Markdown in Finder), ad-hoc signed, and `target/Enso-<version>-<arch>.dmg`. `make app` stops at the app, `make app.debug` makes a quick unoptimized one, and `make install` copies it to `/Applications` and registers it and its Quick Look preview. The bundle uses `assets/Enso.icns`; `assets/enso.png` also supplies the Dock icon during `cargo run`.
+On macOS, `make` lists the build targets. `make build.macos` produces the release: an optimized `target/enso.app` with its Quick Look extension (Space-bar previews of Markdown in Finder), ad-hoc signed, and `target/enso-<version>-<arch>.dmg`. `make app` stops at the app, `make app.debug` makes a quick unoptimized one, and `make install` copies it to `/Applications` and registers it and its Quick Look preview. The bundle uses `assets/enso.icns`; `assets/enso.png` also supplies the Dock icon during `cargo run`.
 
 The initial build downloads and compiles GPUI's native dependencies. Subsequent builds are incremental. Development builds optimize GPUI Base, Ropey, and the text index to avoid slow million-line editor initialization under `cargo run`; the first rebuild after a profile change takes longer.
 
 ## First version
 
-On the first launch without a file/folder argument, Enso creates and opens an editable `Get Started.md` in its local application data folder (`~/Library/Application Support/Enso` on macOS, `%LOCALAPPDATA%/Enso` on Windows, and `$XDG_DATA_HOME/Enso` or `~/.local/share/Enso` on Linux). It auto-saves like any document. A separate first-launch marker prevents repeated opening or recreation, and existing sample edits are preserved. Explicit file/folder arguments take priority.
+On the first launch without a file/folder argument, enso creates and opens an editable `Get Started.md` in its local application data folder (`~/Library/Application Support/enso` on macOS, `%LOCALAPPDATA%/enso` on Windows, and `$XDG_DATA_HOME/enso` or `~/.local/share/enso` on Linux). It auto-saves like any document. A separate first-launch marker prevents repeated opening or recreation, and existing sample edits are preserved. Explicit file/folder arguments take priority.
 
 - Native dialogs for opening individual UTF-8 text files or folders.
 - Lazy folder browsing, nested directory expansion, and manual refresh.
 - New files in the workspace root. Without a folder, choose the file location when creating a note.
 - Document tabs retain edits while switching files or folders. Hover a tab to smoothly expand its pill and fade in the close icon, with no reserved close-button space at rest; Ctrl W (or Cmd W on macOS) closes the current file after saving pending edits.
 - Draggable dividers resize the sidebar and the editor/preview split. The sidebar animates open/closed while preserving its resized width and respecting reduced-motion settings. Toolbar actions use icons with tooltips.
-- macOS uses a compact custom titlebar with native traffic lights, Enso branding, and a sidebar collapse/expand button. File tabs share the macOS titlebar, including their animated hover close buttons; there is no separate tab row. Windows and Linux keep their native titlebars.
+- macOS uses a compact custom titlebar with native traffic lights, enso branding, and a sidebar collapse/expand button. File tabs share the macOS titlebar, including their animated hover close buttons; there is no separate tab row. Windows and Linux keep their native titlebars.
 - Read and Split reveal the section containing the editor cursor when switching views. In Split, editor clicks and cursor movement also move the preview to the corresponding passage.
 - A compact 20 px status bar shows a word count; counting runs on background snapshots and debounces while typing.
 - Markdown files above 256 KiB use a virtual section reader: only visible sections are parsed and laid out, with source editing initialized on demand outside the render pass. Large-file editing disables syntax highlighting, code folding, auto-close, and soft wrapping.
@@ -40,7 +40,7 @@ Use Cmd on macOS and Ctrl on Windows/Linux: O opens a file, Shift O opens a fold
 
 `.github/workflows/release.yml` builds release packages on GitHub Actions: a macOS disk image for Apple silicon (with the Quick Look extension), Windows zips for x64 and ARM64, and Linux tarballs for x64 and ARM64. Run it by hand from the Actions tab (Release -> Run workflow): it puts the packages in a draft GitHub Release for the version in `Cargo.toml`, to check and publish from the Releases page. Running it again for the same version replaces the draft's files.
 
-The macOS app is ad-hoc signed, not notarized, so Gatekeeper asks on first open. On Linux, unpack the tarball and run `./install.sh` to add Enso to the app launcher.
+The macOS app is ad-hoc signed, not notarized, so Gatekeeper asks on first open. On Linux, unpack the tarball and run `./install.sh` to add enso to the app launcher.
 
 ## Keyboard shortcuts
 
@@ -102,4 +102,4 @@ The file lifecycle test covers Unicode text, saving, conflict detection, duplica
 
 ## Current scope
 
-Text input is UTF-8; binary and other encodings show an error. Workspace symlinks are skipped to avoid cycles. Changes auto-save to the original file. Workspace state is retained only while Enso is running. Closing the last file leaves the window open. Save failures keep the file open. Reading, section indexing, and disk writes run on background workers. The large-file reader retains the complete source and indexes UTF-8 byte ranges without parsing a full-document AST. It prefers paragraph boundaries and carries fenced code blocks across sections. Very long paragraphs, lists, tables, and reference definitions spanning sections can render differently from a whole-document parse; cross-section text selection is not yet supported. No file watcher, search across notes, plugins, or vault database yet.
+Text input is UTF-8; binary and other encodings show an error. Workspace symlinks are skipped to avoid cycles. Changes auto-save to the original file. Workspace state is retained only while enso is running. Closing the last file leaves the window open. Save failures keep the file open. Reading, section indexing, and disk writes run on background workers. The large-file reader retains the complete source and indexes UTF-8 byte ranges without parsing a full-document AST. It prefers paragraph boundaries and carries fenced code blocks across sections. Very long paragraphs, lists, tables, and reference definitions spanning sections can render differently from a whole-document parse; cross-section text selection is not yet supported. No file watcher, search across notes, plugins, or vault database yet.

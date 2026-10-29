@@ -1,5 +1,5 @@
 #!/bin/sh
-# The full macOS release: optimized build, Enso.app with its Quick Look
+# The full macOS release: optimized build, enso.app with its Quick Look
 # extension, signing, and a drag-to-Applications disk image.
 set -eu
 cd "$(dirname "$0")/.."
@@ -10,12 +10,12 @@ step() {
 
 version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
 arch=$(uname -m)
-app="$PWD/target/Enso.app"
-dmg="$PWD/target/Enso-$version-$arch.dmg"
+app="$PWD/target/enso.app"
+dmg="$PWD/target/enso-$version-$arch.dmg"
 
-# bundle-macos.sh builds the release binary, assembles Enso.app, builds the
+# bundle-macos.sh builds the release binary, assembles enso.app, builds the
 # Quick Look extension into it (build-quicklook.sh), and signs the bundle.
-step "Building Enso $version ($arch): app, Quick Look extension, signature"
+step "Building enso $version ($arch): app, Quick Look extension, signature"
 ./scripts/bundle-macos.sh
 
 step "Checking the signature"
@@ -28,7 +28,7 @@ cp -R "$app" "$staging/"
 ln -s /Applications "$staging/Applications"
 rm -f "$dmg"
 hdiutil create \
-    -volname "Enso $version" \
+    -volname "enso $version" \
     -srcfolder "$staging" \
     -fs HFS+ \
     -format UDZO \

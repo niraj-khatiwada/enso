@@ -3,7 +3,7 @@
 <plist version="1.0">
 <dict>
   <key>CFBundleDevelopmentRegion</key><string>en</string>
-  <key>CFBundleDisplayName</key><string>Enso</string>
+  <key>CFBundleDisplayName</key><string>enso</string>
   <key>CFBundleExecutable</key><string>EnsoQuickLook</string>
   <key>CFBundleIdentifier</key><string>app.enso.markdown.quicklook</string>
   <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>

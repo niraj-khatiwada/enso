@@ -1,5 +1,5 @@
 #!/bin/sh
-# Build Enso.app. Release by default; pass --debug for a quick unoptimized bundle.
+# Build enso.app. Release by default; pass --debug for a quick unoptimized bundle.
 set -eu
 cd "$(dirname "$0")/.."
 
@@ -15,20 +15,20 @@ else
 fi
 
 version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
-bundle="$PWD/target/Enso.app"
+bundle="$PWD/target/enso.app"
 rm -rf "$bundle"
 mkdir -p "$bundle/Contents/MacOS" "$bundle/Contents/Resources"
-cp "target/$profile/enso" "$bundle/Contents/MacOS/Enso"
-cp assets/Enso.icns "$bundle/Contents/Resources/Enso.icns"
+cp "target/$profile/enso" "$bundle/Contents/MacOS/enso"
+cp assets/enso.icns "$bundle/Contents/Resources/enso.icns"
 cat > "$bundle/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
-<key>CFBundleName</key><string>Enso</string>
-<key>CFBundleDisplayName</key><string>Enso</string>
+<key>CFBundleName</key><string>enso</string>
+<key>CFBundleDisplayName</key><string>enso</string>
 <key>CFBundleIdentifier</key><string>app.enso.markdown</string>
-<key>CFBundleExecutable</key><string>Enso</string>
-<key>CFBundleIconFile</key><string>Enso.icns</string>
+<key>CFBundleExecutable</key><string>enso</string>
+<key>CFBundleIconFile</key><string>enso.icns</string>
 <key>CFBundlePackageType</key><string>APPL</string>
 <key>CFBundleShortVersionString</key><string>$version</string>
 <key>CFBundleVersion</key><string>$version</string>

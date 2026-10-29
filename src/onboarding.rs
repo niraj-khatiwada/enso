@@ -31,8 +31,8 @@ pub fn first_launch(directory: &Path) -> io::Result<Option<(PathBuf, String)>> {
 
 pub fn load() -> io::Result<Option<(PathBuf, String)>> {
     let directory = dirs::data_local_dir()
-        .ok_or_else(|| io::Error::other("Unable to locate Enso's application data folder"))?
-        .join("Enso");
+        .map(crate::files::app_folder)
+        .ok_or_else(|| io::Error::other("Unable to locate enso's application data folder"))?;
     first_launch(&directory)
 }
 

@@ -306,7 +306,7 @@ struct Enso {
 
 impl Enso {
     fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        window.set_window_title("Enso");
+        window.set_window_title("enso");
         let focus = cx.focus_handle();
         focus.focus(window, cx);
         let filename = cx.new(|cx| InputState::new(window, cx));
@@ -875,8 +875,8 @@ impl Enso {
         workspaces::record(&path, cx);
         let title = path
             .file_name()
-            .map(|n| format!("{} — Enso", n.to_string_lossy()))
-            .unwrap_or_else(|| "Enso".into());
+            .map(|n| format!("{} — enso", n.to_string_lossy()))
+            .unwrap_or_else(|| "enso".into());
         let handle = self.window_handle;
         cx.defer(move |cx| {
             let _ = handle.update(cx, |_, window, _| window.set_window_title(&title));
@@ -2819,7 +2819,7 @@ fn open_enso_window(
                 }
             } else {
                 TitlebarOptions {
-                    title: Some("Enso".into()),
+                    title: Some("enso".into()),
                     ..Default::default()
                 }
             }),
@@ -2856,7 +2856,7 @@ fn open_enso_window(
             });
         }
         Ok(_) => {}
-        Err(error) => eprintln!("Unable to open an Enso window: {error}"),
+        Err(error) => eprintln!("Unable to open an enso window: {error}"),
     }
 }
 
@@ -2995,11 +2995,11 @@ fn main() {
             bind_markdown_keys(cx);
             cx.set_menus(vec![
                 Menu {
-                    name: "Enso".into(),
+                    name: "enso".into(),
                     items: vec![
                         MenuItem::action("Settings…", OpenSettings),
                         MenuItem::separator(),
-                        MenuItem::action("Quit Enso", Quit),
+                        MenuItem::action("Quit enso", Quit),
                     ],
                     disabled: false,
                 },

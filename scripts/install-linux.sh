@@ -1,5 +1,5 @@
 #!/bin/sh
-# Install Enso for the current user on Linux: a launcher entry with its icon,
+# Install enso for the current user on Linux: a launcher entry with its icon,
 # which docks and task switchers match to the running window by its app id.
 # Usage: scripts/install-linux.sh [path/to/enso]   (default: target/release/enso,
 # else target/debug/enso). Run it again after moving the binary.
@@ -11,7 +11,7 @@ bin=${1:-}
 if [ -z "$bin" ]; then
     if [ -x target/release/enso ]; then bin=target/release/enso; else bin=target/debug/enso; fi
 fi
-[ -x "$bin" ] || { echo "No Enso binary at $bin: build it first (cargo build)." >&2; exit 1; }
+[ -x "$bin" ] || { echo "No enso binary at $bin: build it first (cargo build)." >&2; exit 1; }
 bin=$(realpath "$bin")
 
 data=${XDG_DATA_HOME:-$HOME/.local/share}
@@ -22,7 +22,7 @@ cp assets/linux/$id.png "$icon_dir/$id.png"
 cat > "$data/applications/$id.desktop" <<EOF
 [Desktop Entry]
 Type=Application
-Name=Enso
+Name=enso
 Comment=A quiet, native Markdown workspace
 Exec="$bin" %F
 Icon=$id

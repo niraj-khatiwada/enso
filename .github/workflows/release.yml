@@ -1,4 +1,4 @@
-# Release builds of Enso for macOS (Apple silicon), Windows (x64, ARM64) and
+# Release builds of enso for macOS (Apple silicon), Windows (x64, ARM64) and
 # Linux (x64, ARM64).
 #
 # Run it by hand: Actions -> Release -> Run workflow. It builds every package
@@ -28,13 +28,13 @@ jobs:
           workspaces: |
             .
             macos/quicklook -> ../../target/quicklook
-      # Release build, Enso.app with its Quick Look extension, ad-hoc
+      # Release build, enso.app with its Quick Look extension, ad-hoc
       # signature and disk image. Not notarized: Gatekeeper asks on first open.
       - run: ./scripts/build-mac.sh
       - uses: actions/upload-artifact@v4
         with:
           name: enso-macos-arm64
-          path: target/Enso-*.dmg
+          path: target/enso-*.dmg
           if-no-files-found: error
 
   windows:
@@ -61,15 +61,15 @@ jobs:
         shell: pwsh
         run: |
           $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"' | Select-Object -First 1).Matches.Groups[1].Value
-          $dir = "Enso-$version-windows-${{ matrix.arch }}"
+          $dir = "enso-$version-windows-${{ matrix.arch }}"
           New-Item -ItemType Directory $dir | Out-Null
-          Copy-Item target/release/enso.exe "$dir/Enso.exe"
+          Copy-Item target/release/enso.exe "$dir/enso.exe"
           Copy-Item README.md $dir
           Compress-Archive -Path $dir -DestinationPath "$dir.zip"
       - uses: actions/upload-artifact@v4
         with:
           name: enso-windows-${{ matrix.arch }}
-          path: Enso-*-windows-*.zip
+          path: enso-*-windows-*.zip
           if-no-files-found: error
 
   linux:
@@ -102,14 +102,14 @@ jobs:
       - name: Package
         run: |
           version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
-          dir="Enso-$version-linux-${{ matrix.arch }}"
+          dir="enso-$version-linux-${{ matrix.arch }}"
           mkdir -p "$dir/assets/linux" "$dir/scripts"
           cp target/release/enso "$dir/enso"
           cp assets/linux/app.enso.markdown.png "$dir/assets/linux/"
           cp scripts/install-linux.sh "$dir/scripts/"
           cat > "$dir/install.sh" <<'EOF'
           #!/bin/sh
-          # Add Enso to the app launcher, with its icon, for the current user.
+          # Add enso to the app launcher, with its icon, for the current user.
           here=$(cd "$(dirname "$0")" && pwd)
           exec "$here/scripts/install-linux.sh" "$here/enso"
           EOF
@@ -119,7 +119,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: enso-linux-${{ matrix.arch }}
-          path: Enso-*-linux-*.tar.gz
+          path: enso-*-linux-*.tar.gz
           if-no-files-found: error
 
   release:
@@ -154,6 +154,6 @@ jobs:
               --repo "$GITHUB_REPOSITORY" \
               --draft \
               --target "$GITHUB_SHA" \
-              --title "Enso $tag" \
+              --title "enso $tag" \
               --generate-notes
           fi

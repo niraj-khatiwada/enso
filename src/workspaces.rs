@@ -39,7 +39,7 @@ pub struct Workspaces {
 impl Global for Workspaces {}
 
 fn file() -> Option<PathBuf> {
-    dirs::config_dir().map(|p| p.join("Enso").join("workspaces"))
+    dirs::config_dir().map(|p| crate::files::app_folder(p).join("workspaces"))
 }
 
 fn parse(text: &str) -> Vec<Recent> {

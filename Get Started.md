@@ -1,6 +1,6 @@
 # A little space for your thoughts.
 
-Welcome to **Enso**, a quiet home for your Markdown and text files.
+Welcome to **enso**, a quiet home for your Markdown and text files.
 This is a real Markdown file you can edit. Try **Ctrl+E** to switch between reading
 and editing, or **Ctrl+\\** for split view. Your changes save automatically.
 On macOS, the Command-key equivalents also work.
