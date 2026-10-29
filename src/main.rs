@@ -2479,14 +2479,17 @@ impl Render for Enso {
             .on_action(cx.listener(|this, _: &Save, _, cx| this.save(cx)))
             .on_action(cx.listener(|this, _: &CloseFile, _, cx| this.close_current_file(cx)))
             .on_action(cx.listener(|this, _: &NewFolder, w, cx| this.new_folder(w, cx)))
+            // Only when the tree itself has focus: a text field passes Enter
+            // and Cmd-Backspace on to here after handling them, and acting
+            // again would reset a rename in progress (or delete a file).
             .on_action(cx.listener(|this, _: &RenameSelected, w, cx| {
-                match this.selected_entry() {
+                match this.selected_entry().filter(|_| this.focus.is_focused(w)) {
                     Some(path) => this.start_rename(path, w, cx),
                     None => cx.propagate(),
                 }
             }))
             .on_action(cx.listener(|this, _: &DeleteSelected, w, cx| {
-                match this.selected_entry() {
+                match this.selected_entry().filter(|_| this.focus.is_focused(w)) {
                     Some(path) => this.request_delete(path, w, cx),
                     None => cx.propagate(),
                 }
@@ -3073,9 +3076,18 @@ mod transition_tests {
         cx.run_until_parked();
         assert!(note.exists());
 
-        // Rename opens the name field on the selected row.
+        // Rename opens the name field on the selected row, which stays open
+        // to type in, and Enter renames the file on disk.
         cx.simulate_keystrokes(handle, keys.1);
         cx.update(|cx| assert_eq!(view.read(cx).renaming.as_ref(), Some(&note)));
+        draw(cx, handle);
+        cx.update(|cx| assert_eq!(view.read(cx).renaming.as_ref(), Some(&note)));
+        cx.simulate_input(handle, "renamed");
+        cx.simulate_keystrokes(handle, "enter");
+        cx.run_until_parked();
+        assert!(root.join("renamed.md").exists(), "rename did not happen");
+        std::fs::rename(root.join("renamed.md"), &note).unwrap();
+        cx.update(|cx| view.update(cx, |view, _| view.selected = Some(note.clone())));
 
         // Forgetting a deleted entry closes its tab and clears the selection.
         cx.update_window(handle, |_, window, cx| {
