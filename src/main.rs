@@ -17,6 +17,7 @@ use gpui_kit::component::{
     button::{Button, ButtonVariants},
     h_flex,
     input::{Editor, EditorState, Input, InputEvent, InputState},
+    menu::{ContextMenuExt, PopupMenuItem},
     popover::Popover,
     resizable::{HandleEdge, h_resizable, resizable_panel, resize_handle},
     text::{RenderedText, TextView, TextViewState},
@@ -41,6 +42,8 @@ actions!(
         ToggleView,
         ToggleSplit,
         NewFolder,
+        RenameSelected,
+        DeleteSelected,
         Quit
     ]
 );
@@ -1051,6 +1054,86 @@ impl Enso {
         }
     }
 
+    /// The tree row last clicked, if it is still inside the open workspace.
+    fn selected_entry(&self) -> Option<PathBuf> {
+        let root = self.root.as_ref()?;
+        self.selected
+            .clone()
+            .filter(|path| path != root && path.starts_with(root) && path.exists())
+    }
+
+    /// Ask, then move a file or folder to the Trash.
+    fn request_delete(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let bin = if cfg!(target_os = "windows") {
+            "Recycle Bin"
+        } else {
+            "Trash"
+        };
+        let detail = if path.is_dir() {
+            format!("The folder and everything in it will be moved to the {bin}.")
+        } else {
+            format!("You can restore it from the {bin}.")
+        };
+        let confirm = format!("Move to {bin}");
+        let receiver = window.prompt(
+            PromptLevel::Warning,
+            &format!("Move “{name}” to the {bin}?"),
+            Some(&detail),
+            &[confirm.as_str(), "Cancel"],
+            cx,
+        );
+        cx.spawn_in(window, async move |this, cx| {
+            if receiver.await != Ok(0) {
+                return;
+            }
+            let trashed = path.clone();
+            let result = cx
+                .background_executor()
+                .spawn(async move { files::move_to_trash(&trashed) })
+                .await;
+            let _ = this.update(cx, |this, cx| match result {
+                Ok(()) => this.forget_entry(&path, cx),
+                Err(error) => {
+                    this.message(format!("Could not move “{name}” to the {bin}: {error}"), true, cx)
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Drop everything that pointed at a file or folder that is gone: its
+    /// tabs (their edits went with it), tree state and selection.
+    fn forget_entry(&mut self, path: &PathBuf, cx: &mut Context<Self>) {
+        for index in (0..self.documents.len()).rev() {
+            if self.documents[index]
+                .path
+                .as_ref()
+                .is_some_and(|p| p.starts_with(path))
+            {
+                self.remove_document(index, cx);
+            }
+        }
+        self.folders.retain(|p, _| !p.starts_with(path));
+        self.expanded.retain(|p| !p.starts_with(path));
+        if self.selected.as_ref().is_some_and(|p| p.starts_with(path)) {
+            self.selected = None;
+        }
+        if self.renaming.as_ref().is_some_and(|p| p.starts_with(path)) {
+            self.renaming = None;
+        }
+        if self.naming.as_ref().is_some_and(|n| n.dir.starts_with(path)) {
+            self.naming = None;
+        }
+        if let Some(parent) = path.parent() {
+            self.load_folder(parent.to_path_buf(), cx);
+        }
+        cx.notify();
+    }
+
     fn start_rename(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
         let name = path
             .file_name()
@@ -1789,6 +1872,7 @@ impl Render for Enso {
                             pending,
                         } = row;
                         let path = entry.path.clone();
+                        let menu_path = path.clone();
                         let expanded = self.expanded.contains(&path);
                         let active = highlighted.as_ref() == Some(&path);
                         let label = path
@@ -1975,6 +2059,9 @@ impl Render for Enso {
                                     return;
                                 }
                                 this.selected = Some(path.clone());
+                                // The tree takes focus, so Rename and Delete
+                                // shortcuts act on the row just clicked.
+                                this.focus.focus(w, cx);
                                 if entry.directory {
                                     if !this.expanded.remove(&path) {
                                         this.expanded.insert(path.clone());
@@ -1985,6 +2072,53 @@ impl Render for Enso {
                                     this.open_path(path.clone(), w, cx);
                                 }
                             }))
+                            .context_menu({
+                                let weak = cx.entity().downgrade();
+                                move |menu, _, cx| {
+                                    if pending {
+                                        return menu;
+                                    }
+                                    // Right-clicking a row selects it, as in Finder.
+                                    let _ = weak.update(cx, |this, cx| {
+                                        if this.selected.as_ref() != Some(&menu_path) {
+                                            this.selected = Some(menu_path.clone());
+                                            cx.notify();
+                                        }
+                                    });
+                                    let delete_label = if cfg!(target_os = "windows") {
+                                        "Move to Recycle Bin"
+                                    } else {
+                                        "Move to Trash"
+                                    };
+                                    menu.item(
+                                        PopupMenuItem::new("Rename")
+                                            .icon(IconName::Pencil)
+                                            .on_click({
+                                                let weak = weak.clone();
+                                                let path = menu_path.clone();
+                                                move |_, window, cx| {
+                                                    let _ = weak.update(cx, |this, cx| {
+                                                        this.start_rename(path.clone(), window, cx)
+                                                    });
+                                                }
+                                            }),
+                                    )
+                                    .item(PopupMenuItem::separator())
+                                    .item(
+                                        PopupMenuItem::new(delete_label)
+                                            .icon(IconName::Trash)
+                                            .on_click({
+                                                let weak = weak.clone();
+                                                let path = menu_path.clone();
+                                                move |_, window, cx| {
+                                                    let _ = weak.update(cx, |this, cx| {
+                                                        this.request_delete(path.clone(), window, cx)
+                                                    });
+                                                }
+                                            }),
+                                    )
+                                }
+                            })
                     })),
             )
             .child(
@@ -2345,6 +2479,18 @@ impl Render for Enso {
             .on_action(cx.listener(|this, _: &Save, _, cx| this.save(cx)))
             .on_action(cx.listener(|this, _: &CloseFile, _, cx| this.close_current_file(cx)))
             .on_action(cx.listener(|this, _: &NewFolder, w, cx| this.new_folder(w, cx)))
+            .on_action(cx.listener(|this, _: &RenameSelected, w, cx| {
+                match this.selected_entry() {
+                    Some(path) => this.start_rename(path, w, cx),
+                    None => cx.propagate(),
+                }
+            }))
+            .on_action(cx.listener(|this, _: &DeleteSelected, w, cx| {
+                match this.selected_entry() {
+                    Some(path) => this.request_delete(path, w, cx),
+                    None => cx.propagate(),
+                }
+            }))
             .on_action(cx.listener(|this, _: &ToggleView, window, cx| {
                 let next = if this.mode == Mode::Edit {
                     Mode::Read
@@ -2778,6 +2924,19 @@ fn main() {
                 shortcut!("e", ToggleView),
                 shortcut!("q", Quit),
             ]);
+            // Act on the selected tree row. Bound on the window, not in text
+            // fields, so they never take over these keys while typing.
+            cx.bind_keys(if cfg!(target_os = "macos") {
+                [
+                    KeyBinding::new("cmd-backspace", DeleteSelected, Some("Enso")),
+                    KeyBinding::new("enter", RenameSelected, Some("Enso")),
+                ]
+            } else {
+                [
+                    KeyBinding::new("delete", DeleteSelected, Some("Enso")),
+                    KeyBinding::new("f2", RenameSelected, Some("Enso")),
+                ]
+            });
             cx.bind_keys([
                 KeyBinding::new("ctrl-shift-n", NewFolder, Some("Enso")),
                 #[cfg(target_os = "macos")]
@@ -2868,6 +3027,68 @@ mod transition_tests {
         })
         .unwrap();
         cx.run_until_parked();
+    }
+
+    #[gpui_kit::test]
+    fn tree_shortcuts_rename_and_ask_before_deleting(cx: &mut TestAppContext) {
+        let root = std::env::temp_dir().join(format!("enso-tree-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let note = root.join("note.md");
+        std::fs::write(&note, "hi").unwrap();
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            let (delete, rename) = if cfg!(target_os = "macos") {
+                ("cmd-backspace", "enter")
+            } else {
+                ("delete", "f2")
+            };
+            cx.bind_keys([
+                gpui_kit::KeyBinding::new(delete, super::DeleteSelected, Some("Enso")),
+                gpui_kit::KeyBinding::new(rename, super::RenameSelected, Some("Enso")),
+            ]);
+        });
+        let (handle, view) = cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| {
+                    let mut view = Enso::new(window, cx);
+                    view.open_folder(root.clone(), cx);
+                    view.selected = Some(note.clone());
+                    view
+                })
+            })
+            .unwrap()
+        });
+        draw(cx, handle);
+        let keys = if cfg!(target_os = "macos") {
+            ("cmd-backspace", "enter")
+        } else {
+            ("delete", "f2")
+        };
+
+        // Delete asks first; cancelling leaves the file where it was.
+        cx.simulate_keystrokes(handle, keys.0);
+        assert!(cx.has_pending_prompt());
+        cx.simulate_prompt_answer("Cancel");
+        cx.run_until_parked();
+        assert!(note.exists());
+
+        // Rename opens the name field on the selected row.
+        cx.simulate_keystrokes(handle, keys.1);
+        cx.update(|cx| assert_eq!(view.read(cx).renaming.as_ref(), Some(&note)));
+
+        // Forgetting a deleted entry closes its tab and clears the selection.
+        cx.update_window(handle, |_, window, cx| {
+            view.update(cx, |view, cx| {
+                view.renaming = None;
+                view.add_document(Some(note.clone()), "hi".into(), None, window, cx);
+                view.forget_entry(&note, cx);
+                assert!(view.documents.is_empty());
+                assert!(view.selected.is_none());
+            })
+        })
+        .unwrap();
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[gpui_kit::test]
