@@ -11,7 +11,7 @@ futures = "0.3"
 trash = "5"
 url = "2"
 gpui-test = { package = "gpui-pre", version = "=0.3.10", features = ["test-support"], optional = true }
-gpui-kit = { path = "../gpui-kit-main/crates/kit" }
+gpui-kit = "0.8.1"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
