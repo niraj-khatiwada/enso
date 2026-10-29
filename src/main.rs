@@ -210,8 +210,13 @@ struct TreeRow {
 const TREE_INDENT: f32 = 16.;
 /// Height of the macOS title bar strip that sits over the top of the window.
 const TITLEBAR_HEIGHT: f32 = 38.;
-/// Left inset GPUI Kit's macOS title bar keeps clear for the traffic lights.
-const TRAFFIC_LIGHTS_WIDTH: f32 = 80.;
+/// Left inset GPUI Kit's title bar keeps: room for the macOS traffic lights,
+/// a margin on Windows (its window controls are on the right).
+const TRAFFIC_LIGHTS_WIDTH: f32 = if cfg!(target_os = "macos") { 80. } else { 12. };
+/// macOS and Windows draw Enso's own title bar (tabs and view buttons in it,
+/// the sidebar running up beside the window controls); Linux keeps the
+/// window manager's.
+const CUSTOM_TITLEBAR: bool = cfg!(any(target_os = "macos", target_os = "windows"));
 
 /// The system backdrop behind the window: a blurred tint of the desktop on
 /// macOS, Mica on Windows 11, nothing elsewhere. Only the sidebar lets it show.
@@ -1536,7 +1541,7 @@ impl Render for Enso {
             .gap_1()
             .px_5()
             .py_2()
-            .when(cfg!(target_os = "macos"), |tabs| {
+            .when(CUSTOM_TITLEBAR, |tabs| {
                 tabs.px_0()
                     .py_0()
                     .h_full()
@@ -1867,26 +1872,10 @@ impl Render for Enso {
             })
             .border_r_1()
             .border_color(theme.border)
-            // The title bar floats over the top of the sidebar on macOS; this
+            // The title bar floats over the top of the sidebar; this
             // keeps the sidebar's own content below it.
-            .when(cfg!(target_os = "macos"), |sidebar| {
+            .when(CUSTOM_TITLEBAR, |sidebar| {
                 sidebar.child(div().h(px(TITLEBAR_HEIGHT)).flex_shrink_0())
-            })
-            .when(!cfg!(target_os = "macos"), |sidebar| {
-                sidebar.child(
-                    h_flex()
-                        .px_5()
-                        .py_5()
-                        .gap_3()
-                        .items_center()
-                        .child(brand::logo(26., cx))
-                        .child(
-                            div()
-                                .text_lg()
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .child("enso"),
-                        ),
-                )
             })
             .child(
                 h_flex()
@@ -2438,23 +2427,23 @@ impl Render for Enso {
                     ),
             );
         }
-        let (mac_tabs, standard_tabs) = if cfg!(target_os = "macos") {
+        let (titlebar_tabs, standard_tabs) = if CUSTOM_TITLEBAR {
             (Some(tabs), None)
         } else {
             (None, Some(tabs))
         };
         let document_header = h_flex()
-            .h(px(if cfg!(target_os = "macos") { 44. } else { 64. }))
+            .h(px(if CUSTOM_TITLEBAR { 44. } else { 64. }))
             .flex_1()
             .min_w_0()
             .px_6()
-            .when(cfg!(target_os = "macos"), |header| header.px_2())
+            .when(CUSTOM_TITLEBAR, |header| header.px_2())
             .items_center()
             .justify_between()
-            .when(!cfg!(target_os = "macos"), |header| {
+            .when(!CUSTOM_TITLEBAR, |header| {
                 header.border_b_1().border_color(theme.border)
             })
-            .when(!cfg!(target_os = "macos"), |header| {
+            .when(!CUSTOM_TITLEBAR, |header| {
                 header.child(
                     v_flex()
                         .gap_1()
@@ -2464,7 +2453,7 @@ impl Render for Enso {
                                 .font_weight(FontWeight::MEDIUM)
                                 .child(document_title),
                         )
-                        .when(!cfg!(target_os = "macos"), |title| {
+                        .when(!CUSTOM_TITLEBAR, |title| {
                             title.child(
                                 div()
                                     .text_xs()
@@ -2474,7 +2463,7 @@ impl Render for Enso {
                         }),
                 )
             })
-            .when_some(mac_tabs, |header, tabs| header.child(tabs))
+            .when_some(titlebar_tabs, |header, tabs| header.child(tabs))
             .child(
                 h_flex().gap_1().items_center().flex_shrink_0().children(
                     [
@@ -2499,7 +2488,7 @@ impl Render for Enso {
                     }),
                 ),
             );
-        let (mac_titlebar, standard_header) = if cfg!(target_os = "macos") {
+        let (custom_titlebar, standard_header) = if CUSTOM_TITLEBAR {
             let toggle_label = if self.sidebar_open {
                 "Collapse sidebar"
             } else {
@@ -2661,7 +2650,7 @@ impl Render for Enso {
                                 .bg(content_background(cx))
                                 // Room for the floating title bar; its bottom
                                 // border stops at the sidebar.
-                                .when(mac_titlebar.is_some(), |view| {
+                                .when(custom_titlebar.is_some(), |view| {
                                     view.child(
                                         div()
                                             .h(px(TITLEBAR_HEIGHT))
@@ -2709,7 +2698,7 @@ impl Render for Enso {
                         ),
                 ),
             )
-            .when_some(mac_titlebar, |view, titlebar| {
+            .when_some(custom_titlebar, |view, titlebar| {
                 view.child(div().absolute().top_0().left_0().right_0().child(titlebar))
             })
     }
@@ -2872,7 +2861,7 @@ fn open_enso_window(
     bounds.origin.y += offset;
     let opened = gpui_kit::open_window(
         WindowOptions {
-            titlebar: Some(if cfg!(target_os = "macos") {
+            titlebar: Some(if CUSTOM_TITLEBAR {
                 TitlebarOptions {
                     traffic_light_position: Some(point(px(12.), px(TITLEBAR_HEIGHT / 2. - 7.))),
                     ..TitleBar::title_bar_options()
@@ -2883,7 +2872,7 @@ fn open_enso_window(
                     ..Default::default()
                 }
             }),
-            app_owns_titlebar_drag: cfg!(target_os = "macos"),
+            app_owns_titlebar_drag: CUSTOM_TITLEBAR,
             window_bounds: Some(WindowBounds::Windowed(bounds)),
             window_min_size: Some(size(px(800.), px(500.))),
             window_background: window_backdrop(),
