@@ -1144,30 +1144,27 @@ impl Enso {
         let detail = if path.is_dir() {
             format!("The folder and everything in it will be moved to the {bin}.")
         } else {
-            format!("You can restore it from the {bin}.")
+            format!("It will be moved to the {bin}.")
         };
-        let confirm = format!("Move to {bin}");
         let receiver = window.prompt(
             PromptLevel::Warning,
-            &format!("Move “{name}” to the {bin}?"),
+            &format!("Delete “{name}”?"),
             Some(&detail),
-            &[confirm.as_str(), "Cancel"],
+            &["Delete", "Cancel"],
             cx,
         );
         cx.spawn_in(window, async move |this, cx| {
             if receiver.await != Ok(0) {
                 return;
             }
-            let trashed = path.clone();
-            let result = cx
-                .background_executor()
-                .spawn(async move { files::move_to_trash(&trashed) })
-                .await;
-            let _ = this.update(cx, |this, cx| match result {
+            // On the main thread: where an item can't go to the Recycle Bin,
+            // Windows asks before deleting it for good, and that dialog needs it.
+            let _ = this.update(cx, |this, cx| match files::move_to_trash(&path) {
                 Ok(()) => this.forget_entry(&path, cx),
-                Err(error) => {
-                    this.message(format!("Could not move “{name}” to the {bin}: {error}"), true, cx)
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {
+                    this.message(format!("Kept “{name}”: {error}"), false, cx)
                 }
+                Err(error) => this.message(format!("Could not delete “{name}”: {error}"), true, cx),
             });
         })
         .detach();
@@ -2181,11 +2178,6 @@ impl Render for Enso {
                                             cx.notify();
                                         }
                                     });
-                                    let delete_label = if cfg!(target_os = "windows") {
-                                        "Move to Recycle Bin"
-                                    } else {
-                                        "Move to Trash"
-                                    };
                                     menu.item(
                                         PopupMenuItem::new("Rename")
                                             .icon(IconName::Pencil)
@@ -2201,7 +2193,7 @@ impl Render for Enso {
                                     )
                                     .item(PopupMenuItem::separator())
                                     .item(
-                                        PopupMenuItem::new(delete_label)
+                                        PopupMenuItem::new("Delete")
                                             .icon(IconName::Trash)
                                             .on_click({
                                                 let weak = weak.clone();
