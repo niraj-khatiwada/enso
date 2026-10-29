@@ -1,5 +1,8 @@
 <p align="center">
-  <img src="assets/enso.png" alt="enso logo" width="128">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/logo-light.png">
+    <img src="assets/logo-dark.png" alt="enso logo" width="128">
+  </picture>
 </p>
 
 <h1 align="center">enso</h1>
