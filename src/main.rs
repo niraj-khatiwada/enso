@@ -1130,44 +1130,23 @@ impl Enso {
             .filter(|path| path != root && path.starts_with(root) && path.exists())
     }
 
-    /// Ask, then move a file or folder to the Trash.
-    fn request_delete(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+    /// Move a file or folder to the Trash (Recycle Bin on Windows), without
+    /// asking: it can be restored from there. Only an item that can't be
+    /// recycled is ever deleted outright, and then the system asks first
+    /// (Windows) or the move fails and nothing is deleted (macOS, Linux).
+    fn delete_entry(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         let name = path
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
-        let bin = if cfg!(target_os = "windows") {
-            "Recycle Bin"
-        } else {
-            "Trash"
-        };
-        let detail = if path.is_dir() {
-            format!("The folder and everything in it will be moved to the {bin}.")
-        } else {
-            format!("It will be moved to the {bin}.")
-        };
-        let receiver = window.prompt(
-            PromptLevel::Warning,
-            &format!("Delete “{name}”?"),
-            Some(&detail),
-            &["Delete", "Cancel"],
-            cx,
-        );
-        cx.spawn_in(window, async move |this, cx| {
-            if receiver.await != Ok(0) {
-                return;
+        // On the main thread: Windows' "delete permanently?" dialog needs it.
+        match files::move_to_trash(&path) {
+            Ok(()) => self.forget_entry(&path, cx),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {
+                self.message(format!("Kept “{name}”: {error}"), false, cx)
             }
-            // On the main thread: where an item can't go to the Recycle Bin,
-            // Windows asks before deleting it for good, and that dialog needs it.
-            let _ = this.update(cx, |this, cx| match files::move_to_trash(&path) {
-                Ok(()) => this.forget_entry(&path, cx),
-                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {
-                    this.message(format!("Kept “{name}”: {error}"), false, cx)
-                }
-                Err(error) => this.message(format!("Could not delete “{name}”: {error}"), true, cx),
-            });
-        })
-        .detach();
+            Err(error) => self.message(format!("Could not delete “{name}”: {error}"), true, cx),
+        }
     }
 
     /// Drop everything that pointed at a file or folder that is gone: its
@@ -2198,9 +2177,9 @@ impl Render for Enso {
                                             .on_click({
                                                 let weak = weak.clone();
                                                 let path = menu_path.clone();
-                                                move |_, window, cx| {
+                                                move |_, _, cx| {
                                                     let _ = weak.update(cx, |this, cx| {
-                                                        this.request_delete(path.clone(), window, cx)
+                                                        this.delete_entry(path.clone(), cx)
                                                     });
                                                 }
                                             }),
@@ -2588,7 +2567,7 @@ impl Render for Enso {
             }))
             .on_action(cx.listener(|this, _: &DeleteSelected, w, cx| {
                 match this.selected_entry().filter(|_| this.focus.is_focused(w)) {
-                    Some(path) => this.request_delete(path, w, cx),
+                    Some(path) => this.delete_entry(path, cx),
                     None => cx.propagate(),
                 }
             }))
@@ -3212,7 +3191,7 @@ mod transition_tests {
     }
 
     #[gpui_kit::test]
-    fn tree_shortcuts_rename_and_ask_before_deleting(cx: &mut TestAppContext) {
+    fn tree_shortcuts_rename_and_clean_up_deleted_entries(cx: &mut TestAppContext) {
         let root = std::env::temp_dir().join(format!("enso-tree-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
@@ -3247,13 +3226,6 @@ mod transition_tests {
         } else {
             ("delete", "f2")
         };
-
-        // Delete asks first; cancelling leaves the file where it was.
-        cx.simulate_keystrokes(handle, keys.0);
-        assert!(cx.has_pending_prompt());
-        cx.simulate_prompt_answer("Cancel");
-        cx.run_until_parked();
-        assert!(note.exists());
 
         // Rename opens the name field on the selected row, which stays open
         // to type in, and Enter renames the file on disk.
