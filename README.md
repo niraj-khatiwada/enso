@@ -45,7 +45,7 @@ Use Cmd on macOS and Ctrl on Windows/Linux: O opens a file, Shift O opens a fold
 | ⌘O / ⌘⇧O | Open file / open folder as a workspace |
 | ⌘N / Ctrl⇧N | New file / new folder in the selected folder |
 | Enter (F2 on Windows/Linux) | Rename the selected file or folder (or double-click its name) |
-| ⌘⌫ (Delete on Windows/Linux) | Move the selected file or folder to the Trash, after confirming |
+| ⌘⌫ (Delete on Windows/Linux) | Delete the selected file or folder (to the Trash / Recycle Bin; only a permanent delete asks first) |
 | ⌘S | Save now (saving is also automatic) |
 | ⌘W | Close the current file |
 | ⌘E | Switch between Read and Edit |
