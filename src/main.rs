@@ -2428,10 +2428,13 @@ impl Render for Enso {
             .when(CUSTOM_TITLEBAR, |header| header.px_2())
             .items_center()
             .justify_between()
+            // With no file named on the left, the view buttons stay right.
+            .when(!CUSTOM_TITLEBAR && self.active.is_none(), |header| header.justify_end())
             .when(!CUSTOM_TITLEBAR, |header| {
                 header.border_b_1().border_color(theme.border)
             })
-            .when(!CUSTOM_TITLEBAR, |header| {
+            // The file's name and type, once there is a file.
+            .when(!CUSTOM_TITLEBAR && self.active.is_some(), |header| {
                 header.child(
                     v_flex()
                         .gap_1()
