@@ -2827,6 +2827,9 @@ fn open_enso_window(
             window_bounds: Some(WindowBounds::Windowed(bounds)),
             window_min_size: Some(size(px(800.), px(500.))),
             window_background: window_backdrop(),
+            // Linux docks and task switchers find Enso's icon and name through
+            // the .desktop file of this id (scripts/install-linux.sh).
+            app_id: Some("app.enso.markdown".into()),
             ..Default::default()
         },
         cx,
