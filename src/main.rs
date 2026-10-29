@@ -1491,10 +1491,6 @@ impl Render for Enso {
         let sidebar_width = self.sidebar_width;
 
         let active_path = self.active.and_then(|i| self.documents[i].path.clone());
-        let document_title = self
-            .active
-            .map(|i| self.documents[i].title())
-            .unwrap_or_default();
         let markdown = self.active.is_none_or(|i| self.documents[i].markdown);
         let mode = if markdown { self.mode } else { Mode::Edit };
         let active_doc = self.active.map(|i| self.documents[i].editor.entity_id());
@@ -1529,16 +1525,10 @@ impl Render for Enso {
             .id("tabs")
             .track_scroll(&self.tab_scroll)
             .gap_1()
-            .px_5()
-            .py_2()
-            .when(CUSTOM_TITLEBAR, |tabs| {
-                tabs.px_0()
-                    .py_0()
-                    .h_full()
-                    .items_center()
-                    .flex_1()
-                    .min_w_0()
-            })
+            .h_full()
+            .items_center()
+            .flex_1()
+            .min_w_0()
             .overflow_x_scroll();
         for (i, document) in self.documents.iter().enumerate() {
             let editor_id = document.editor.entity_id();
@@ -2412,49 +2402,22 @@ impl Render for Enso {
                     ),
             );
         }
-        let (titlebar_tabs, standard_tabs) = if CUSTOM_TITLEBAR {
-            (Some(tabs), None)
-        } else {
-            (None, Some(tabs))
-        };
+        // The tab strip and view buttons: in Enso's title bar on macOS and
+        // Windows, a bar of the same shape under the native one on Linux.
         let document_header = h_flex()
-            .h(px(if CUSTOM_TITLEBAR { 44. } else { 64. }))
+            .h(px(44.))
             // Fills the title bar's width beside the toggle; as a row of the
             // content column (Linux) it keeps its height instead of growing.
             .when(CUSTOM_TITLEBAR, |header| header.flex_1())
             .when(!CUSTOM_TITLEBAR, |header| header.w_full().flex_shrink_0())
             .min_w_0()
-            .px_6()
-            .when(CUSTOM_TITLEBAR, |header| header.px_2())
+            .px_2()
+            .gap_2()
             .items_center()
-            .justify_between()
-            // With no file named on the left, the view buttons stay right.
-            .when(!CUSTOM_TITLEBAR && self.active.is_none(), |header| header.justify_end())
             .when(!CUSTOM_TITLEBAR, |header| {
                 header.border_b_1().border_color(theme.border)
             })
-            // The file's name and type, once there is a file.
-            .when(!CUSTOM_TITLEBAR && self.active.is_some(), |header| {
-                header.child(
-                    v_flex()
-                        .gap_1()
-                        .child(
-                            div()
-                                .text_sm()
-                                .font_weight(FontWeight::MEDIUM)
-                                .child(document_title),
-                        )
-                        .when(!CUSTOM_TITLEBAR, |title| {
-                            title.child(
-                                div()
-                                    .text_xs()
-                                    .text_color(theme.muted_foreground)
-                                    .child(if markdown { "MARKDOWN" } else { "PLAIN TEXT" }),
-                            )
-                        }),
-                )
-            })
-            .when_some(titlebar_tabs, |header, tabs| header.child(tabs))
+            .child(tabs)
             .child(
                 h_flex().gap_1().items_center().flex_shrink_0().children(
                     [
@@ -2651,9 +2614,6 @@ impl Render for Enso {
                                     )
                                 })
                                 .when_some(standard_header, |view, header| view.child(header))
-                                .when_some(standard_tabs, |view, tabs| {
-                                    view.when(!self.documents.is_empty(), |view| view.child(tabs))
-                                })
                                 .child(body)
                                 .child(
                                     h_flex()
