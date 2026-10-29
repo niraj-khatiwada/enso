@@ -166,10 +166,68 @@ pub fn relative_link(from: &Path, to: &Path) -> String {
     parts.join("/")
 }
 
-/// Move a file or folder to the system Trash (Recycle Bin on Windows), where
-/// it can still be restored. Nothing is deleted outright.
+/// Move a file or folder to the system Trash (Recycle Bin on Windows), where it
+/// can still be restored. Never deleted outright without asking: an `Err` of
+/// kind `Interrupted` means the user chose to keep it.
 pub fn move_to_trash(path: &Path) -> io::Result<()> {
-    trash::delete(path).map_err(io::Error::other)
+    #[cfg(target_os = "macos")]
+    {
+        // NSFileManager rather than the crate's default of scripting Finder,
+        // which needs permission to control Finder and fails without it.
+        use trash::macos::{DeleteMethod, TrashContextExtMacos};
+        let mut trash = trash::TrashContext::default();
+        trash.set_delete_method(DeleteMethod::NsFileManager);
+        trash.delete(path).map_err(io::Error::other)
+    }
+    #[cfg(windows)]
+    {
+        recycle(path)
+    }
+    #[cfg(not(any(target_os = "macos", windows)))]
+    {
+        trash::delete(path).map_err(io::Error::other)
+    }
+}
+
+/// The Windows shell's delete, sent to the Recycle Bin. Where an item can't be
+/// recycled (a network or shared drive, or too big for the bin) Windows asks
+/// before deleting it permanently: the trash crate answered that for the user,
+/// so files on such drives vanished for good.
+#[cfg(windows)]
+fn recycle(path: &Path) -> io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::UI::Shell::{
+        FO_DELETE, FOF_ALLOWUNDO, FOF_NOERRORUI, FOF_SILENT, FOF_WANTNUKEWARNING,
+        SHFILEOPSTRUCTW, SHFileOperationW,
+    };
+    let path = std::path::absolute(path)?;
+    // A list of paths, each NUL-terminated, ending in an extra NUL.
+    let mut from: Vec<u16> = path.as_os_str().encode_wide().collect();
+    from.extend([0, 0]);
+    let mut operation = SHFILEOPSTRUCTW {
+        hwnd: std::ptr::null_mut(),
+        wFunc: FO_DELETE,
+        pFrom: from.as_ptr(),
+        pTo: std::ptr::null(),
+        fFlags: (FOF_ALLOWUNDO | FOF_WANTNUKEWARNING | FOF_NOERRORUI | FOF_SILENT) as u16,
+        fAnyOperationsAborted: 0,
+        hNameMappings: std::ptr::null_mut(),
+        lpszProgressTitle: std::ptr::null(),
+    };
+    // SAFETY: `from` is double-NUL-terminated and outlives the call.
+    let code = unsafe { SHFileOperationW(&mut operation) };
+    if operation.fAnyOperationsAborted != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "Nothing was deleted.",
+        ));
+    }
+    if code != 0 {
+        return Err(io::Error::other(format!(
+            "Windows could not delete it (error {code:#x})."
+        )));
+    }
+    Ok(())
 }
 
 /// Rename a file or folder in place. Never replaces another entry, though a
@@ -240,6 +298,20 @@ fn replace(path: &Path, content: &str) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Moves a scratch file to the real Trash / Recycle Bin, so it is not run
+    /// by default: `cargo test --bin enso trash_keeps_files -- --ignored`.
+    #[test]
+    #[ignore]
+    fn trash_keeps_files() {
+        let dir = std::env::temp_dir().join(format!("enso-trash-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("enso-trash-check.md");
+        fs::write(&file, "check").unwrap();
+        move_to_trash(&file).unwrap();
+        assert!(!file.exists());
+        let _ = fs::remove_dir(&dir);
+    }
 
     #[test]
     fn links_are_relative_to_the_document() {

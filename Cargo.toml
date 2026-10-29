@@ -8,10 +8,17 @@ license = "MIT"
 [dependencies]
 dirs = "6.0.0"
 futures = "0.3"
-trash = "5"
 url = "2"
 gpui-test = { package = "gpui-pre", version = "=0.3.10", features = ["test-support"], optional = true }
 gpui-kit = "0.8.1"
+
+# Moving deleted files to the Trash: the trash crate on macOS and Linux;
+# Windows goes through the shell itself (see files::move_to_trash).
+[target.'cfg(not(windows))'.dependencies]
+trash = "5"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_UI_Shell", "Win32_Foundation"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
