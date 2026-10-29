@@ -1,0 +1,5 @@
+# Windows gives the main thread a 1 MB stack (macOS and Linux: 8 MB). GPUI
+# lays the UI out recursively on that thread, and a debug build of Enso's
+# element tree overflows 1 MB. Match the other platforms, as Zed does.
+[target.'cfg(all(target_os = "windows", target_env = "msvc"))']
+rustflags = ["-C", "link-arg=/STACK:8388608"]
