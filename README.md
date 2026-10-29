@@ -38,13 +38,9 @@ Use Cmd on macOS and Ctrl on Windows/Linux: O opens a file, Shift O opens a fold
 
 ## Releases
 
-`.github/workflows/release.yml` builds release packages on GitHub Actions: a macOS disk image for Apple silicon (with the Quick Look extension), Windows zips for x64 and ARM64, and Linux tarballs for x64 and ARM64. Push a version tag to publish them as a GitHub Release:
+`.github/workflows/release.yml` builds release packages on GitHub Actions: a macOS disk image for Apple silicon (with the Quick Look extension), Windows zips for x64 and ARM64, and Linux tarballs for x64 and ARM64. Run it by hand from the Actions tab (Release -> Run workflow): it puts the packages in a draft GitHub Release for the version in `Cargo.toml`, to check and publish from the Releases page. Running it again for the same version replaces the draft's files.
 
-```sh
-git tag v0.1.0 && git push origin v0.1.0
-```
-
-Or run the workflow by hand from the Actions tab to only build them. The macOS app is ad-hoc signed, not notarized, so Gatekeeper asks on first open. On Linux, unpack the tarball and run `./install.sh` to add Enso to the app launcher.
+The macOS app is ad-hoc signed, not notarized, so Gatekeeper asks on first open. On Linux, unpack the tarball and run `./install.sh` to add Enso to the app launcher.
 
 ## Keyboard shortcuts
 

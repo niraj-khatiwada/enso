@@ -1,14 +1,13 @@
 # Release builds of Enso for macOS (Apple silicon), Windows (x64, ARM64) and
 # Linux (x64, ARM64).
 #
-# Push a tag such as v0.1.0 to build everything and publish a GitHub Release
-# with the packages. Run it by hand (Actions -> Release -> Run workflow) to
-# only build them; the packages are then attached to the run as artifacts.
+# Run it by hand: Actions -> Release -> Run workflow. It builds every package
+# and puts them in a draft GitHub Release for the version in Cargo.toml
+# (v0.1.0 and so on), to check and publish from the Releases page. Running it
+# again for the same version replaces the draft's files.
 name: Release
 
 on:
-  push:
-    tags: ["v*"]
   workflow_dispatch:
 
 permissions:
@@ -124,23 +123,37 @@ jobs:
           if-no-files-found: error
 
   release:
-    name: Publish release
-    if: startsWith(github.ref, 'refs/tags/v')
+    name: Draft release
     needs: [macos, windows, linux]
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
           path: dist
           merge-multiple: true
-      - name: Create the release
+      - name: Create or update the draft
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
+          tag="v$version"
           ls -l dist
-          gh release create "$GITHUB_REF_NAME" dist/* \
-            --repo "$GITHUB_REPOSITORY" \
-            --title "Enso $GITHUB_REF_NAME" \
-            --generate-notes
+          if draft=$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft 2>/dev/null); then
+            if [ "$draft" != "true" ]; then
+              echo "::error::$tag is already published. Bump the version in Cargo.toml for a new release."
+              exit 1
+            fi
+            # Already drafted for this version: refresh its files.
+            gh release upload "$tag" dist/* --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            # A draft: nothing is public, and the tag is only created on publish.
+            gh release create "$tag" dist/* \
+              --repo "$GITHUB_REPOSITORY" \
+              --draft \
+              --target "$GITHUB_SHA" \
+              --title "Enso $tag" \
+              --generate-notes
+          fi
