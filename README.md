@@ -4,13 +4,7 @@ A native, reading-first Markdown workspace built in Rust with GPUI Kit. No webvi
 
 ## Run
 
-Install stable Rust (1.95 or later). Keep the supplied GPUI Kit repository beside this project:
-
-```text
-Documents/
-  enso/
-  gpui-kit-main/
-```
+Install stable Rust (1.95 or later). GPUI Kit comes from crates.io (`gpui-kit = "0.8.1"`), so a plain clone builds on its own.
 
 ```sh
 cargo run

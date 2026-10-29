@@ -7,9 +7,9 @@ use std::{ops::Range, path::PathBuf, sync::Arc};
 const SECTION_BYTES: usize = 2048;
 pub const LARGE_DOCUMENT_BYTES: usize = 256 * 1024;
 /// Where text starts in the reading view, matching where GPUI Kit's editor
-/// draws it with line numbers off (6 px padding + 12 px gutter margin across,
+/// draws it with line numbers off (6 px padding + 6 px gutter margin across,
 /// 8 px padding down), so switching between Read and Edit doesn't move it.
-pub const TEXT_INSET_X: f32 = 18.;
+pub const TEXT_INSET_X: f32 = 12.;
 pub const TEXT_INSET_Y: f32 = 8.;
 
 /// Above this the editor stops soft-wrapping: wrapping measures every line up
