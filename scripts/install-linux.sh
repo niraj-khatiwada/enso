@@ -11,7 +11,9 @@ bin=${1:-}
 if [ -z "$bin" ]; then
     if [ -x target/release/enso ]; then bin=target/release/enso; else bin=target/debug/enso; fi
 fi
-[ -x "$bin" ] || { echo "No enso binary at $bin: build it first (cargo build)." >&2; exit 1; }
+[ -f "$bin" ] || { echo "No enso binary at $bin: build it first (cargo build)." >&2; exit 1; }
+# Archive tools that drop the executable bit would leave the launcher broken.
+chmod +x "$bin" 2>/dev/null || true
 bin=$(realpath "$bin")
 
 data=${XDG_DATA_HOME:-$HOME/.local/share}

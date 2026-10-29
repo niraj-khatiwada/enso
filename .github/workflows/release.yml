@@ -98,7 +98,8 @@ jobs:
           key: ${{ matrix.arch }}
       - run: cargo build --release --locked
       # The binary, its launcher icon and the script that installs both:
-      # after unpacking, run ./install.sh to add Enso to the app launcher.
+      # after unpacking, run ./install.sh (or sh install.sh) to add enso to
+      # the app launcher.
       - name: Package
         run: |
           version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
@@ -110,8 +111,11 @@ jobs:
           cat > "$dir/install.sh" <<'EOF'
           #!/bin/sh
           # Add enso to the app launcher, with its icon, for the current user.
+          # Works as `sh install.sh` too: some archive tools unpack without
+          # the executable bits, so they're restored here.
           here=$(cd "$(dirname "$0")" && pwd)
-          exec "$here/scripts/install-linux.sh" "$here/enso"
+          chmod +x "$here/enso" "$here/scripts/install-linux.sh" "$here/install.sh" 2>/dev/null || true
+          exec sh "$here/scripts/install-linux.sh" "$here/enso"
           EOF
           chmod +x "$dir/install.sh" "$dir/enso"
           cp README.md "$dir/"
