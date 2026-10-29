@@ -17,11 +17,7 @@ bin=$(realpath "$bin")
 data=${XDG_DATA_HOME:-$HOME/.local/share}
 icon_dir="$data/icons/hicolor/512x512/apps"
 mkdir -p "$icon_dir" "$data/applications"
-if command -v convert >/dev/null 2>&1; then
-    convert assets/enso.png -resize 512x512 "$icon_dir/$id.png"
-else
-    cp assets/enso.png "$icon_dir/$id.png"
-fi
+cp assets/linux/$id.png "$icon_dir/$id.png"
 
 cat > "$data/applications/$id.desktop" <<EOF
 [Desktop Entry]
