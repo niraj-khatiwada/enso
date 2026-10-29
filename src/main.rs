@@ -2419,7 +2419,10 @@ impl Render for Enso {
         };
         let document_header = h_flex()
             .h(px(if CUSTOM_TITLEBAR { 44. } else { 64. }))
-            .flex_1()
+            // Fills the title bar's width beside the toggle; as a row of the
+            // content column (Linux) it keeps its height instead of growing.
+            .when(CUSTOM_TITLEBAR, |header| header.flex_1())
+            .when(!CUSTOM_TITLEBAR, |header| header.w_full().flex_shrink_0())
             .min_w_0()
             .px_6()
             .when(CUSTOM_TITLEBAR, |header| header.px_2())
