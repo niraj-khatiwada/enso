@@ -1,6 +1,13 @@
-# enso
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/logo-light.png">
+    <img src="assets/logo-dark.png" alt="enso logo" width="128">
+  </picture>
+</p>
 
-A native, reading-first Markdown workspace built in Rust with GPUI Kit. No webview or Tauri.
+<h1 align="center">enso</h1>
+
+<p align="center">A native, reading-first Markdown workspace built in Rust with GPUI Kit. No webview or Tauri.</p>
 
 ## Run
 
