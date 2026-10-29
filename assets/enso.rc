@@ -1,0 +1,3 @@
+// Windows resources. GPUI loads icon #1 as the window and taskbar icon; File
+// Explorer shows it as the executable's icon.
+1 ICON "enso.ico"

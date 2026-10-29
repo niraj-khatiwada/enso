@@ -3,7 +3,7 @@
 APP := target/Enso.app
 LSREGISTER := /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister
 
-.PHONY: help run check test build.macos app app.debug quicklook install clean
+.PHONY: help run check test build.macos app app.debug quicklook install install.linux clean
 
 help: ## List the targets
 	@awk 'BEGIN {FS = ":.*## "} /^[a-zA-Z_.-]+:.*## / {printf "  make %-12s %s\n", $$1, $$2}' $(MAKEFILE_LIST)
@@ -39,6 +39,9 @@ install: ## Copy Enso.app to /Applications and register it and its Quick Look pr
 	$(LSREGISTER) -f /Applications/Enso.app
 	pluginkit -a /Applications/Enso.app/Contents/PlugIns/EnsoQuickLook.appex
 	qlmanage -r >/dev/null 2>&1 || true
+
+install.linux: ## Linux: add Enso to the app launcher, with its icon (after cargo build)
+	./scripts/install-linux.sh
 
 clean: ## Remove build output
 	cargo clean

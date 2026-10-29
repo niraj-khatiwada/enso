@@ -14,6 +14,10 @@ gpui-kit = "0.8.1"
 
 # Moving deleted files to the Trash: the trash crate on macOS and Linux;
 # Windows goes through the shell itself (see files::move_to_trash).
+[build-dependencies]
+# Embeds the app icon into enso.exe on Windows (build.rs).
+embed-resource = "3"
+
 [target.'cfg(not(windows))'.dependencies]
 trash = "5"
 
