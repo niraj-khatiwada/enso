@@ -87,6 +87,11 @@ struct Document {
     path: Option<PathBuf>,
     editor: Entity<EditorState>,
     preview: Entity<TextViewState>,
+    /// Whether `preview` holds this document's rendered Markdown. Only the few
+    /// most recently viewed documents keep it; see `Enso::warm_documents`.
+    preview_loaded: bool,
+    /// When this document was last the active one (`Enso::view_clock`).
+    last_viewed: u64,
     saved: Arc<String>,
     dirty: bool,
     editor_loaded: bool,
@@ -272,6 +277,12 @@ struct Enso {
     sidebar_width: Pixels,
     focus_after_close: bool,
     hovered_tab: Option<EntityId>,
+    /// The tab strip's scroll position, and the tab last scrolled into view.
+    tab_scroll: ScrollHandle,
+    scrolled_to_tab: Option<EntityId>,
+    /// Counts document switches, to tell which documents were viewed last.
+    view_clock: u64,
+    warmed_doc: Option<EntityId>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -349,6 +360,10 @@ impl Enso {
             sidebar_width: px(248.),
             focus_after_close: false,
             hovered_tab: None,
+            tab_scroll: ScrollHandle::new(),
+            scrolled_to_tab: None,
+            view_clock: 0,
+            warmed_doc: None,
             _subscriptions: vec![
                 subscription,
                 rename_subscription,
@@ -423,6 +438,37 @@ impl Enso {
         };
         window.defer(cx, move |window, cx| focus.focus(window, cx));
         cx.notify();
+    }
+
+    /// Keep the rendered preview only for the documents viewed most recently:
+    /// parse the active one's if it has none, and drop the rest's. Background
+    /// tabs then cost a file's text, not a parsed and laid-out document.
+    fn warm_documents(&mut self, cx: &mut Context<Self>) {
+        const KEEP: usize = 3;
+        let Some(active) = self.active else {
+            return;
+        };
+        self.view_clock += 1;
+        self.documents[active].last_viewed = self.view_clock;
+        let doc = &mut self.documents[active];
+        if doc.markdown && doc.large_reader.is_none() && !doc.preview_loaded {
+            let text = doc.editor.read(cx).value();
+            // Large files read through `large_reader`; their editor may not be
+            // filled yet, and the preview stays empty either way.
+            if text.len() < reader::LARGE_DOCUMENT_BYTES {
+                doc.preview.update(cx, |preview, cx| preview.set_text(&text, cx));
+                doc.preview_loaded = true;
+            }
+        }
+        let mut recent: Vec<_> = (0..self.documents.len()).collect();
+        recent.sort_by_key(|&i| std::cmp::Reverse(self.documents[i].last_viewed));
+        for &i in recent.iter().skip(KEEP) {
+            let doc = &mut self.documents[i];
+            if doc.preview_loaded {
+                doc.preview.update(cx, |preview, cx| preview.set_text("", cx));
+                doc.preview_loaded = false;
+            }
+        }
     }
 
     fn reveal_editor_cursor(&mut self, index: usize, cx: &mut Context<Self>) {
@@ -591,8 +637,9 @@ impl Enso {
         });
         let wrap = source.len() < reader::NO_WRAP_BYTES;
         editor.update(cx, |editor, cx| editor.set_soft_wrap(wrap, window, cx));
-        let preview =
-            cx.new(|cx| TextViewState::markdown(if large || !markdown { "" } else { &source }, cx));
+        // Parsed when the document is first shown, not on open: opening many
+        // files at once only reads them (see `warm_documents`).
+        let preview = cx.new(|cx| TextViewState::markdown("", cx));
         let preview_ref = preview.clone();
         let subscription = cx.subscribe(
             &editor,
@@ -655,6 +702,7 @@ impl Enso {
                         }
                         if markdown
                             && !large
+                            && doc.preview_loaded
                             && doc.large_reader.is_none()
                             && editor.read(cx).text().len() < reader::LARGE_DOCUMENT_BYTES
                         {
@@ -720,6 +768,8 @@ impl Enso {
             close_after_save: false,
             editor,
             preview,
+            preview_loaded: false,
+            last_viewed: 0,
             markdown,
             _subscriptions: vec![subscription, cursor_subscription, preview_subscription],
         });
@@ -1452,8 +1502,37 @@ impl Render for Enso {
             .unwrap_or_default();
         let markdown = self.active.is_none_or(|i| self.documents[i].markdown);
         let mode = if markdown { self.mode } else { Mode::Edit };
+        let active_doc = self.active.map(|i| self.documents[i].editor.entity_id());
+        if active_doc != self.warmed_doc {
+            self.warmed_doc = active_doc;
+            self.warm_documents(cx);
+        }
+        // Bring a newly active tab into view, once, so scrolling away stays put.
+        // From the last frame's layout (tab bounds there exclude the scroll
+        // offset); a tab not laid out yet is revealed on the next frame.
+        let active_tab = self.active.map(|i| self.documents[i].editor.entity_id());
+        if active_tab != self.scrolled_to_tab {
+            match self.active.and_then(|i| self.tab_scroll.bounds_for_item(i)) {
+                Some(tab) => {
+                    self.scrolled_to_tab = active_tab;
+                    let view = self.tab_scroll.bounds();
+                    let mut offset = self.tab_scroll.offset();
+                    if tab.left() + offset.x < view.left() {
+                        offset.x = view.left() - tab.left();
+                    } else if tab.right() + offset.x > view.right() {
+                        offset.x = view.right() - tab.right();
+                    }
+                    offset.x = offset.x.clamp(-self.tab_scroll.max_offset().x, px(0.));
+                    self.tab_scroll.set_offset(offset);
+                }
+                None if active_tab.is_some() => window.request_animation_frame(),
+                None => self.scrolled_to_tab = None,
+            }
+        }
+        // Scrolls sideways (wheel or trackpad) once tabs overflow; no scrollbar.
         let mut tabs = h_flex()
             .id("tabs")
+            .track_scroll(&self.tab_scroll)
             .gap_1()
             .px_5()
             .py_2()
@@ -1479,12 +1558,24 @@ impl Render for Enso {
             )
             .clamp(0., 1.);
 
-            tabs = tabs.child(
+            let active = self.active == Some(i);
+            // One pill: name and close button share the hover and active fill.
+            // The wrapper keeps a press on a tab from starting a title-bar
+            // window drag (after the tab's own handlers have seen it).
+            tabs = tabs.child(div().flex_shrink_0().on_mouse_down(MouseButton::Left, |_, _, cx| {
+                cx.stop_propagation()
+            }).child(
                 h_flex()
                     .id(("file-tab", editor_id))
                     .flex_shrink_0()
+                    .h(px(28.))
+                    .pl_2p5()
+                    .pr_1()
+                    .gap_0p5()
                     .items_center()
                     .rounded_md()
+                    .cursor_pointer()
+                    .text_sm()
                     .on_hover(cx.listener(move |this, hovered, _, cx| {
                         let next = if *hovered {
                             Some(editor_id)
@@ -1498,32 +1589,24 @@ impl Render for Enso {
                             cx.notify();
                         }
                     }))
-                    .when(self.active == Some(i), |tab| tab.bg(theme.secondary))
-                    .child(
-                        Button::new(("tab", editor_id))
-                            .small()
-                            .ghost()
-                            .label(format!(
-                                "{}{}",
-                                document.title(),
-                                if document.dirty(cx) { " •" } else { "" }
-                            ))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.active = this
-                                    .documents
-                                    .iter()
-                                    .position(|doc| doc.editor.entity_id() == editor_id);
-                                this.selected = None;
-                                cx.notify();
-                            })),
-                    )
-                    .child(
+                    .when(active, |tab| tab.bg(theme.secondary))
+                    .when(!active, |tab| {
+                        tab.text_color(theme.muted_foreground)
+                            .hover(|tab| tab.bg(theme.secondary.opacity(0.6)))
+                    })
+                    .child(format!(
+                        "{}{}",
+                        document.title(),
+                        if document.dirty(cx) { " •" } else { "" }
+                    ))
+                    // Built only while shown: a hidden button per tab made every
+                    // frame cost more with each open file.
+                    .when(reveal > 0.001, |tab| tab.child(
                         h_flex()
-                            .w(px(24. * reveal))
-                            .h(px(28.))
+                            .w(px(20. * reveal))
+                            .h(px(20.))
                             .flex_shrink_0()
                             .overflow_hidden()
-                            .when(reveal <= 0.001, |slot| slot.invisible())
                             .child(
                                 Button::new(("close-tab", editor_id))
                                     .ghost()
@@ -1537,6 +1620,8 @@ impl Render for Enso {
                                     .opacity(reveal)
                                     .disabled(!hovered)
                                     .on_click(cx.listener(move |this, _, _, cx| {
+                                        // Not also a click on the tab around it.
+                                        cx.stop_propagation();
                                         if let Some(index) = this
                                             .documents
                                             .iter()
@@ -1546,8 +1631,16 @@ impl Render for Enso {
                                         }
                                     })),
                             ),
-                    ),
-            );
+                    ))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.active = this
+                            .documents
+                            .iter()
+                            .position(|doc| doc.editor.entity_id() == editor_id);
+                        this.selected = None;
+                        cx.notify();
+                    })),
+            ));
         }
         let highlighted = self.selected.clone().or_else(|| active_path.clone());
         let switcher = {
@@ -2426,10 +2519,12 @@ impl Render for Enso {
                 .h(px(TITLEBAR_HEIGHT))
                 .bg(gpui_kit::transparent_black())
                 .border_color(gpui_kit::transparent_black())
-                .child(
+                // Laid out on top of the bar rather than in it, so a full tab
+                // strip scrolls within the window instead of widening the bar.
+                .child(div().absolute().inset_0().child(
                     h_flex()
-                        .w_full()
-                        .h_full()
+                        .size_full()
+                        .min_w_0()
                         .items_center()
                         .gap_2()
                         .pr_2()
@@ -2454,7 +2549,7 @@ impl Render for Enso {
                         )
                         .child(div().flex_shrink_0().w(px(header_offset)))
                         .child(document_header),
-                );
+                ));
             (Some(titlebar.into_any_element()), None)
         } else {
             (None, Some(document_header.into_any_element()))
@@ -2477,7 +2572,15 @@ impl Render for Enso {
             .on_action(cx.listener(|this, _: &OpenFolder, w, cx| this.pick(true, w, cx)))
             .on_action(cx.listener(|this, _: &NewFile, w, cx| this.new_file(w, cx)))
             .on_action(cx.listener(|this, _: &Save, _, cx| this.save(cx)))
-            .on_action(cx.listener(|this, _: &CloseFile, _, cx| this.close_current_file(cx)))
+            // Closes the current tab; with no tabs left, the window, as Cmd-W
+            // does in other Mac apps (and quits after the last window).
+            .on_action(cx.listener(|this, _: &CloseFile, window, cx| {
+                if this.active.is_some() {
+                    this.close_current_file(cx);
+                } else {
+                    this.request_close(CloseTarget::Window, window, cx);
+                }
+            }))
             .on_action(cx.listener(|this, _: &NewFolder, w, cx| this.new_folder(w, cx)))
             // Only when the tree itself has focus: a text field passes Enter
             // and Cmd-Backspace on to here after handling them, and acting
@@ -3030,6 +3133,87 @@ mod transition_tests {
         })
         .unwrap();
         cx.run_until_parked();
+    }
+
+    #[gpui_kit::test]
+    fn close_file_with_no_tabs_closes_the_window(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            bind_view_keys(cx);
+        });
+        let (handle, _view) = cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| {
+                    let mut view = Enso::new(window, cx);
+                    view.add_document(Some(PathBuf::from("a.md")), "a".into(), None, window, cx);
+                    view
+                })
+            })
+            .unwrap()
+        });
+        draw(cx, handle);
+        // The first press closes the tab, the window stays.
+        cx.simulate_keystrokes(handle, "ctrl-w");
+        cx.run_until_parked();
+        assert!(cx.update(|cx| cx.windows().contains(&handle)));
+        // With no tabs left, the next one closes the window.
+        cx.simulate_keystrokes(handle, "ctrl-w");
+        cx.run_until_parked();
+        assert!(!cx.update(|cx| cx.windows().contains(&handle)));
+    }
+
+    #[gpui_kit::test]
+    fn only_recently_viewed_documents_keep_a_preview(cx: &mut TestAppContext) {
+        cx.update(|cx| gpui_kit::init(cx));
+        let (handle, view) = cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| {
+                    let mut view = Enso::new(window, cx);
+                    for n in 0..5 {
+                        view.add_document(
+                            Some(PathBuf::from(format!("n{n}.md"))),
+                            format!("# Note {n}"),
+                            None,
+                            window,
+                            cx,
+                        );
+                    }
+                    view
+                })
+            })
+            .unwrap()
+        });
+        let view_tab = |cx: &mut TestAppContext, i: usize| {
+            cx.update(|cx| view.update(cx, |view, cx| {
+                view.active = Some(i);
+                cx.notify();
+            }));
+            draw(cx, handle);
+        };
+        let loaded = |cx: &mut TestAppContext| {
+            cx.update(|cx| {
+                view.read(cx)
+                    .documents
+                    .iter()
+                    .map(|d| d.preview_loaded)
+                    .collect::<Vec<_>>()
+            })
+        };
+        draw(cx, handle);
+        // Opening five files parsed only the one shown.
+        assert_eq!(loaded(cx), [false, false, false, false, true]);
+        for i in [0, 1, 2] {
+            view_tab(cx, i);
+        }
+        // Three kept; the oldest (4) dropped its preview.
+        assert_eq!(loaded(cx), [true, true, true, false, false]);
+        // Coming back to it parses it again.
+        view_tab(cx, 4);
+        assert_eq!(loaded(cx), [false, true, true, false, true]);
+        cx.update(|cx| {
+            let text = view.read(cx).documents[4].preview.read(cx).rendered_text();
+            assert!(text.as_str().contains("Note 4"), "{:?}", text.as_str());
+        });
     }
 
     #[gpui_kit::test]
