@@ -42,6 +42,41 @@ On the first launch without a file/folder argument, Enso creates and opens an ed
 
 Use Cmd on macOS and Ctrl on Windows/Linux: O opens a file, Shift O opens a folder, N creates a file, W closes the current file after saving pending edits, S saves, E toggles Edit/Read, backslash toggles Split (press again to return to the previous view), and Q quits. Ctrl+E and Ctrl+backslash also work on macOS; Split no longer requires Shift.
 
+## Keyboard shortcuts
+
+⌘ on macOS, Ctrl on Windows and Linux.
+
+| App | |
+|---|---|
+| ⌘O / ⌘⇧O | Open file / open folder as a workspace |
+| ⌘N / Ctrl⇧N | New file / new folder in the selected folder |
+| ⌘S | Save now (saving is also automatic) |
+| ⌘W | Close the current file |
+| ⌘E | Switch between Read and Edit |
+| ⌘\\ | Split view |
+| ⌘, | Settings |
+| ⌘Q | Quit |
+
+In the Markdown editor:
+
+| Formatting | |
+|---|---|
+| ⌘B | Bold `**text**` |
+| ⌘I | Italic `*text*` |
+| ⌘⇧X | Strikethrough `~~text~~` |
+| ⌘⇧C | Inline code `` `text` `` |
+| ⌘K | Link `[text](url)` |
+| ⌘1 – ⌘6 | Heading level 1–6 |
+| ⌘0 | Back to body text |
+| ⌘⇧8 | Bullet list |
+| ⌘⇧7 | Numbered list |
+| ⌘⇧L | Task list `- [ ]` |
+| ⌘Enter | Tick / untick a task |
+| ⌘⇧. | Quote |
+| ⌘⌥C | Code block |
+
+Each applies to the selection, or to the word or line at the cursor; using it again removes the format. In lists, task lists and quotes, Enter continues with the next item (an empty item ends the list, or steps a nested one out a level), and Tab / Shift-Tab nest and un-nest items. The editor's own shortcuts still apply: ⌘Z / ⌘⇧Z undo and redo, ⌘F find, ⌘⇧F replace, ⌘] / ⌘[ indent and outdent lines, ⌥⌘↑ / ⌥⌘↓ add cursors.
+
 ## Platforms
 
 One codebase targets macOS, Windows, and Linux using GPUI Kit's native backends. This initial version is developed on macOS; Windows and Linux runtime verification remains to be done. Linux needs GPUI's native build dependencies (including a C/C++ toolchain, pkg-config, fontconfig, Wayland/X11 development libraries, and a working Vulkan driver). Follow the platform prerequisites in the supplied GPUI Kit repository. Distribution installers and OS file associations are future work.

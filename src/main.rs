@@ -1,6 +1,7 @@
 mod app_icon;
 mod brand;
 mod files;
+mod markdown_edit;
 mod onboarding;
 mod reader;
 mod settings;
@@ -41,6 +42,34 @@ actions!(
         ToggleSplit,
         NewFolder,
         Quit
+    ]
+);
+
+// Markdown formatting in the document editor; see `bind_markdown_keys`.
+actions!(
+    markdown,
+    [
+        Bold,
+        Italic,
+        Strikethrough,
+        InlineCode,
+        InsertLink,
+        Heading1,
+        Heading2,
+        Heading3,
+        Heading4,
+        Heading5,
+        Heading6,
+        BodyText,
+        BulletList,
+        NumberedList,
+        TaskList,
+        ToggleTaskDone,
+        Quote,
+        CodeBlock,
+        ContinueList,
+        IndentListItem,
+        OutdentListItem
     ]
 );
 
@@ -1688,7 +1717,9 @@ impl Render for Enso {
                     // The workspace folder sits further left than the tree, so
                     // the tree's threads read as hanging from it.
                     .pl_2()
-                    .pr_5()
+                    // Same right inset as the tree below, so the buttons end
+                    // where a row's highlight does.
+                    .pr_2()
                     .pt_4()
                     .pb_2()
                     .gap_2()
@@ -1977,6 +2008,9 @@ impl Render for Enso {
                 editor_pane = Some(
                     div()
                         .id(("editor-pane", document.editor.entity_id()))
+                        .when(document.markdown, |pane| {
+                            markdown_commands(pane, &document.editor)
+                        })
                         .overflow_hidden()
                         .flex_1()
                         .min_w_0()
@@ -2448,6 +2482,133 @@ fn bind_view_keys(cx: &mut App) {
     }
 }
 
+/// Markdown shortcuts, live only in a Markdown document's editor (its
+/// `MarkdownEditor` context), not in the sidebar's name fields.
+fn bind_markdown_keys(cx: &mut App) {
+    let context = Some("MarkdownEditor > Input");
+    macro_rules! key {
+        ($keys:literal) => {
+            if cfg!(target_os = "macos") {
+                concat!("cmd-", $keys)
+            } else {
+                concat!("ctrl-", $keys)
+            }
+        };
+    }
+    cx.bind_keys([
+        KeyBinding::new(key!("b"), Bold, context),
+        KeyBinding::new(key!("i"), Italic, context),
+        KeyBinding::new(key!("shift-x"), Strikethrough, context),
+        KeyBinding::new(key!("shift-c"), InlineCode, context),
+        KeyBinding::new(key!("k"), InsertLink, context),
+        KeyBinding::new(key!("1"), Heading1, context),
+        KeyBinding::new(key!("2"), Heading2, context),
+        KeyBinding::new(key!("3"), Heading3, context),
+        KeyBinding::new(key!("4"), Heading4, context),
+        KeyBinding::new(key!("5"), Heading5, context),
+        KeyBinding::new(key!("6"), Heading6, context),
+        KeyBinding::new(key!("0"), BodyText, context),
+        KeyBinding::new(key!("shift-8"), BulletList, context),
+        KeyBinding::new(key!("shift-7"), NumberedList, context),
+        KeyBinding::new(key!("shift-l"), TaskList, context),
+        KeyBinding::new(key!("enter"), ToggleTaskDone, context),
+        KeyBinding::new(key!("shift-."), Quote, context),
+        KeyBinding::new(key!("alt-c"), CodeBlock, context),
+        // These fall through to the editor's own Enter / Tab outside lists.
+        KeyBinding::new("enter", ContinueList, context),
+        KeyBinding::new("tab", IndentListItem, context),
+        KeyBinding::new("shift-tab", OutdentListItem, context),
+    ]);
+}
+
+/// Hook the Markdown shortcuts up to a document editor's pane.
+fn markdown_commands(pane: Stateful<Div>, editor: &Entity<EditorState>) -> Stateful<Div> {
+    use markdown_edit::{Block, Inline};
+    // A command that always applies.
+    macro_rules! command {
+        ($pane:expr, $action:ty, $run:expr) => {{
+            let editor = editor.clone();
+            $pane.on_action(move |_: &$action, window, cx| {
+                apply_markdown(&editor, window, cx, |text, selection| {
+                    Some($run(text, selection))
+                });
+            })
+        }};
+    }
+    // One that only applies to list lines, else the key does what it normally does.
+    macro_rules! list_key {
+        ($pane:expr, $action:ty, $run:expr) => {{
+            let editor = editor.clone();
+            $pane.on_action(move |_: &$action, window, cx| {
+                if !apply_markdown(&editor, window, cx, $run) {
+                    cx.propagate();
+                }
+            })
+        }};
+    }
+    let inline = |kind| move |t: &str, s| markdown_edit::toggle_inline(t, s, kind);
+    let block = |kind| move |t: &str, s| markdown_edit::toggle_block(t, s, kind);
+    let pane = pane.key_context("MarkdownEditor");
+    let pane = command!(pane, Bold, inline(Inline::Bold));
+    let pane = command!(pane, Italic, inline(Inline::Italic));
+    let pane = command!(pane, Strikethrough, inline(Inline::Strikethrough));
+    let pane = command!(pane, InlineCode, inline(Inline::Code));
+    let pane = command!(pane, InsertLink, markdown_edit::link);
+    let pane = command!(pane, Heading1, block(Block::Heading(1)));
+    let pane = command!(pane, Heading2, block(Block::Heading(2)));
+    let pane = command!(pane, Heading3, block(Block::Heading(3)));
+    let pane = command!(pane, Heading4, block(Block::Heading(4)));
+    let pane = command!(pane, Heading5, block(Block::Heading(5)));
+    let pane = command!(pane, Heading6, block(Block::Heading(6)));
+    let pane = command!(pane, BodyText, block(Block::Heading(0)));
+    let pane = command!(pane, BulletList, block(Block::Bullet));
+    let pane = command!(pane, NumberedList, block(Block::Numbered));
+    let pane = command!(pane, TaskList, block(Block::Task));
+    let pane = command!(pane, Quote, block(Block::Quote));
+    let pane = command!(pane, ToggleTaskDone, markdown_edit::toggle_task_done);
+    let pane = command!(pane, CodeBlock, markdown_edit::toggle_code_block);
+    let pane = list_key!(pane, ContinueList, |t: &str, s: std::ops::Range<usize>| {
+        s.is_empty()
+            .then(|| markdown_edit::continue_on_enter(t, s.start))
+            .flatten()
+    });
+    let pane = list_key!(pane, IndentListItem, |t: &str, s| {
+        markdown_edit::indent_list(t, s, false)
+    });
+    list_key!(pane, OutdentListItem, |t: &str, s| {
+        markdown_edit::indent_list(t, s, true)
+    })
+}
+
+/// Run a Markdown command on `editor`: hand it the lines around the selection
+/// (not the whole document), then apply its edit as one undoable change.
+/// Returns whether the command applied.
+fn apply_markdown(
+    editor: &Entity<EditorState>,
+    window: &mut Window,
+    cx: &mut App,
+    command: impl FnOnce(&str, std::ops::Range<usize>) -> Option<markdown_edit::Edit>,
+) -> bool {
+    editor.update(cx, |state, cx| {
+        use gpui_kit::base::input::RopeExt as _;
+        let selection = state.selected_range();
+        let rope = state.text();
+        // One line of context either side, for fences around a selection.
+        let first = rope.offset_to_point(selection.start).row.saturating_sub(1);
+        let last = rope.offset_to_point(selection.end).row + 1;
+        let start = rope.line_start_offset(first);
+        let end = rope.line_end_offset(last).max(selection.end);
+        let text = rope.slice(start..end).to_string();
+        let Some(edit) = command(&text, selection.start - start..selection.end - start) else {
+            return false;
+        };
+        state.set_selected_range(edit.range.start + start..edit.range.end + start, cx);
+        state.replace(edit.insert, window, cx);
+        state.set_selected_range(edit.select.start + start..edit.select.end + start, cx);
+        true
+    })
+}
+
 fn open_enso_window(
     cx: &mut App,
     setup: impl FnOnce(&mut Enso, &mut Window, &mut Context<Enso>) + 'static,
@@ -2623,6 +2784,7 @@ fn main() {
                 KeyBinding::new("cmd-shift-n", NewFolder, Some("Enso")),
             ]);
             bind_view_keys(cx);
+            bind_markdown_keys(cx);
             cx.set_menus(vec![
                 Menu {
                     name: "Enso".into(),
@@ -2706,6 +2868,67 @@ mod transition_tests {
         })
         .unwrap();
         cx.run_until_parked();
+    }
+
+    #[gpui_kit::test]
+    fn markdown_shortcuts_edit_and_fall_through(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            bind_view_keys(cx);
+            super::bind_markdown_keys(cx);
+        });
+        let (handle, view) = cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| {
+                    let mut view = Enso::new(window, cx);
+                    view.add_document(
+                        Some(PathBuf::from("note.md")),
+                        "- one".into(),
+                        None,
+                        window,
+                        cx,
+                    );
+                    view.mode = Mode::Edit;
+                    view
+                })
+            })
+            .unwrap()
+        });
+        draw(cx, handle);
+        let editor = cx.update(|cx| view.read(cx).documents[0].editor.clone());
+        let set = |cx: &mut TestAppContext, range: std::ops::Range<usize>| {
+            cx.update_window(handle, |_, window, cx| {
+                editor.focus_handle(cx).focus(window, cx);
+                editor.update(cx, |e, cx| e.set_selected_range(range, cx));
+            })
+            .unwrap();
+        };
+        let text = |cx: &mut TestAppContext| cx.update(|cx| editor.read(cx).value().to_string());
+        let primary = if cfg!(target_os = "macos") { "cmd" } else { "ctrl" };
+
+        // Enter continues the list, Tab nests the new item, a second Enter on
+        // the empty item steps it back out.
+        set(cx, 5..5);
+        cx.simulate_keystrokes(handle, "enter");
+        assert_eq!(text(cx), "- one\n- ");
+        cx.simulate_keystrokes(handle, "tab");
+        assert_eq!(text(cx), "- one\n  - ");
+        cx.simulate_keystrokes(handle, "enter");
+        assert_eq!(text(cx), "- one\n- ");
+        cx.simulate_keystrokes(handle, "enter");
+        assert_eq!(text(cx), "- one\n");
+        // Outside a list Enter and Tab keep their usual meaning.
+        cx.simulate_input(handle, "word");
+        cx.simulate_keystrokes(handle, "enter");
+        assert_eq!(text(cx), "- one\nword\n");
+        // Formatting shortcuts.
+        set(cx, 6..10);
+        cx.simulate_keystrokes(handle, &format!("{primary}-b"));
+        assert_eq!(text(cx), "- one\n**word**\n");
+        cx.simulate_keystrokes(handle, &format!("{primary}-2"));
+        assert_eq!(text(cx), "- one\n## **word**\n");
+        cx.simulate_keystrokes(handle, &format!("{primary}-z"));
+        assert_eq!(text(cx), "- one\n**word**\n");
     }
 
     #[gpui_kit::test]
