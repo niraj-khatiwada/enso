@@ -1,0 +1,146 @@
+# Release builds of Enso for macOS (Apple silicon), Windows (x64, ARM64) and
+# Linux (x64, ARM64).
+#
+# Push a tag such as v0.1.0 to build everything and publish a GitHub Release
+# with the packages. Run it by hand (Actions -> Release -> Run workflow) to
+# only build them; the packages are then attached to the run as artifacts.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  macos:
+    name: macOS (Apple silicon)
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            .
+            macos/quicklook -> ../../target/quicklook
+      # Release build, Enso.app with its Quick Look extension, ad-hoc
+      # signature and disk image. Not notarized: Gatekeeper asks on first open.
+      - run: ./scripts/build-mac.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: enso-macos-arm64
+          path: target/Enso-*.dmg
+          if-no-files-found: error
+
+  windows:
+    name: Windows (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            runner: windows-latest
+          - arch: arm64
+            runner: windows-11-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.arch }}
+      # build.rs embeds the app icon; .cargo/config.toml gives the main
+      # thread the 8 MB stack GPUI needs.
+      - run: cargo build --release --locked
+      - name: Package
+        shell: pwsh
+        run: |
+          $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"' | Select-Object -First 1).Matches.Groups[1].Value
+          $dir = "Enso-$version-windows-${{ matrix.arch }}"
+          New-Item -ItemType Directory $dir | Out-Null
+          Copy-Item target/release/enso.exe "$dir/Enso.exe"
+          Copy-Item README.md $dir
+          Compress-Archive -Path $dir -DestinationPath "$dir.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: enso-windows-${{ matrix.arch }}
+          path: Enso-*-windows-*.zip
+          if-no-files-found: error
+
+  linux:
+    name: Linux (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: System libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config libfontconfig-dev libfreetype-dev libwayland-dev \
+            libxkbcommon-dev libxkbcommon-x11-dev libxcb1-dev libx11-xcb-dev \
+            libvulkan-dev libssl-dev libzstd-dev
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.arch }}
+      - run: cargo build --release --locked
+      # The binary, its launcher icon and the script that installs both:
+      # after unpacking, run ./install.sh to add Enso to the app launcher.
+      - name: Package
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
+          dir="Enso-$version-linux-${{ matrix.arch }}"
+          mkdir -p "$dir/assets/linux" "$dir/scripts"
+          cp target/release/enso "$dir/enso"
+          cp assets/linux/app.enso.markdown.png "$dir/assets/linux/"
+          cp scripts/install-linux.sh "$dir/scripts/"
+          cat > "$dir/install.sh" <<'EOF'
+          #!/bin/sh
+          # Add Enso to the app launcher, with its icon, for the current user.
+          here=$(cd "$(dirname "$0")" && pwd)
+          exec "$here/scripts/install-linux.sh" "$here/enso"
+          EOF
+          chmod +x "$dir/install.sh" "$dir/enso"
+          cp README.md "$dir/"
+          tar -czf "$dir.tar.gz" "$dir"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: enso-linux-${{ matrix.arch }}
+          path: Enso-*-linux-*.tar.gz
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [macos, windows, linux]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ls -l dist
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "Enso $GITHUB_REF_NAME" \
+            --generate-notes
