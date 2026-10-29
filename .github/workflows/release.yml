@@ -104,9 +104,9 @@ jobs:
         run: |
           version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
           dir="enso-$version-linux-${{ matrix.arch }}"
-          mkdir -p "$dir/assets/linux" "$dir/scripts"
+          mkdir -p "$dir/assets" "$dir/scripts"
           cp target/release/enso "$dir/enso"
-          cp assets/linux/app.enso.markdown.png "$dir/assets/linux/"
+          cp -R assets/linux "$dir/assets/"
           cp scripts/install-linux.sh "$dir/scripts/"
           cat > "$dir/install.sh" <<'EOF'
           #!/bin/sh
