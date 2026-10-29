@@ -166,6 +166,12 @@ pub fn relative_link(from: &Path, to: &Path) -> String {
     parts.join("/")
 }
 
+/// Move a file or folder to the system Trash (Recycle Bin on Windows), where
+/// it can still be restored. Nothing is deleted outright.
+pub fn move_to_trash(path: &Path) -> io::Result<()> {
+    trash::delete(path).map_err(io::Error::other)
+}
+
 /// Rename a file or folder in place. Never replaces another entry, though a
 /// change of case alone is allowed on case-insensitive volumes.
 pub fn rename(path: &Path, name: &str) -> io::Result<PathBuf> {
