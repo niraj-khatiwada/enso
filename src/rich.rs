@@ -193,6 +193,7 @@ pub fn decorate(
     let table_owner = owner.clone();
     let task_owner = owner.clone();
     let task_base = base.clone();
+    let diagram_owner = owner.clone();
     view.plugin(inline)
         .markdown_block_parser(|node, context| {
             let source = context.node_source(node)?;
@@ -219,9 +220,9 @@ pub fn decorate(
                     .markdown(source.to_owned()),
             )
         })
-        .markdown_block_renderer("enso-mermaid", |node, _, cx| {
+        .markdown_block_renderer("enso-mermaid", move |node, _, cx| {
             let block = node.data::<MermaidBlock>().unwrap();
-            render_mermaid(&block.source, cx)
+            render_mermaid(&block.source, diagram_owner.clone(), cx)
         })
         .markdown_block_renderer("enso-image", move |node, window, cx| {
             render_picture(
@@ -235,7 +236,9 @@ pub fn decorate(
                 cx,
             )
         })
-        .markdown_block_renderer("enso-tasks", move |node, window, _| {
+        .markdown_block_renderer("enso-tasks", move |node, window, cx| {
+            // A locked note's boxes show their state but don't change.
+            let locked = task_owner.upgrade().is_some_and(|app| app.read(cx).is_locked(editor_id));
             let tasks = node.data::<Tasks>().unwrap();
             // Markers sit in a box one text line tall, centered on the item's
             // first line however tall the checkbox or the text is.
@@ -261,6 +264,7 @@ pub fn decorate(
                             .child(
                                 gpui_kit::component::checkbox::Checkbox::new(("read-task", i))
                                     .checked(checked)
+                                    .disabled(locked)
                                     .on_click(move |_, w, cx| {
                                         if let Some(marker) = marker {
                                             let _ = owner.update(cx, |app, cx| {
@@ -308,7 +312,7 @@ pub fn decorate(
                 app.read(cx)
                     .documents
                     .iter()
-                    .find(|doc| doc.editor.entity_id() == editor_id)
+                    .find(|doc| doc.editor.entity_id() == editor_id && !doc.locked)
                     .and_then(|doc| {
                         let slice = doc.editor.read(cx).text().try_slice(range).ok()?;
                         EditableTable::parse(&slice.to_string())
@@ -340,13 +344,30 @@ struct MermaidBlock {
 
 /// A diagram on a soft panel the width of the text, centred; wide ones scale
 /// down to fit. A diagram with a mistake shows the mistake and its source.
-fn render_mermaid(source: &str, cx: &mut App) -> AnyElement {
+fn render_mermaid(source: &str, owner: WeakEntity<Enso>, cx: &mut App) -> AnyElement {
     let theme = cx.theme().clone();
     let dark = theme.mode.is_dark();
     match crate::diagram::render(source, dark) {
         Ok(drawn) => {
             let [r, g, b, _] = crate::diagram::background(dark);
+            let full = crate::media::Lightbox::Diagram {
+                svg: drawn.svg.clone(),
+                width: drawn.width,
+                height: drawn.height,
+            };
+            let opener = owner.clone();
             div()
+                .relative()
+                .group("enso-diagram")
+                // Double-click to see it full size, as the toolbar's button does.
+                .on_mouse_down(MouseButton::Left, move |event, w, cx| {
+                    if event.click_count == 2 {
+                        cx.stop_propagation();
+                        let full = full.clone();
+                        let _ = opener.update(cx, |app, cx| app.open_lightbox(full, w, cx));
+                    }
+                })
+                .child(diagram_toolbar(source, &drawn, owner, &theme))
                 .w_full()
                 .my_1()
                 .p_4()
@@ -398,9 +419,76 @@ fn render_mermaid(source: &str, cx: &mut App) -> AnyElement {
     }
 }
 
+/// What a diagram offers on hover, top right: view it full size, copy it,
+/// and save it as a PNG or an SVG.
+fn diagram_toolbar(
+    source: &str,
+    drawn: &crate::diagram::Diagram,
+    owner: WeakEntity<Enso>,
+    theme: &gpui_kit::component::Theme,
+) -> impl IntoElement {
+    let source: SharedString = source.to_string().into();
+    let full = crate::media::Lightbox::Diagram {
+        svg: drawn.svg.clone(),
+        width: drawn.width,
+        height: drawn.height,
+    };
+    h_flex()
+        .absolute()
+        .top(px(6.))
+        .right(px(6.))
+        .gap(px(2.))
+        .p(px(2.))
+        .toolbar_surface(theme)
+        .opacity(0.)
+        .group_hover("enso-diagram", |bar| bar.opacity(1.))
+        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+        .child({
+            let owner = owner.clone();
+            ui::icon_button("diagram-full", IconName::Maximize, "View Full Size")
+                .xsmall()
+                .compact()
+                .on_click(move |_, w, cx| {
+                    cx.stop_propagation();
+                    let full = full.clone();
+                    let _ = owner.update(cx, |app, cx| app.open_lightbox(full, w, cx));
+                })
+        })
+        .child({
+            let owner = owner.clone();
+            let source = source.clone();
+            ui::icon_button("diagram-copy", IconName::Copy, "Copy Image")
+                .xsmall()
+                .compact()
+                .on_click(move |_, _, cx| {
+                    cx.stop_propagation();
+                    let _ = owner.update(cx, |app, cx| app.copy_diagram(&source, cx));
+                })
+        })
+        .child(
+            ui::icon_button("diagram-save", IconName::Download, "Save")
+                .xsmall()
+                .compact()
+                .dropdown_menu(move |menu, _, _| {
+                    let save = |label: &'static str, format: crate::media::DiagramFormat| {
+                        let owner = owner.clone();
+                        let source = source.clone();
+                        PopupMenuItem::new(label).on_click(move |_, w, cx| {
+                            let _ = owner.update(cx, |app, cx| {
+                                let folder = app.save_folder();
+                                app.save_diagram(&source, format, folder, w, cx)
+                            });
+                        })
+                    };
+                    menu.item(save("Save as PNG…", crate::media::DiagramFormat::Png))
+                        .item(save("Save as SVG…", crate::media::DiagramFormat::Svg))
+                }),
+        )
+}
+
 /// The SVG as an image GPUI can draw, made once per drawing: the image's id
 /// is a hash of its bytes, which isn't worth recomputing every frame.
-fn diagram_image(svg: &std::sync::Arc<str>) -> std::sync::Arc<gpui_kit::Image> {
+pub(crate) fn diagram_image(svg: &std::sync::Arc<str>) -> std::sync::Arc<gpui_kit::Image> {
     thread_local! {
         static IMAGES: std::cell::RefCell<HashMap<usize, (std::sync::Arc<str>, std::sync::Arc<gpui_kit::Image>)>> =
             Default::default();
@@ -488,7 +576,7 @@ fn parse_tasks(node: &Node, context: &MarkdownParseContext<'_>) -> Option<Tasks>
     })
 }
 impl Enso {
-    fn toggle_read_task(
+    pub(crate) fn toggle_read_task(
         &mut self,
         id: EntityId,
         marker: usize,
@@ -581,6 +669,8 @@ fn render_picture(
     cx: &mut App,
 ) -> AnyElement {
     let picture = node.data::<Picture>().unwrap().clone();
+    // A locked note's images can be viewed, copied and saved, not changed.
+    let locked = owner.upgrade().is_some_and(|app| app.read(cx).is_locked(editor_id));
     let source = if !picture.src.contains(':') {
         ImageSource::from(
             base.as_ref()
@@ -635,7 +725,7 @@ fn render_picture(
         // fills it without contributing an intrinsic-height layout box.
         .child(img(source).absolute().inset_0().size_full())
         .child(geometry(inner.clone()));
-    for left in [true, false] {
+    for left in [true, false].into_iter().filter(|_| !locked) {
         let owner = owner.clone();
         let range = range.clone();
         let expected = expected.clone();
@@ -717,7 +807,7 @@ fn render_picture(
         .opacity(0.)
         .group_hover("enso-image", |bar| bar.opacity(1.))
         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation());
-    for (alignment, icon, label) in [
+    for (alignment, icon, label) in (!locked).then_some([
         (
             Alignment::Left,
             IconName::AlignHorizontalJustifyStart,
@@ -733,7 +823,7 @@ fn render_picture(
             IconName::AlignHorizontalJustifyEnd,
             "Align right",
         ),
-    ] {
+    ]).into_iter().flatten() {
         let owner = owner.clone();
         let range = range.clone();
         let expected = expected.clone();
@@ -767,7 +857,85 @@ fn render_picture(
                 ),
         );
     }
-    toolbar = toolbar.child(
+    // The file behind the picture, for viewing full size, copying and saving
+    // it. Web images only exist in GPUI's cache, so they have neither.
+    let local = crate::export::html::local_path(&picture.src, base.as_deref()).filter(|p| p.is_file());
+    let full = match &local {
+        Some(path) => Some(crate::media::Lightbox::Image(path.clone())),
+        None if picture.src.starts_with("https://") || picture.src.starts_with("http://") => {
+            Some(crate::media::Lightbox::Web(picture.src.clone().into()))
+        }
+        None => None,
+    };
+    if let Some(full) = full.clone() {
+        let owner = owner.clone();
+        toolbar = toolbar
+            .when(!locked, |t| t.child(div().w(px(1.)).h(px(14.)).mx(px(2.)).bg(theme.border)))
+            .child(
+                ui::icon_button("image-full", IconName::Maximize, "View Full Size")
+                    .xsmall()
+                    .compact()
+                    .on_click(move |_, w, cx| {
+                        cx.stop_propagation();
+                        let full = full.clone();
+                        let _ = owner.update(cx, |app, cx| app.open_lightbox(full, w, cx));
+                    }),
+            );
+    }
+    // A web image copies and saves by downloading it.
+    if local.is_none() && (picture.src.starts_with("https://") || picture.src.starts_with("http://")) {
+        let url: SharedString = picture.src.clone().into();
+        toolbar = toolbar
+            .child({
+                let owner = owner.clone();
+                let url = url.clone();
+                ui::icon_button("image-copy", IconName::Copy, "Copy Image")
+                    .xsmall()
+                    .compact()
+                    .on_click(move |_, _, cx| {
+                        cx.stop_propagation();
+                        let _ = owner.update(cx, |app, cx| app.copy_web_image(url.clone(), cx));
+                    })
+            })
+            .child({
+                let owner = owner.clone();
+                ui::icon_button("image-save", IconName::Download, "Save Image As…")
+                    .xsmall()
+                    .compact()
+                    .on_click(move |_, w, cx| {
+                        cx.stop_propagation();
+                        let _ = owner.update(cx, |app, cx| app.save_web_image(url.clone(), w, cx));
+                    })
+            })
+            .when(!locked, |t| t.child(div().w(px(1.)).h(px(14.)).mx(px(2.)).bg(theme.border)));
+    }
+    if let Some(path) = local {
+        toolbar = toolbar
+            .child({
+                let owner = owner.clone();
+                let path = path.clone();
+                ui::icon_button("image-copy", IconName::Copy, "Copy Image")
+                    .xsmall()
+                    .compact()
+                    .on_click(move |_, _, cx| {
+                        cx.stop_propagation();
+                        let _ = owner.update(cx, |app, cx| app.copy_image(path.clone(), cx));
+                    })
+            })
+            .child({
+                let owner = owner.clone();
+                ui::icon_button("image-save", IconName::Download, "Save Image As…")
+                    .xsmall()
+                    .compact()
+                    .on_click(move |_, w, cx| {
+                        cx.stop_propagation();
+                        let _ = owner.update(cx, |app, cx| app.save_image_as(path.clone(), w, cx));
+                    })
+            })
+            .when(!locked, |t| t.child(div().w(px(1.)).h(px(14.)).mx(px(2.)).bg(theme.border)));
+    }
+    let opener = owner.clone();
+    toolbar = toolbar.when(!locked, |toolbar| toolbar.child(
         div().debug_selector(|| "image-edit-button".into()).child(
             ui::icon_button("edit-image", IconName::Pencil, "Edit image")
                 .xsmall()
@@ -788,10 +956,19 @@ fn render_picture(
                     }
                 }),
         ),
-    );
+    ));
     let alignment = node.data::<Picture>().unwrap().alignment;
     div()
         .id(("editable-image", node.source_range().map_or(0, |r| r.start)))
+        // Double-click to see it full size.
+        .on_mouse_down(MouseButton::Left, move |event, w, cx| {
+            if event.click_count == 2 {
+                if let Some(full) = full.clone() {
+                    cx.stop_propagation();
+                    let _ = opener.update(cx, |app, cx| app.open_lightbox(full, w, cx));
+                }
+            }
+        })
         .debug_selector(|| "image-available".into())
         .relative()
         .w_full()
@@ -816,7 +993,7 @@ impl Enso {
         w: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if picture.alignment == alignment {
+        if picture.alignment == alignment || self.is_locked(id) {
             return;
         }
         let Some(target) = self.rich_target(id, range, w, cx) else {
@@ -845,7 +1022,7 @@ impl Enso {
         w: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if available <= px(0.) {
+        if available <= px(0.) || self.is_locked(id) {
             return;
         }
         let Some(target) = self.rich_target(id, range, w, cx) else {
@@ -1228,6 +1405,9 @@ impl Enso {
         w: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !editor.read(cx).is_editable() {
+            return;
+        }
         let selection = editor.read(cx).selected_range();
         let source = editor.read(cx).value();
         let (range, body, color) = if !slash {
@@ -1274,6 +1454,11 @@ impl Enso {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<Target> {
+        // A locked note is read, not changed: no control may edit it.
+        if self.is_locked(id) {
+            self.message("This page is locked. Unlock it to make changes.", true, cx);
+            return None;
+        }
         let doc = self
             .documents
             .iter_mut()

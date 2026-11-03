@@ -44,6 +44,8 @@ pub struct Preferences {
     pub line_numbers: bool,
     pub document_outline: bool,
     pub spell_check: bool,
+    /// Load images from the web (`https://…`) in notes.
+    pub web_images: bool,
     /// Split view puts the reader on the left and the editor on the right.
     pub reader_first: bool,
     pub(crate) split_order_path: Option<PathBuf>,
@@ -65,6 +67,24 @@ fn document_outline_path() -> Option<PathBuf> {
 }
 fn load_document_outline(path: &Path) -> bool {
     std::fs::read_to_string(path).map_or(true, |value| value.trim() != "off")
+}
+fn web_images_path() -> Option<PathBuf> {
+    dirs::config_dir().map(|p| crate::files::app_folder(p).join("web-images"))
+}
+pub fn web_images(cx: &App) -> bool {
+    cx.try_global::<Preferences>().is_none_or(|p| p.web_images)
+}
+/// Whether notes load images from the web. Off, no image request leaves the
+/// app; images already shown stay until the note is reopened.
+fn set_web_images(on: bool, cx: &mut App) -> io::Result<()> {
+    if !cx.has_global::<Preferences>() { init(cx); }
+    cx.update_global::<Preferences, _>(|prefs, _| prefs.web_images = on);
+    crate::http::set_enabled(on);
+    if let Some(path) = web_images_path() {
+        if let Some(parent) = path.parent() { std::fs::create_dir_all(parent)?; }
+        std::fs::write(path, if on { "on" } else { "off" })?;
+    }
+    Ok(())
 }
 fn spell_check_path() -> Option<PathBuf> {
     dirs::config_dir().map(|p| crate::files::app_folder(p).join("spell-check"))
@@ -159,6 +179,8 @@ pub fn init(cx: &mut App) {
     let line_numbers = line_numbers_path().as_deref().is_some_and(load_line_numbers);
     let document_outline = document_outline_path().as_deref().is_none_or(load_document_outline);
     let spell_check = spell_check_path().as_deref().is_none_or(load_document_outline);
+    let web_images = web_images_path().as_deref().is_none_or(load_document_outline);
+    crate::http::set_enabled(web_images);
     let split_order_path = split_order_path();
     let reader_first = split_order_path.as_deref().is_some_and(load_reader_first);
     let reading_path = crate::typography::preference_path();
@@ -171,6 +193,7 @@ pub fn init(cx: &mut App) {
         line_numbers,
         document_outline,
         spell_check,
+        web_images,
         reader_first,
         split_order_path,
         window: None,
@@ -599,6 +622,7 @@ impl SettingsWindow {
             )
             .child(
                 h_flex().gap_4().items_center().justify_between().py_3()
+                    .border_b_1().border_color(theme.border)
                     .child(v_flex().gap_0p5()
                         .child(div().text_sm().font_weight(FontWeight::MEDIUM).child("Document Outline"))
                         .child(div().text_xs().text_color(theme.muted_foreground).child("Show the section navigation rail beside Markdown documents.")))
@@ -608,6 +632,20 @@ impl SettingsWindow {
                             let _=outline_weak.update(cx,|this,cx|{this.error=error;cx.notify();});
                         }))
             )
+            .child({
+                let weak = cx.entity().downgrade();
+                h_flex().gap_4().items_center().justify_between().py_3()
+                    .child(v_flex().gap_0p5()
+                        .child(div().text_sm().font_weight(FontWeight::MEDIUM).child("Load Web Images"))
+                        .child(div().text_xs().text_color(theme.muted_foreground).child(
+                            "Show images hosted on the web. Off, notes never contact the sites their images come from.")))
+                    .child(Switch::new("web-images").checked(web_images(cx))
+                        .accessibility_label("Load Web Images")
+                        .on_change(move |on, _, cx| {
+                            let error = set_web_images(*on, cx).err().map(|e| format!("Could not save editor settings: {e}"));
+                            let _ = weak.update(cx, |this, cx| { this.error = error; cx.notify(); });
+                        }))
+            })
     }
 }
 

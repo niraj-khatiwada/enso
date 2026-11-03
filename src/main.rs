@@ -3,7 +3,10 @@ mod brand;
 mod diagram;
 mod export;
 mod files;
+mod http;
+mod lock;
 mod markdown_edit;
+mod media;
 mod onboarding;
 mod outline;
 mod palette;
@@ -65,6 +68,8 @@ actions!(
         PasteFiles,
         ExportNote,
         DismissExport,
+        DismissLightbox,
+        ToggleLock,
         CopyRichText,
         DismissCommandPalette,
         DismissRichControls,
@@ -138,6 +143,8 @@ struct Document {
     disk_stamp: Option<(std::time::SystemTime, u64)>,
     /// A "changed on disk" question is open for this document.
     disk_prompt: bool,
+    /// Locked: readable, not changeable (see `lock`).
+    locked: bool,
     /// The file was gone at the last check (already reported).
     missing: bool,
     _subscriptions: Vec<Subscription>,
@@ -303,6 +310,50 @@ impl Render for SidebarResize {
     }
 }
 
+/// The note's top-level blocks as source ranges, in the order the reader
+/// lists them (one list item each): the same parser, with the reader's
+/// options.
+fn top_level_blocks(source: &str) -> Vec<std::ops::Range<usize>> {
+    let mut options = markdown::ParseOptions::gfm();
+    options.constructs.math_flow = true;
+    options.constructs.math_text = true;
+    let Ok(tree) = markdown::to_mdast(source, &options) else {
+        return Vec::new();
+    };
+    tree.children()
+        .into_iter()
+        .flatten()
+        .filter_map(|node| node.position().map(|p| p.start.offset..p.end.offset))
+        .collect()
+}
+
+/// The source offset under `point` in a reader: the block whose rows it's
+/// on, then the line within that block at the same fraction of its height.
+fn source_at_point(source: &str, list: &ListState, point: Point<Pixels>) -> Option<usize> {
+    let blocks = top_level_blocks(source);
+    // A reader that split the note differently can't be mapped this way.
+    if blocks.len() != list.item_count() {
+        return None;
+    }
+    let first = list.logical_scroll_top().item_ix;
+    for ix in first..blocks.len() {
+        let bounds = list.bounds_for_item(ix)?;
+        if point.y > bounds.bottom() {
+            continue;
+        }
+        let block = blocks[ix].clone();
+        let fraction = ((point.y - bounds.top()) / bounds.size.height.max(px(1.))).clamp(0., 1.);
+        let text = &source[block.clone()];
+        let lines: Vec<usize> = std::iter::once(0)
+            .chain(text.match_indices('\n').map(|(i, _)| i + 1))
+            .filter(|&i| i < text.len())
+            .collect();
+        let line = ((fraction * lines.len() as f32) as usize).min(lines.len().saturating_sub(1));
+        return Some(block.start + lines.get(line).copied().unwrap_or(0));
+    }
+    None
+}
+
 /// A tab being dragged along the tab strip. `from` is where it started; the
 /// drag preview is the tab's name in a pill.
 #[derive(Clone)]
@@ -449,6 +500,10 @@ struct Enso {
     closing_export: Option<export::ExportDialog>,
     export_choice: export::ExportChoice,
     toasts: Vec<ToastEntry>,
+    /// A picture shown full size (and the one fading out), with the focus
+    /// that takes Escape.
+    lightbox: Option<(media::Lightbox, FocusHandle)>,
+    closing_lightbox: Option<(media::Lightbox, FocusHandle)>,
     toast_serial: u64,
     _subscriptions: Vec<Subscription>,
 }
@@ -556,6 +611,8 @@ impl Enso {
             closing_export: None,
             export_choice: Default::default(),
             toasts: Vec::new(),
+            lightbox: None,
+            closing_lightbox: None,
             toast_serial: 0,
             _subscriptions: vec![
                 subscription,
@@ -662,6 +719,74 @@ impl Enso {
                 doc.preview_loaded = false;
             }
         }
+    }
+
+    /// Whether the note behind `editor_id` is locked.
+    pub(crate) fn is_locked(&self, editor_id: EntityId) -> bool {
+        self.documents.iter().any(|d| d.editor.entity_id() == editor_id && d.locked)
+    }
+
+    /// Lock or unlock a note: its editor turns read-only, and every way of
+    /// changing it from enso checks `is_editable` (or `is_locked`) first.
+    fn set_locked(&mut self, index: usize, locked: bool, cx: &mut Context<Self>) {
+        let doc = &mut self.documents[index];
+        doc.locked = locked;
+        doc.editor.update(cx, |editor, cx| editor.set_readonly(locked, cx));
+        if let Some(path) = doc.path.clone() {
+            lock::set_locked(&path, locked, cx);
+        }
+        cx.notify();
+    }
+
+    /// Lock Page / Unlock Page, for the active note.
+    pub(crate) fn toggle_lock(&mut self, cx: &mut Context<Self>) {
+        let Some(index) = self.active else {
+            return;
+        };
+        let locked = !self.documents[index].locked;
+        self.set_locked(index, locked, cx);
+        let title = self.documents[index].title();
+        let toast = if locked {
+            ui::toast::done("page-lock", "Page locked", title)
+        } else {
+            ui::toast::done("page-lock", "Page unlocked", title)
+        };
+        self.toast(toast, cx);
+    }
+
+    /// The reader was clicked at `position`: put the editor's caret on the
+    /// source behind it, so Split's editor scrolls there (and Edit opens
+    /// there). A drag follows its selection's start, exactly; a plain click
+    /// finds the block under the pointer and the line within it.
+    fn reader_clicked(&mut self, editor_id: EntityId, position: Point<Pixels>, cx: &mut Context<Self>) {
+        let Some(index) = self.documents.iter().position(|d| d.editor.entity_id() == editor_id) else {
+            return;
+        };
+        let doc = &self.documents[index];
+        if !doc.markdown || !doc.editor_loaded || !doc.preview_loaded {
+            return;
+        }
+        let preview = doc.preview.read(cx);
+        let offset = preview.selected_source_range().map(|r| r.start).or_else(|| {
+            let rendered = preview.rendered_text();
+            source_at_point(rendered.source(), preview.list_state(), position)
+        });
+        let Some(offset) = offset else {
+            return;
+        };
+        let doc = &mut self.documents[index];
+        // The editor's caret moving would reveal it in the reader again;
+        // the reader is already there.
+        doc.last_reader_cursor = Some(offset);
+        doc.editor.update(cx, |editor, cx| {
+            let text = editor.text().clone();
+            let mut at = offset.min(text.len());
+            while at > 0 && !text.is_char_boundary(at) {
+                at -= 1;
+            }
+            editor.set_selected_range(at..at, cx);
+        });
+        cx.notify();
     }
 
     fn reveal_editor_cursor(&mut self, index: usize, cx: &mut Context<Self>) {
@@ -1075,6 +1200,7 @@ impl Enso {
             disk_stamp: None,
             disk_prompt: false,
             missing: false,
+            locked: false,
             editor,
             preview,
             preview_loaded: false,
@@ -1086,6 +1212,9 @@ impl Enso {
         self.active = Some(self.documents.len() - 1);
         if let Some(path) = self.documents.last().and_then(|d| d.path.clone()) {
             self.reveal_in_tree(&path, cx);
+            if lock::is_locked(&path, cx) {
+                self.set_locked(self.documents.len() - 1, true, cx);
+            }
         }
         self.schedule_word_count(self.documents.len() - 1, true, cx);
         self.mode = if markdown { Mode::Read } else { Mode::Edit };
@@ -1737,6 +1866,10 @@ impl Enso {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.is_locked(editor.entity_id()) {
+            self.message("This page is locked. Unlock it to add images.", true, cx);
+            return;
+        }
         let Some(doc_path) = self
             .documents
             .iter()
@@ -1948,6 +2081,7 @@ impl Enso {
     /// tabs, the selection and expanded folders follow it, and both folders
     /// it touched are listed again.
     fn entry_moved(&mut self, old: &PathBuf, new: &PathBuf, cx: &mut Context<Self>) {
+        lock::moved(old, new, cx);
         let moved = |path: &PathBuf| {
             path.strip_prefix(old)
                 .ok()
@@ -2520,6 +2654,10 @@ impl Render for Enso {
                     })
                     // Long names end in "…" at a fixed width; the full name is in
                     // the tooltip, and the unsaved dot stays outside the cut.
+                    // A locked note says so on its tab.
+                    .when(document.locked, |tab| {
+                        tab.child(Icon::new(IconName::Lock).size_3().mr_1().text_color(theme.muted_foreground))
+                    })
                     .child(
                         div()
                             .max_w(px(TAB_TITLE_WIDTH))
@@ -3215,7 +3353,7 @@ impl Render for Enso {
                     div()
                         .id(("editor-pane", document.editor.entity_id()))
                         .when(document.markdown, |pane| {
-                            markdown_commands(pane, &document.editor)
+                            markdown_commands(pane, &document.editor, document.locked)
                         })
                         .overflow_hidden()
                         .flex_1()
@@ -3226,6 +3364,8 @@ impl Render for Enso {
                         .child(
                             Editor::new(&document.editor)
                                 .bordered(false)
+                                // Locked: readable and selectable, not changeable.
+                                .readonly(document.locked)
                                 .size_full()
                                 .font_family(theme.mono_font_family.clone())
                                 .text_sm()
@@ -3295,6 +3435,7 @@ impl Render for Enso {
                         .and_then(|p| p.parent())
                         .map(PathBuf::from);
                     let link_base = base.clone();
+                    let editor_id = document.editor.entity_id();
                     reading_pane = Some(
                         div()
                             .id(("preview-pane", document.editor.entity_id()))
@@ -3302,6 +3443,16 @@ impl Render for Enso {
                             .min_w_0()
                             .h_full()
                             .overflow_hidden()
+                            // A click in the reader moves the editor there too,
+                            // as the editor's caret moves the reader. Seen on
+                            // the way down, before the text view handles it.
+                            .capture_any_mouse_up(cx.listener(move |_, event: &MouseUpEvent, window, cx| {
+                                if event.button == MouseButton::Left {
+                                    let position = event.position;
+                                    // After the text view has settled its selection.
+                                    cx.defer_in(window, move |this, _, cx| this.reader_clicked(editor_id, position, cx));
+                                }
+                            }))
                             .child(
                                 div().size_full().child(
                                     // Spans the whole pane, like the editor, so its
@@ -3482,6 +3633,11 @@ impl Render for Enso {
                             let theme = cx.theme().clone();
                             let dismiss_controls = controls.clone();
                             let dismiss_popover = popover.clone();
+                            let lock_weak = weak.clone();
+                            let locked = weak.upgrade().is_some_and(|enso| {
+                                let enso = enso.read(cx);
+                                enso.active.is_some_and(|i| enso.documents[i].locked)
+                            });
                             v_flex().debug_selector(|| "document-menu-panel".into()).w(px(240.))
                                 // Select's popup can extend beyond this surface.
                                 // Wait for its outside-click handling before
@@ -3502,6 +3658,18 @@ impl Render for Enso {
                                     .on_click(move |_, window, cx| {
                                         let _ = popover.update(cx, |state, cx| state.dismiss(window, cx));
                                         let _ = weak.update(cx, |this, cx| this.open_export(window, cx));
+                                    }))
+                                // The switch shows the state; the whole row flips it.
+                                .child(h_flex().id("lock-page").mx_1().mb_1().px_2().h(px(28.)).gap_2()
+                                    .items_center().rounded_md().cursor_pointer().text_sm()
+                                    .hover(|row| row.bg(theme.secondary))
+                                    .child(Icon::new(if locked { IconName::Lock } else { IconName::LockOpen })
+                                        .size_4().text_color(theme.muted_foreground))
+                                    .child(div().flex_1().child("Lock Page"))
+                                    .child(gpui_kit::component::switch::Switch::new("lock-page-switch")
+                                        .checked(locked).small().accessibility_label("Lock Page"))
+                                    .on_click(move |_, _, cx| {
+                                        let _ = lock_weak.update(cx, |this, cx| this.toggle_lock(cx));
                                     }))
                         }))
                 }),
@@ -3576,6 +3744,7 @@ impl Render for Enso {
             .on_action(cx.listener(|this, _: &PasteFiles, w, cx| this.paste_files(w, cx)))
             .on_action(cx.listener(|this, action: &spellcheck::ReplaceSpelling, w, cx| this.replace_spelling(action, w, cx)))
             .on_action(cx.listener(|this, _: &ExportNote, w, cx| this.open_export(w, cx)))
+            .on_action(cx.listener(|this, _: &ToggleLock, _, cx| this.toggle_lock(cx)))
             .on_action(cx.listener(|this, _: &CopyRichText, _, cx| {
                 let images = this.export_choice.images;
                 this.copy_rich_text(images, cx)
@@ -3728,6 +3897,7 @@ impl Render for Enso {
             .when_some(self.palette_overlay(window, cx), |view, overlay| view.child(overlay))
             .when_some(self.controls_overlay(window, cx), |view, overlay| view.child(overlay))
             .when_some(self.export_overlay(window, cx), |view, overlay| view.child(overlay))
+            .when_some(self.lightbox_overlay(window, cx), |view, overlay| view.child(overlay))
             .when_some(self.toast_layer(window, cx), |view, layer| view.child(layer))
     }
 }
@@ -3738,6 +3908,7 @@ fn bind_view_keys(cx: &mut App) {
         KeyBinding::new("escape", DismissRichControls, Some("RichControls > Input")),
         KeyBinding::new("escape", DismissRichControls, Some("RichControls")),
         KeyBinding::new("escape", DismissExport, Some("ExportDialog")),
+        KeyBinding::new("escape", DismissLightbox, Some("Lightbox")),
         KeyBinding::new(if cfg!(target_os = "macos") { "cmd-shift-t" } else { "ctrl-shift-t" }, ReopenClosedTab, Some("Enso")),
         KeyBinding::new("ctrl-shift-p", OpenCommandPalette, Some("Enso")),
         KeyBinding::new("cmd-shift-p", OpenCommandPalette, Some("Enso")),
@@ -3858,13 +4029,17 @@ fn bind_markdown_keys(cx: &mut App) {
 }
 
 /// Hook the Markdown shortcuts up to a document editor's pane.
-fn markdown_commands(pane: Stateful<Div>, editor: &Entity<EditorState>) -> Stateful<Div> {
+fn markdown_commands(pane: Stateful<Div>, editor: &Entity<EditorState>, locked: bool) -> Stateful<Div> {
     use markdown_edit::{Block, Inline};
     // A command that always applies.
     macro_rules! command {
         ($pane:expr, $action:ty, $run:expr) => {{
             let editor = editor.clone();
             $pane.on_action(move |_: &$action, window, cx| {
+                // A locked note takes no formatting.
+                if locked {
+                    return;
+                }
                 apply_markdown(&editor, window, cx, |text, selection| {
                     Some($run(text, selection))
                 });
@@ -3876,7 +4051,7 @@ fn markdown_commands(pane: Stateful<Div>, editor: &Entity<EditorState>) -> State
         ($pane:expr, $action:ty, $run:expr) => {{
             let editor = editor.clone();
             $pane.on_action(move |_: &$action, window, cx| {
-                if !apply_markdown(&editor, window, cx, $run) {
+                if locked || !apply_markdown(&editor, window, cx, $run) {
                     cx.propagate();
                 }
             })
@@ -3927,6 +4102,10 @@ fn apply_markdown(
 ) -> bool {
     editor.update(cx, |state, cx| {
         use gpui_kit::base::input::RopeExt as _;
+        // A locked note takes no edits, from keys or commands.
+        if !state.is_editable() {
+            return false;
+        }
         let selection = state.selected_range();
         let rope = state.text();
         // One line of context either side, for fences around a selection.
@@ -4079,7 +4258,10 @@ fn open_workspace_window(root: Option<PathBuf>, cx: &mut App) {
 
 fn main() {
     let initial = std::env::args_os().nth(1).map(PathBuf::from);
-    let app = gpui_kit::application().with_assets(gpui_kit::assets::AllAssets);
+    let app = gpui_kit::application()
+        .with_assets(gpui_kit::assets::AllAssets)
+        // Web images in notes; GPUI's own client refuses every request.
+        .with_http_client(std::sync::Arc::new(http::Client::new()));
     // The system can hand over files before the app has a context to open them
     // with; queue them until the run loop below picks them up.
     let (opened_tx, mut opened_rx) = futures::channel::mpsc::unbounded::<Vec<String>>();
@@ -4093,6 +4275,7 @@ fn main() {
             settings::init(cx);
             workspaces::init(cx);
             session::init(cx);
+            lock::init(cx);
             cx.on_action(|_: &OpenSettings, cx| settings::open(cx));
             cx.bind_keys([
                 KeyBinding::new("cmd-,", OpenSettings, None),
@@ -4650,6 +4833,153 @@ mod transition_tests {
         assert!(cx.update(|cx| view.read(cx).mode == Mode::Split));
         assert!(cx.update(|cx| super::settings::reader_first(cx)));
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn diagrams_copy_save_and_open_full_size(cx: &mut TestAppContext) {
+        cx.update(|cx| { gpui_kit::init(cx); bind_view_keys(cx); });
+        let dir = std::env::temp_dir().join(format!("enso-media-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let source = "flowchart LR\n  A --> B";
+        let (handle, view) = cx.update(|cx| gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+            cx.new(|cx| Enso::new(window, cx))
+        }).unwrap());
+        draw(cx, handle);
+        // Copy: a PNG on the clipboard.
+        cx.update(|cx| view.update(cx, |app, cx| app.copy_diagram(source, cx)));
+        let copied = cx.update(|cx| cx.read_from_clipboard()).expect("clipboard");
+        match copied.entries().first() {
+            Some(gpui_kit::ClipboardEntry::Image(image)) => {
+                assert_eq!(image.format(), gpui_kit::ImageFormat::Png);
+                assert!(image.bytes().starts_with(b"\x89PNG"));
+            }
+            other => panic!("expected an image, got {other:?}"),
+        }
+        // Save as PNG and as SVG, wherever the dialog says.
+        for (format, name, magic) in [
+            (super::media::DiagramFormat::Png, "d.png", &b"\x89PNG"[..]),
+            (super::media::DiagramFormat::Svg, "d.svg", &b"<svg"[..]),
+        ] {
+            cx.update_window(handle, |_, window, cx| {
+                view.update(cx, |app, cx| app.save_diagram(source, format, Some(dir.clone()), window, cx))
+            }).unwrap();
+            cx.run_until_parked();
+            let target = dir.join(name);
+            cx.simulate_new_path_selection(|_| Some(target));
+            cx.run_until_parked();
+            assert!(std::fs::read(dir.join(name)).unwrap().starts_with(magic), "{name}");
+        }
+        // Full size opens, and Escape closes it.
+        let drawn = crate::diagram::render(source, false).unwrap();
+        cx.update_window(handle, |_, window, cx| view.update(cx, |app, cx| {
+            app.open_lightbox(super::media::Lightbox::Diagram { svg: drawn.svg.clone(), width: drawn.width, height: drawn.height }, window, cx)
+        })).unwrap();
+        draw(cx, handle);
+        assert!(cx.update(|cx| view.read(cx).lightbox.is_some()));
+        cx.simulate_keystrokes(handle, "escape");
+        draw(cx, handle);
+        assert!(cx.update(|cx| view.read(cx).lightbox.is_none()));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn a_locked_page_takes_no_edits(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            bind_view_keys(cx);
+            super::bind_markdown_keys(cx);
+        });
+        let text = "- [ ] task\n\nhello";
+        let (handle, view) = cx.update(|cx| gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+            cx.new(|cx| {
+                let mut app = Enso::new(window, cx);
+                app.add_document(Some(PathBuf::from("locked.md")), text.into(), None, window, cx);
+                app.mode = Mode::Edit;
+                app
+            })
+        }).unwrap());
+        draw(cx, handle);
+        let editor = cx.update(|cx| view.read(cx).documents[0].editor.clone());
+        cx.update_window(handle, |_, window, cx| {
+            editor.focus_handle(cx).focus(window, cx);
+            editor.update(cx, |e, cx| e.set_selected_range(text.len()..text.len(), cx));
+        }).unwrap();
+        cx.update(|cx| view.update(cx, |app, cx| app.toggle_lock(cx)));
+        draw(cx, handle);
+        let value = |cx: &mut TestAppContext| cx.update(|cx| editor.read(cx).value().to_string());
+        // Typing, a formatting shortcut, the reader's checkbox, the slash menu.
+        cx.simulate_input(handle, " more");
+        let bold = if cfg!(target_os = "macos") { "cmd-b" } else { "ctrl-b" };
+        cx.simulate_keystrokes(handle, bold);
+        let id = editor.entity_id();
+        cx.update_window(handle, |_, window, cx| view.update(cx, |app, cx| app.toggle_read_task(id, 2, window, cx))).unwrap();
+        cx.simulate_keystrokes(handle, "enter /");
+        draw(cx, handle);
+        assert_eq!(value(cx), text);
+        assert!(cx.update(|cx| view.read(cx).palette.is_none()));
+        // Unlocked, the same typing lands.
+        cx.update(|cx| view.update(cx, |app, cx| app.toggle_lock(cx)));
+        draw(cx, handle);
+        cx.simulate_input(handle, "!");
+        assert_eq!(value(cx), format!("{text}!"));
+    }
+
+    #[gpui_kit::test]
+    fn clicking_the_reader_moves_the_editor_there(cx: &mut TestAppContext) {
+        use gpui_kit::{Modifiers, VisualTestContext, point};
+        cx.update(|cx| { gpui_kit::init(cx); bind_view_keys(cx); });
+        let mut source = String::new();
+        for n in 0..12 {
+            source.push_str(&format!("## Section {n}\n\nSome words for section {n}.\n\n"));
+        }
+        source.push_str("- one\n- two\n- three\n\n| a | b |\n|---|---|\n| 1 | 2 |\n\n```rust\nfn x() {}\n```\n");
+        let text = source.clone();
+        let (handle, view) = cx.update(|cx| gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+            cx.new(|cx| {
+                let mut app = Enso::new(window, cx);
+                app.add_document(Some(PathBuf::from("click.md")), text, None, window, cx);
+                app
+            })
+        }).unwrap());
+        cx.update_window(handle, |_, window, cx| view.update(cx, |app, cx| app.set_mode(Mode::Split, window, cx))).unwrap();
+        for _ in 0..3 {
+            draw(cx, handle);
+        }
+        // The reader lists one item per top-level block, as the source has.
+        let blocks = super::top_level_blocks(&source);
+        let (count, bounds) = cx.update(|cx| {
+            let app = view.read(cx);
+            let preview = app.documents[0].preview.read(cx);
+            (preview.list_state().item_count(), preview.list_state().bounds_for_item(5))
+        });
+        assert_eq!(count, blocks.len());
+        let bounds = bounds.expect("block 5 is on screen");
+        let mut visual = VisualTestContext::from_window(handle, cx);
+        visual.simulate_click(point(bounds.left() + px(4.), bounds.center().y), Modifiers::default());
+        draw(cx, handle);
+        let cursor = cx.update(|cx| view.read(cx).documents[0].editor.read(cx).cursor());
+        assert_eq!(cursor, blocks[5].start, "caret at {:?}", &source[cursor..cursor + 20]);
+    }
+
+    #[gpui_kit::test]
+    fn the_reader_lists_one_item_per_block_for_the_features_sample(cx: &mut TestAppContext) {
+        cx.update(|cx| { gpui_kit::init(cx); bind_view_keys(cx); });
+        let source = include_str!("../Get Started.md").to_string()
+            + "\n\n> quote\n>\n> > nested\n\n<table><tr><td>x</td></tr></table>\n\n<img src=\"a.png\" width=\"50%\" />\n\nA footnote.[^1]\n\n[^1]: Note.\n[gfm]: https://example.com\n\n$$\nE = mc^2\n$$\n\n```mermaid\nflowchart LR\n  A --> B\n```\n\n- [x] done\n\n---\n";
+        let text = source.clone();
+        let (handle, view) = cx.update(|cx| gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+            cx.new(|cx| {
+                let mut app = Enso::new(window, cx);
+                app.add_document(Some(PathBuf::from("sample.md")), text, None, window, cx);
+                app
+            })
+        }).unwrap());
+        for _ in 0..3 {
+            draw(cx, handle);
+        }
+        let count = cx.update(|cx| view.read(cx).documents[0].preview.read(cx).list_state().item_count());
+        assert_eq!(count, super::top_level_blocks(&source).len());
     }
 
     #[gpui_kit::test]

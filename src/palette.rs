@@ -105,6 +105,7 @@ enum Choice {
     Image,
     Table,
     CodeBlock,
+    Mermaid,
     Divider,
     Footnote,
     Highlight,
@@ -121,6 +122,7 @@ enum Choice {
     SearchEverything,
     Export,
     CopyRichText,
+    ToggleLock,
 }
 impl Choice {
     fn key(&self) -> String {
@@ -138,6 +140,7 @@ impl Choice {
             Self::Image => "image".into(),
             Self::Table => "table".into(),
             Self::CodeBlock => "code-block".into(),
+            Self::Mermaid => "mermaid-diagram".into(),
             Self::Divider => "divider".into(),
             Self::Footnote => "footnote".into(),
             Self::Highlight => "highlight".into(),
@@ -156,6 +159,7 @@ impl Choice {
             Self::SearchEverything => "search-everything".into(),
             Self::Export => "export".into(),
             Self::CopyRichText => "copy-rich-text".into(),
+            Self::ToggleLock => "lock-page".into(),
         }
     }
 
@@ -188,6 +192,7 @@ impl Choice {
             Self::SearchEverything => Box::new(SearchEverything),
             Self::Export => Box::new(ExportNote),
             Self::CopyRichText => Box::new(CopyRichText),
+            Self::ToggleLock => Box::new(ToggleLock),
             _ => return None,
         })
     }
@@ -229,7 +234,7 @@ impl Enso {
         let Some(doc) = self.active.map(|i| &self.documents[i]) else {
             return false;
         };
-        if !doc.markdown || self.mode == Mode::Read {
+        if !doc.markdown || self.mode == Mode::Read || doc.locked {
             return false;
         }
         let editor = doc.editor.clone();
@@ -288,9 +293,10 @@ impl Enso {
         }
         self.closing_palette = None;
         ensure_history(cx);
+        // A locked note offers nothing to insert or format.
         let target = self.active.and_then(|i| {
             let doc = &self.documents[i];
-            (doc.markdown && self.mode != Mode::Read)
+            (doc.markdown && self.mode != Mode::Read && !doc.locked)
                 .then(|| (doc.editor.clone(), doc.editor.read(cx).selected_range()))
         });
         let mut insert = Vec::new();
@@ -328,6 +334,12 @@ impl Enso {
                     &["snippet", "fence"],
                     Choice::CodeBlock,
                     Some("⌥C"),
+                ),
+                entry(
+                    "Mermaid Diagram",
+                    &["diagram", "flowchart", "chart", "graph", "sequence"],
+                    Choice::Mermaid,
+                    None,
                 ),
                 entry(
                     "Quote",
@@ -449,6 +461,16 @@ impl Enso {
                     &["preview", "side by side"],
                     Choice::Mode(Mode::Split),
                     Some("\\"),
+                ),
+                entry(
+                    if self.active.is_some_and(|i| self.documents[i].locked) {
+                        "Unlock Page"
+                    } else {
+                        "Lock Page"
+                    },
+                    &["lock", "unlock", "read only", "protect", "freeze", "edit"],
+                    Choice::ToggleLock,
+                    None,
                 ),
                 entry(
                     "Export…",
@@ -682,6 +704,7 @@ impl Enso {
             }
             Choice::Settings => settings::open(cx),
             Choice::Export => self.open_export(window, cx),
+            Choice::ToggleLock => self.toggle_lock(cx),
             Choice::CopyRichText => {
                 let images = self.export_choice.images;
                 self.copy_rich_text(images, cx)
@@ -724,6 +747,7 @@ impl Enso {
                             });
                         }
                         Choice::Divider => insert(&editor, "\n\n---\n\n".into(), window, cx),
+                        Choice::Mermaid => insert_mermaid(&editor, window, cx),
                         Choice::Highlight => self.open_highlight(editor.clone(), slash, window, cx),
                         Choice::Date => insert(
                             &editor,
@@ -1345,7 +1369,44 @@ fn is_insert(choice: &Choice) -> bool {
             | Choice::Swap
             | Choice::Settings
             | Choice::Reveal
+            | Choice::SearchEverything
+            | Choice::Export
+            | Choice::CopyRichText
+            | Choice::ToggleLock
     )
+}
+
+/// The diagram a new Mermaid block starts with.
+const MERMAID_STARTER: &str = "flowchart LR\n  source[Markdown] --> parse --> doc[Document]";
+
+/// A Mermaid block on its own lines at the selection, its starter diagram
+/// selected so typing replaces it.
+fn insert_mermaid(editor: &Entity<EditorState>, window: &mut Window, cx: &mut App) {
+    let source = editor.read(cx).value().to_string();
+    let range = editor.read(cx).selected_range();
+    let before = &source[..range.start];
+    let after = &source[range.end..];
+    let lead = if before.is_empty() || before.ends_with("\n\n") {
+        ""
+    } else if before.ends_with('\n') {
+        "\n"
+    } else {
+        "\n\n"
+    };
+    let tail = if after.starts_with("\n\n") || after.is_empty() {
+        ""
+    } else if after.starts_with('\n') {
+        "\n"
+    } else {
+        "\n\n"
+    };
+    let fence = "```mermaid\n";
+    let text = format!("{lead}{fence}{MERMAID_STARTER}\n```{tail}");
+    editor.update(cx, |state, cx| {
+        state.replace(text, window, cx);
+        let start = range.start + lead.len() + fence.len();
+        state.set_selected_range(start..start + MERMAID_STARTER.len(), cx);
+    });
 }
 
 fn apply_palette_markdown(
@@ -1790,6 +1851,63 @@ mod ui_tests {
             assert_eq!(editor.read(cx).selected_range(), 1..6);
             assert_eq!(editor.read(cx).value().as_str(), "[hello](url) world");
         });
+    }
+
+    #[gpui_kit::test]
+    fn mermaid_diagram_inserts_from_slash_and_the_palette(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            cx.set_global(super::History::default());
+            bind_view_keys(cx);
+            bind_markdown_keys(cx);
+        });
+        let (handle, view) = cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| {
+                    let mut app = Enso::new(window, cx);
+                    app.add_document(Some(PathBuf::from("diagram.md")), "".into(), None, window, cx);
+                    app.mode = Mode::Edit;
+                    app
+                })
+            })
+            .unwrap()
+        });
+        draw(cx, handle);
+        let editor = cx.update(|cx| view.read(cx).documents[0].editor.clone());
+        cx.update_window(handle, |_, window, cx| editor.focus_handle(cx).focus(window, cx)).unwrap();
+        draw(cx, handle);
+        let block = format!("```mermaid\n{}\n```", super::MERMAID_STARTER);
+        // From the slash menu on an empty line: the slash becomes the block,
+        // and the starter diagram is selected, ready to be typed over.
+        cx.simulate_keystrokes(handle, "/");
+        draw(cx, handle);
+        cx.simulate_input(handle, "mermaid");
+        draw(cx, handle);
+        cx.simulate_keystrokes(handle, "enter");
+        draw(cx, handle);
+        cx.update(|cx| {
+            let state = editor.read(cx);
+            assert_eq!(state.value().as_ref(), block);
+            let selected = &state.value()[state.selected_range()];
+            assert_eq!(selected, super::MERMAID_STARTER);
+        });
+        // From the command palette after text: on its own lines below it.
+        cx.update_window(handle, |_, window, cx| {
+            editor.update(cx, |state, cx| {
+                state.set_value("Intro", window, cx);
+                state.set_selected_range(5..5, cx);
+            })
+        })
+        .unwrap();
+        let key = if cfg!(target_os = "macos") { "cmd-shift-p" } else { "ctrl-shift-p" };
+        cx.simulate_keystrokes(handle, key);
+        draw(cx, handle);
+        cx.simulate_input(handle, "mermaid diagram");
+        draw(cx, handle);
+        cx.simulate_keystrokes(handle, "enter");
+        draw(cx, handle);
+        let text = cx.update(|cx| editor.read(cx).value().to_string());
+        assert_eq!(text, format!("Intro\n\n{block}"));
     }
 
     #[gpui_kit::test]

@@ -32,6 +32,11 @@ bezel-mermaid = "0.2.24"
 # Pictures of diagrams for PDFs and the clipboard: the SVG renderer GPUI
 # already builds, at its version and features.
 resvg = { version = "0.46", default-features = false, features = ["text", "system-fonts"] }
+# Web images: GPUI fetches them through an HTTP client the app installs.
+# The system's TLS and trusted roots (Secure Transport, SChannel, OpenSSL),
+# rather than a bundled TLS stack.
+ureq = { version = "3.5", default-features = false, features = ["native-tls-no-default"] }
+bytes = "1"
 
 # Moving deleted files to the Trash: the trash crate on macOS and Linux;
 # Windows goes through the shell itself (see files::move_to_trash).

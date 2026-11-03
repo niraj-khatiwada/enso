@@ -356,7 +356,7 @@ fn attribute(tag: &str, name: &str) -> Option<String> {
 
 /// The file an image source points at: relative to the note's folder, or a
 /// `file://` URL. Web, data and other URLs aren't local.
-pub(super) fn local_path(src: &str, base: Option<&Path>) -> Option<std::path::PathBuf> {
+pub(crate) fn local_path(src: &str, base: Option<&Path>) -> Option<std::path::PathBuf> {
     if let Some(path) = src.strip_prefix("file://") {
         return Some(percent_decode(path).into());
     }
