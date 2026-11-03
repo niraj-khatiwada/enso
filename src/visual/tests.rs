@@ -1023,3 +1023,58 @@ fn pasting_an_image_inserts_an_image_block(cx: &mut TestAppContext) {
     cx.update(|cx| assert!(view.read(cx).selected_image().is_some()));
     assert_synced(cx, &view, "after pasting an image");
 }
+
+#[gpui_kit::test]
+fn the_front_matter_panel_edits_the_header_both_ways(cx: &mut TestAppContext) {
+    let doc = "---\ntitle: Hills\ntags: [walk]\n---\n\n# Hills\n\nBody.\n";
+    let (handle, view) = open(cx, doc);
+    draw(cx, handle);
+    let panel = cx.update(|cx| {
+        view.read(cx)
+            .front_matter
+            .as_ref()
+            .map(|p| p.editor.clone())
+    });
+    let panel = panel.expect("a front matter panel");
+    cx.update(|cx| {
+        assert_eq!(
+            panel.read(cx).value().as_ref(),
+            "title: Hills\ntags: [walk]"
+        )
+    });
+    cx.update_window(handle, |_, window, cx| {
+        panel.update(cx, |state, cx| {
+            state.focus(window, cx);
+            state.set_selected_range(12..12, cx);
+        });
+    })
+    .unwrap();
+    cx.simulate_input(handle, " and lakes");
+    draw(cx, handle);
+    assert_eq!(
+        source(cx, &view),
+        doc.replace("title: Hills\n", "title: Hills and lakes\n")
+    );
+    cx.update_window(handle, |_, window, cx| {
+        view.update(cx, |v, cx| window.focus(&v.focus, cx));
+    })
+    .unwrap();
+    let at = source(cx, &view).find("[walk]").unwrap() + 5;
+    cx.update_window(handle, |_, window, cx| {
+        let editor = view.read(cx).editor.clone();
+        editor.update(cx, |state, cx| {
+            state.set_selected_range(at..at, cx);
+            state.replace(", lake".to_string(), window, cx);
+        });
+    })
+    .unwrap();
+    draw(cx, handle);
+    draw(cx, handle);
+    cx.update(|cx| {
+        assert_eq!(
+            panel.read(cx).value().as_ref(),
+            "title: Hills and lakes\ntags: [walk, lake]"
+        )
+    });
+    assert_synced(cx, &view, "after front matter edits");
+}

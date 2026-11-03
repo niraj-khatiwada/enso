@@ -3,6 +3,7 @@ pub mod caret;
 mod commands;
 pub mod document;
 mod focus;
+mod front_matter;
 pub mod image;
 mod image_ui;
 mod input;

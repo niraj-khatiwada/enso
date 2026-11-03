@@ -163,6 +163,7 @@ pub struct VisualView {
     pub(super) image_bounds: Rc<RefCell<HashMap<u64, Bounds<Pixels>>>>,
     pub(super) image_dialog: Option<super::image_ui::ImageDialog>,
     pub paste_images: Option<PasteImages>,
+    pub(super) front_matter: Option<super::front_matter::FrontMatterPanel>,
     focus_target: Option<FocusTarget>,
     focus_fade: Option<(FocusTarget, std::time::Instant)>,
     padded: (usize, Pixels, Pixels),
@@ -227,6 +228,7 @@ impl VisualView {
             image_bounds: Rc::default(),
             image_dialog: None,
             paste_images: None,
+            front_matter: None,
             focus_target: None,
             focus_fade: None,
             padded: (0, px(0.), px(0.)),
@@ -1328,6 +1330,16 @@ impl VisualView {
         let (last, head, tail) = self.padded;
         let pad_top = if ix == 0 { head } else { px(0.) };
         let pad_bottom = if ix == last { tail } else { px(0.) };
+        if bix == 0
+            && self.front_matter.is_some()
+            && super::front_matter::front_matter_lang(
+                &self.doc.blocks[0].kind,
+                self.doc.blocks[0].start,
+            )
+            .is_some()
+        {
+            return self.render_front_matter(pad_top, cx);
+        }
         if let Kind::Image(image) = &self.doc.blocks[bix].kind {
             let (id, image) = (self.doc.blocks[bix].id, image.clone());
             return self.render_image_block(id, &image, pad_top, pad_bottom, cx);
@@ -1551,8 +1563,9 @@ impl Focusable for VisualView {
 }
 
 impl Render for VisualView {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.perf.borrow_mut().frame_begin();
+        self.sync_front_matter(window, cx);
         if self.doc.definitions() != self.render_defs {
             self.refresh_render_cx(cx);
         }
