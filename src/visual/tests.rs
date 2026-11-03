@@ -1172,3 +1172,54 @@ fn the_page_reports_its_structure_and_resizes_its_text(cx: &mut TestAppContext) 
     assert!(after > before, "{before:?} -> {after:?}");
     cx.update(|cx| assert_eq!(super::prefs::WritingPrefs::get(cx).text_size, 20.));
 }
+
+#[gpui_kit::test]
+fn formulas_render_and_edit_through_the_math_editor(cx: &mut TestAppContext) {
+    let doc = "Energy $E$ here.\n\n$$\nE = mc^2\n$$\n\nAfter.\n";
+    let (handle, view) = open(cx, doc);
+    let block = cx.update(|cx| {
+        view.read(cx)
+            .doc
+            .blocks
+            .iter()
+            .find(|b| matches!(b.kind, super::document::Kind::Math { .. }))
+            .map(|b| b.id)
+    });
+    let block = block.expect("a display math block");
+    cx.update_window(handle, |_, window, cx| {
+        view.update(cx, |v, cx| {
+            v.open_math_dialog(super::math_ui::MathTarget::Block(block), window, cx);
+            let editor = v.math_dialog.as_ref().unwrap().editor.clone();
+            assert_eq!(editor.read(cx).value().as_ref(), "E = mc^2");
+            editor.update(cx, |e, cx| {
+                e.set_value("E = mc^2 + \\frac{1}{2}", window, cx)
+            });
+            v.confirm_math_dialog(window, cx);
+        })
+    })
+    .unwrap();
+    draw(cx, handle);
+    assert_eq!(
+        source(cx, &view),
+        "Energy $E$ here.\n\n$$\nE = mc^2 + \\frac{1}{2}\n$$\n\nAfter.\n"
+    );
+    let at = source(cx, &view).find("After").unwrap() + 5;
+    cx.update(|cx| view.update(cx, |v, cx| v.place_caret(at, None, cx)));
+    cx.simulate_keystrokes(handle, &format!("{MOD}-shift-m"));
+    cx.update(|cx| assert!(view.read(cx).math_dialog.is_some()));
+    cx.simulate_keystrokes(handle, "escape");
+    cx.update(|cx| assert!(view.read(cx).math_dialog.is_none()));
+    cx.simulate_keystrokes(handle, &format!("{MOD}-shift-m"));
+    cx.simulate_input(handle, "\\alpha");
+    cx.update_window(handle, |_, window, cx| {
+        view.update(cx, |v, cx| v.confirm_math_dialog(window, cx))
+    })
+    .unwrap();
+    draw(cx, handle);
+    assert!(
+        source(cx, &view).ends_with("After$\\alpha$.\n"),
+        "{}",
+        source(cx, &view)
+    );
+    assert_synced(cx, &view, "after math edits");
+}

@@ -2,10 +2,8 @@ use std::{
     hash::{DefaultHasher, Hash, Hasher},
     ops::Range,
     panic::{AssertUnwindSafe, catch_unwind},
-    sync::Arc,
 };
 
-use gpui_kit::base::text::MarkdownExtensions;
 use gpui_kit::base::text::editor_host::{
     BlockNode, CodeBlock, InlineNode, Paragraph, Table, parse_markdown,
 };
@@ -14,12 +12,7 @@ use super::document::{Item, Kind, Row, fresh_id, is_closing_fence};
 use super::mapping::{LeafBuilder, LeafMap, Seg};
 
 pub(super) fn parse_nodes(text: &str, front_matter: bool) -> Option<Vec<BlockNode>> {
-    let extensions = if front_matter {
-        MarkdownExtensions::default().frontmatter()
-    } else {
-        MarkdownExtensions::default()
-    };
-    let extensions = Arc::new(extensions);
+    let extensions = super::math::extensions(front_matter);
     catch_unwind(AssertUnwindSafe(|| parse_markdown(text, extensions).ok()))
         .ok()
         .flatten()
@@ -354,6 +347,10 @@ impl<'a> Builder<'a> {
         let span = span.unwrap_or(0..0);
         let src = self.source.get(span.clone()).unwrap_or("");
         let first = src.trim_start();
+        if self.depth == 0 && first.starts_with("$$") {
+            self.kind = Kind::Math { tex: value };
+            return BlockNode::CodeBlock(code);
+        }
         let fenced = first.starts_with("```")
             || first.starts_with("~~~")
             || first.starts_with("---")

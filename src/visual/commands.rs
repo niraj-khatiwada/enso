@@ -237,11 +237,19 @@ pub fn listeners(root: Stateful<Div>, cx: &mut Context<VisualView>) -> Stateful<
         w,
         cx
     ));
-    let root = on!(root, ToggleTaskDone, |this, w, cx| this.apply(
-        |t: &str, s| Some(markdown_edit::toggle_task_done(t, s)),
-        w,
-        cx
-    ));
+    let root = on!(
+        root,
+        ToggleTaskDone,
+        |this, w, cx| if this.math_dialog.is_some() {
+            this.confirm_math_dialog(w, cx);
+        } else {
+            this.apply(
+                |t: &str, s| Some(markdown_edit::toggle_task_done(t, s)),
+                w,
+                cx,
+            );
+        }
+    );
     let root = on!(root, CodeBlock, |this, w, cx| this.apply(
         |t: &str, s| Some(markdown_edit::toggle_code_block(t, s)),
         w,

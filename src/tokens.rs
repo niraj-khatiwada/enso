@@ -9,11 +9,9 @@ pub const SPACE_4: Pixels = px(8.);
 pub const SPACE_5: Pixels = px(12.);
 pub const SPACE_6: Pixels = px(16.);
 pub const SPACE_7: Pixels = px(24.);
-pub const SPACE_8: Pixels = px(32.);
 
 pub const RADIUS_SM: Pixels = px(4.);
 pub const RADIUS_MD: Pixels = px(6.);
-pub const RADIUS_LG: Pixels = px(8.);
 
 pub const HAIRLINE: Pixels = px(1.);
 pub const NUDGE: Pixels = px(0.5);

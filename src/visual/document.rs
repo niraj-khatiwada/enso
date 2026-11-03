@@ -41,6 +41,9 @@ pub enum Kind {
         aligns: Vec<ColumnAlign>,
     },
     Image(super::image::ImageBlock),
+    Math {
+        tex: String,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -453,7 +456,7 @@ impl VisualDocument {
                 }
                 Kind::List { .. } => self.edit_list(first, rope, &old, new_len),
                 Kind::Table { .. } => self.edit_table_row(first, rope, &old, new_len),
-                Kind::Other | Kind::Image(_) => None,
+                Kind::Other | Kind::Image(_) | Kind::Math { .. } => None,
             };
             if let Some(result) = result {
                 for block in &mut self.blocks[first + 1..] {
@@ -1760,8 +1763,10 @@ pub(crate) mod tests {
             ("inline HTML", "Some <kbd>Ctrl</kbd> text.\n", &|d| {
                 d.blocks[0].leaves[0].text == "Some Ctrl text."
             }),
-            ("math block", "Inline $x^2$ and\n\n$$\ny = 1\n$$\n", &|d| {
-                d.blocks.len() == 2 && d.blocks[1].leaves[0].text == "y = 1"
+            ("math", "Inline $x^2$ and\n\n$$\ny = 1\n$$\n", &|d| {
+                d.blocks.len() == 2
+                    && d.blocks[0].leaves[0].text.contains('\u{FFFC}')
+                    && matches!(&d.blocks[1].kind, Kind::Math { tex } if tex == "y = 1")
             }),
             (
                 "HTML block",
