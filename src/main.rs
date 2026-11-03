@@ -1,5 +1,6 @@
 mod app_icon;
 mod brand;
+mod diagram;
 mod export;
 mod files;
 mod markdown_edit;

@@ -494,6 +494,10 @@ mod tests {
         );
         let pdf = pdf(&source, Some(&dir), "Sample", LAYOUT).unwrap();
         assert!(pdf.starts_with(b"%PDF"));
+        // The diagram is a picture; the broken one stays as code.
+        let pages = typeset(&source, Some(&dir), LAYOUT).unwrap();
+        let pictures = pages.iter().flatten().filter(|(_, i)| matches!(i, Item::Image { .. })).count();
+        assert_eq!(pictures, 3, "two images and one diagram");
         let without = pdf_no_images(&source, &dir);
         assert!(without.len() < pdf.len());
         std::fs::remove_dir_all(dir).unwrap();
@@ -603,6 +607,17 @@ line two\
 fn main() { println!("{}", "#[x]"); }
 ```
 
+```mermaid
+flowchart LR
+  A[Write] --> B{Export?}
+  B -->|PDF| C[Print]
+```
+
+```mermaid
+flowchart LR
+  A -->
+```
+
 $$
 E = mc^2
 $$
@@ -617,4 +632,5 @@ A footnote.[^1] Reference [link][gfm].
 \*escaped\* \# not a heading
 "##;
 }
+
 

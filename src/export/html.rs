@@ -33,7 +33,41 @@ pub fn body(source: &str, base: Option<&Path>, images: &mut Images) -> String {
     };
     let html = markdown::to_html_with_options(source, &options)
         .unwrap_or_else(|_| format!("<pre>{}</pre>", escape(source)));
-    rewrite_images(&marks(&html), base, images)
+    let inline = matches!(images, Images::Inline { .. });
+    diagrams(&rewrite_images(&marks(&html), base, images), inline)
+}
+
+/// ```mermaid fences as their diagrams: SVG in a page, which stays sharp at
+/// any zoom, or a picture for the clipboard, where most apps drop SVG. A
+/// diagram with a mistake stays as its source.
+fn diagrams(html: &str, picture: bool) -> String {
+    const OPEN: &str = "<pre><code class=\"language-mermaid\">";
+    const CLOSE: &str = "</code></pre>";
+    let mut out = String::with_capacity(html.len());
+    let mut rest = html;
+    while let Some(start) = rest.find(OPEN) {
+        let Some(len) = rest[start + OPEN.len()..].find(CLOSE) else {
+            break;
+        };
+        let end = start + OPEN.len() + len + CLOSE.len();
+        out.push_str(&rest[..start]);
+        let source = unescape(&rest[start + OPEN.len()..start + OPEN.len() + len]);
+        match crate::diagram::render(&source, false) {
+            Ok(drawn) if picture => match crate::diagram::png(&drawn, 2.) {
+                Some(png) => out.push_str(&format!(
+                    "<p><img src=\"data:image/png;base64,{}\" width=\"{}\" alt=\"Diagram\" /></p>",
+                    base64::engine::general_purpose::STANDARD.encode(png),
+                    drawn.width.round()
+                )),
+                None => out.push_str(&rest[start..end]),
+            },
+            Ok(drawn) => out.push_str(&format!("<figure class=\"diagram\">{}</figure>", drawn.svg)),
+            Err(_) => out.push_str(&rest[start..end]),
+        }
+        rest = &rest[end..];
+    }
+    out.push_str(rest);
+    out
 }
 
 /// Write a new export folder. Refuse an existing target rather than replacing
@@ -383,6 +417,8 @@ th { background: var(--soft); }
 hr { border: 0; border-top: 1px solid var(--line); margin: 2em 0; }
 li:has(> input[type="checkbox"]) { list-style: none; margin-left: -1.4em; }
 li > input[type="checkbox"] { margin-right: 0.5em; }
+.diagram { margin: 0 0 1em; padding: 16px; border-radius: 10px; background: #fafbfc; border: 1px solid var(--line); overflow-x: auto; text-align: center; }
+.diagram svg { max-width: 100%; height: auto; }
 mark { background: #fef08a; color: inherit; padding: 0 0.15em; border-radius: 3px; }
 .footnotes { font-size: 0.875em; color: var(--muted); border-top: 1px solid var(--line); margin-top: 3em; }
 @media print { article { padding: 0; max-width: none; } a { color: inherit; } pre, blockquote, table, img { break-inside: avoid; } }
@@ -455,6 +491,18 @@ mod tests {
     fn plain_text_leaves_images_out() {
         let source = "# Trip\n\n<img src=\".assets/images/a.png\" width=\"100%\" />\n\nText with ![inline](b.png) image.\n\n- item\n";
         assert_eq!(plain_text(source), "# Trip\n\nText with  image.\n\n- item\n");
+    }
+
+    #[test]
+    fn mermaid_fences_become_diagrams() {
+        let source = "Before\n\n```mermaid\nflowchart LR\n  A --> B\n```\n\n```mermaid\nflowchart LR\n  A -->\n```\n";
+        let page = body(source, None, &mut Images::None);
+        assert!(page.contains("<figure class=\"diagram\"><svg"), "{page}");
+        // A mistake stays as its source rather than vanishing.
+        assert!(page.contains("<code class=\"language-mermaid\">flowchart LR\n  A --&gt;"), "{page}");
+        // The clipboard gets a picture.
+        let copied = body(source, None, &mut Images::Inline { used: 0 });
+        assert!(copied.contains("src=\"data:image/png;base64,"), "{copied}");
     }
 
     #[test]
