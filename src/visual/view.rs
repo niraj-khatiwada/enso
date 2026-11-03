@@ -36,6 +36,8 @@ actions!(
 
 pub const CONTEXT: &str = "VisualEditor";
 
+pub type PasteImages = Rc<dyn Fn(&ClipboardItem, &mut App) -> Option<Vec<(String, String)>>>;
+
 pub const OPEN_PREFIX_BYTES: usize = 12 * 1024;
 
 pub const BODY_SIZE: f32 = 17.;
@@ -160,6 +162,7 @@ pub struct VisualView {
     pub(super) image_resize: Option<super::image_ui::ImageResize>,
     pub(super) image_bounds: Rc<RefCell<HashMap<u64, Bounds<Pixels>>>>,
     pub(super) image_dialog: Option<super::image_ui::ImageDialog>,
+    pub paste_images: Option<PasteImages>,
     focus_target: Option<FocusTarget>,
     focus_fade: Option<(FocusTarget, std::time::Instant)>,
     padded: (usize, Pixels, Pixels),
@@ -223,6 +226,7 @@ impl VisualView {
             image_resize: None,
             image_bounds: Rc::default(),
             image_dialog: None,
+            paste_images: None,
             focus_target: None,
             focus_fade: None,
             padded: (0, px(0.), px(0.)),

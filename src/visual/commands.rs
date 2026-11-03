@@ -336,7 +336,27 @@ impl VisualView {
     }
 
     pub fn paste(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) else {
+        let Some(item) = cx.read_from_clipboard() else {
+            return;
+        };
+        if let Some(hook) = self.paste_images.clone()
+            && let Some(links) = hook(&item, cx)
+        {
+            let mut at = self.selection().end;
+            for (url, alt) in links {
+                let image = super::image::ImageBlock {
+                    url,
+                    alt,
+                    ..Default::default()
+                };
+                self.write_image(super::image_ui::ImageTarget::Insert(at), &image, window, cx);
+                if let Some((ix, _)) = self.selected_image() {
+                    at = self.doc.blocks[ix].end;
+                }
+            }
+            return;
+        }
+        let Some(text) = item.text() else {
             return;
         };
         let crlf = self.editor.read(cx).text().to_string().contains("\r\n");

@@ -1000,3 +1000,26 @@ fn image_blocks_resize_align_and_delete_in_place(cx: &mut TestAppContext) {
     assert!(text.starts_with("Before.\n\n<p align"), "{text}");
     assert_synced(cx, &view, "after removing an image");
 }
+
+#[gpui_kit::test]
+fn pasting_an_image_inserts_an_image_block(cx: &mut TestAppContext) {
+    let doc = "First paragraph.\n\nSecond.\n";
+    let (handle, view) = open(cx, doc);
+    cx.update(|cx| {
+        view.update(cx, |v, _| {
+            v.caret = 5;
+            v.paste_images = Some(std::rc::Rc::new(|_, _| {
+                Some(vec![("images/shot.png".to_string(), "shot".to_string())])
+            }));
+        });
+        cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string("x".into()));
+    });
+    cx.simulate_keystrokes(handle, &format!("{MOD}-v"));
+    draw(cx, handle);
+    assert_eq!(
+        source(cx, &view),
+        "First paragraph.\n\n![shot](images/shot.png)\n\nSecond.\n"
+    );
+    cx.update(|cx| assert!(view.read(cx).selected_image().is_some()));
+    assert_synced(cx, &view, "after pasting an image");
+}

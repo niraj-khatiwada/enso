@@ -524,9 +524,23 @@ impl Enso {
             .and_then(|p| p.parent())
             .map(PathBuf::from);
         let editor = doc.editor.clone();
+        let weak = cx.entity().downgrade();
+        let paste_editor = editor.clone();
         let visual = cx.new(|cx| {
             let mut view = visual::view::VisualView::new(editor, window, cx);
             view.set_base(base, cx);
+            view.paste_images = Some(std::rc::Rc::new(
+                move |item: &ClipboardItem, cx: &mut App| {
+                    let images = pasted_images(item);
+                    if images.is_empty() {
+                        return None;
+                    }
+                    weak.update(cx, |this, cx| {
+                        this.save_pasted_images(images, &paste_editor, cx)
+                    })
+                    .ok()
+                },
+            ));
             view
         });
         doc.visual = Some(visual.clone());
@@ -1180,6 +1194,36 @@ impl Enso {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let attr = |value: &str| {
+            value
+                .replace('&', "&amp;")
+                .replace('"', "&quot;")
+                .replace('<', "&lt;")
+        };
+        let links: Vec<String> = self
+            .save_pasted_images(images, &editor, cx)
+            .into_iter()
+            .map(|(link, alt)| {
+                format!(
+                    "<img src=\"{}\" alt=\"{}\" width=\"100%\" />",
+                    attr(&link),
+                    attr(&alt)
+                )
+            })
+            .collect();
+        if !links.is_empty() {
+            editor.update(cx, |editor, cx| {
+                editor.replace(links.join("\n"), window, cx)
+            });
+        }
+    }
+
+    fn save_pasted_images(
+        &mut self,
+        images: Vec<PastedImage>,
+        editor: &Entity<EditorState>,
+        cx: &mut Context<Self>,
+    ) -> Vec<(String, String)> {
         let Some(doc_path) = self
             .documents
             .iter()
@@ -1187,10 +1231,10 @@ impl Enso {
             .and_then(|doc| doc.path.clone())
         else {
             self.message("Save this note before pasting images into it.", true, cx);
-            return;
+            return Vec::new();
         };
         let Some(doc_dir) = doc_path.parent().map(PathBuf::from) else {
-            return;
+            return Vec::new();
         };
         let root = self
             .root
@@ -1211,29 +1255,12 @@ impl Enso {
                         .file_stem()
                         .map(|s| s.to_string_lossy().into_owned())
                         .unwrap_or_else(|| "image".into());
-                    // An <img> tag rather than ![](): Markdown images cannot be
-                    // sized, and this one starts at the reading column's width.
-                    let attr = |value: &str| {
-                        value
-                            .replace('&', "&amp;")
-                            .replace('"', "&quot;")
-                            .replace('<', "&lt;")
-                    };
-                    let link = files::relative_link(&doc_dir, &saved);
-                    links.push(format!(
-                        "<img src=\"{}\" alt=\"{}\" width=\"100%\" />",
-                        attr(&link),
-                        attr(&alt)
-                    ));
+                    links.push((files::relative_link(&doc_dir, &saved), alt));
                 }
                 Err(error) => self.message(format!("Could not save the image: {error}"), true, cx),
             }
         }
-        if !links.is_empty() {
-            editor.update(cx, |editor, cx| {
-                editor.replace(links.join("\n"), window, cx)
-            });
-        }
+        links
     }
 
     /// The tree row last clicked, if it is still inside the open workspace.
@@ -1686,24 +1713,7 @@ impl Enso {
                                     let weak = cx.entity().downgrade();
                                     let editor = document.editor.clone();
                                     move |item, window, cx| {
-                                        let mut images = Vec::new();
-                                        for entry in item.entries() {
-                                            match entry {
-                                                ClipboardEntry::Image(image) => {
-                                                    images.push(PastedImage::Data(image.clone()))
-                                                }
-                                                ClipboardEntry::ExternalPaths(paths) => images
-                                                    .extend(
-                                                        paths
-                                                            .paths()
-                                                            .iter()
-                                                            .filter(|p| files::is_image(p))
-                                                            .cloned()
-                                                            .map(PastedImage::File),
-                                                    ),
-                                                _ => {}
-                                            }
-                                        }
+                                        let images = pasted_images(item);
                                         if images.is_empty() {
                                             return false;
                                         }
@@ -2823,6 +2833,25 @@ impl Enso {
         };
         AnyView::from(view).cached(style).into_any_element()
     }
+}
+
+fn pasted_images(item: &ClipboardItem) -> Vec<PastedImage> {
+    let mut images = Vec::new();
+    for entry in item.entries() {
+        match entry {
+            ClipboardEntry::Image(image) => images.push(PastedImage::Data(image.clone())),
+            ClipboardEntry::ExternalPaths(paths) => images.extend(
+                paths
+                    .paths()
+                    .iter()
+                    .filter(|p| files::is_image(p))
+                    .cloned()
+                    .map(PastedImage::File),
+            ),
+            _ => {}
+        }
+    }
+    images
 }
 
 fn bind_view_keys(cx: &mut App) {
