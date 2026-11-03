@@ -123,6 +123,8 @@ enum Choice {
     Export,
     CopyRichText,
     ToggleLock,
+    RenameFile,
+    DeleteFile,
 }
 impl Choice {
     fn key(&self) -> String {
@@ -160,6 +162,8 @@ impl Choice {
             Self::Export => "export".into(),
             Self::CopyRichText => "copy-rich-text".into(),
             Self::ToggleLock => "lock-page".into(),
+            Self::RenameFile => "rename-file".into(),
+            Self::DeleteFile => "delete-file".into(),
         }
     }
 
@@ -509,6 +513,16 @@ impl Enso {
                 None,
             ));
         }
+        // The open note's own file.
+        if self.active.and_then(|i| self.documents[i].path.as_ref()).is_some() {
+            app.push(entry("Rename File", &["name", "title", "file"], Choice::RenameFile, None));
+            app.push(entry(
+                "Delete File",
+                &["remove", "trash", "bin", "file"],
+                Choice::DeleteFile,
+                None,
+            ));
+        }
         let workspaces = workspaces::recent(cx)
             .iter()
             .filter(|w| w.exists())
@@ -705,6 +719,16 @@ impl Enso {
             Choice::Settings => settings::open(cx),
             Choice::Export => self.open_export(window, cx),
             Choice::ToggleLock => self.toggle_lock(cx),
+            Choice::RenameFile => {
+                if let Some(path) = self.active.and_then(|i| self.documents[i].path.clone()) {
+                    self.rename_file(path, window, cx);
+                }
+            }
+            Choice::DeleteFile => {
+                if let Some(path) = self.active.and_then(|i| self.documents[i].path.clone()) {
+                    self.delete_entry(path, window, cx);
+                }
+            }
             Choice::CopyRichText => {
                 let images = self.export_choice.images;
                 self.copy_rich_text(images, cx)
@@ -1373,6 +1397,8 @@ fn is_insert(choice: &Choice) -> bool {
             | Choice::Export
             | Choice::CopyRichText
             | Choice::ToggleLock
+            | Choice::RenameFile
+            | Choice::DeleteFile
     )
 }
 
@@ -1851,6 +1877,46 @@ mod ui_tests {
             assert_eq!(editor.read(cx).selected_range(), 1..6);
             assert_eq!(editor.read(cx).value().as_str(), "[hello](url) world");
         });
+    }
+
+    #[gpui_kit::test]
+    fn rename_file_from_the_palette_starts_the_sidebar_rename(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            cx.set_global(super::History::default());
+            bind_view_keys(cx);
+        });
+        let root = std::env::temp_dir().join(format!("enso-palette-rename-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("notes")).unwrap();
+        let path = root.join("notes/a.md");
+        std::fs::write(&path, "a").unwrap();
+        let (handle, view) = cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| {
+                    let mut app = Enso::new(window, cx);
+                    app.root = Some(root.clone());
+                    app.sidebar_open = false;
+                    app.add_document(Some(path.clone()), "a".into(), None, window, cx);
+                    app
+                })
+            })
+            .unwrap()
+        });
+        draw(cx, handle);
+        let key = if cfg!(target_os = "macos") { "cmd-shift-p" } else { "ctrl-shift-p" };
+        cx.simulate_keystrokes(handle, key);
+        draw(cx, handle);
+        cx.simulate_input(handle, "rename file");
+        draw(cx, handle);
+        cx.simulate_keystrokes(handle, "enter");
+        draw(cx, handle);
+        cx.update(|cx| {
+            let app = view.read(cx);
+            assert_eq!(app.renaming.as_ref(), Some(&path));
+            assert!(app.sidebar_open);
+            assert!(app.expanded.contains(&root.join("notes")));
+        });
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[gpui_kit::test]

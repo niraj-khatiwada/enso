@@ -46,6 +46,8 @@ pub struct Preferences {
     pub spell_check: bool,
     /// Load images from the web (`https://…`) in notes.
     pub web_images: bool,
+    /// Ask before a file or folder goes to the Trash.
+    pub confirm_delete: bool,
     /// Split view puts the reader on the left and the editor on the right.
     pub reader_first: bool,
     pub(crate) split_order_path: Option<PathBuf>,
@@ -81,6 +83,21 @@ fn set_web_images(on: bool, cx: &mut App) -> io::Result<()> {
     cx.update_global::<Preferences, _>(|prefs, _| prefs.web_images = on);
     crate::http::set_enabled(on);
     if let Some(path) = web_images_path() {
+        if let Some(parent) = path.parent() { std::fs::create_dir_all(parent)?; }
+        std::fs::write(path, if on { "on" } else { "off" })?;
+    }
+    Ok(())
+}
+fn confirm_delete_path() -> Option<PathBuf> {
+    dirs::config_dir().map(|p| crate::files::app_folder(p).join("confirm-delete"))
+}
+pub fn confirm_delete(cx: &App) -> bool {
+    cx.try_global::<Preferences>().is_none_or(|p| p.confirm_delete)
+}
+fn set_confirm_delete(on: bool, cx: &mut App) -> io::Result<()> {
+    if !cx.has_global::<Preferences>() { init(cx); }
+    cx.update_global::<Preferences, _>(|prefs, _| prefs.confirm_delete = on);
+    if let Some(path) = confirm_delete_path() {
         if let Some(parent) = path.parent() { std::fs::create_dir_all(parent)?; }
         std::fs::write(path, if on { "on" } else { "off" })?;
     }
@@ -181,6 +198,7 @@ pub fn init(cx: &mut App) {
     let spell_check = spell_check_path().as_deref().is_none_or(load_document_outline);
     let web_images = web_images_path().as_deref().is_none_or(load_document_outline);
     crate::http::set_enabled(web_images);
+    let confirm_delete = confirm_delete_path().as_deref().is_none_or(load_document_outline);
     let split_order_path = split_order_path();
     let reader_first = split_order_path.as_deref().is_some_and(load_reader_first);
     let reading_path = crate::typography::preference_path();
@@ -194,6 +212,7 @@ pub fn init(cx: &mut App) {
         document_outline,
         spell_check,
         web_images,
+        confirm_delete,
         reader_first,
         split_order_path,
         window: None,
@@ -635,6 +654,7 @@ impl SettingsWindow {
             .child({
                 let weak = cx.entity().downgrade();
                 h_flex().gap_4().items_center().justify_between().py_3()
+                    .border_b_1().border_color(theme.border)
                     .child(v_flex().gap_0p5()
                         .child(div().text_sm().font_weight(FontWeight::MEDIUM).child("Load Web Images"))
                         .child(div().text_xs().text_color(theme.muted_foreground).child(
@@ -643,6 +663,17 @@ impl SettingsWindow {
                         .accessibility_label("Load Web Images")
                         .on_change(move |on, _, cx| {
                             let error = set_web_images(*on, cx).err().map(|e| format!("Could not save editor settings: {e}"));
+                            let _ = weak.update(cx, |this, cx| { this.error = error; cx.notify(); });
+                        }))
+            })
+            .child({
+                let weak = cx.entity().downgrade();
+                h_flex().gap_4().items_center().justify_between().py_3()
+                    .child(div().text_sm().font_weight(FontWeight::MEDIUM).child("Confirm Before Deleting Files & Folders"))
+                    .child(Switch::new("confirm-delete").checked(confirm_delete(cx))
+                        .accessibility_label("Confirm Before Deleting Files & Folders")
+                        .on_change(move |on, _, cx| {
+                            let error = set_confirm_delete(*on, cx).err().map(|e| format!("Could not save editor settings: {e}"));
                             let _ = weak.update(cx, |this, cx| { this.error = error; cx.notify(); });
                         }))
             })

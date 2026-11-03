@@ -328,16 +328,7 @@ impl Enso {
             .gap_3()
             .items_center()
             .justify_between()
-            .child(
-                v_flex()
-                    .gap_0p5()
-                    .child(div().text_sm().child("Include Images"))
-                    .child(div().text_xs().text_color(theme.muted_foreground).child(match dialog.choice.format {
-                        Format::Html => "Copied into public/images",
-                        Format::RichText => "Included where the app accepts images, like Mail or Docs",
-                        Format::Pdf => "Fitted to the page",
-                    })),
-            )
+            .child(div().text_sm().child("Include Images"))
             .child(
                 gpui_kit::component::switch::Switch::new("export-images")
                     .checked(dialog.choice.images)

@@ -440,7 +440,8 @@ impl Render for ReadingControls {
         v_flex()
             .w_full()
             .gap_3()
-            .p_3()
+            // With the menu's own 4px, text sits 12px in, as the rows below.
+            .p_2()
             .child(
                 h_flex()
                     .justify_between()

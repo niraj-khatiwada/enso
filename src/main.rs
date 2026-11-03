@@ -444,6 +444,9 @@ struct Enso {
     active: Option<usize>,
     root: Option<PathBuf>,
     folders: HashMap<PathBuf, Vec<files::Entry>>,
+    /// Each listed folder's modified time when it was read: adding, removing
+    /// or renaming an entry moves it, which is when the listing is redone.
+    folder_stamps: HashMap<PathBuf, std::time::SystemTime>,
     expanded: HashSet<PathBuf>,
     mode: Mode,
     previous_mode: Mode,
@@ -570,6 +573,7 @@ impl Enso {
             active: None,
             root: None,
             folders: HashMap::new(),
+            folder_stamps: HashMap::new(),
             expanded: HashSet::new(),
             mode: Mode::Read,
             previous_mode: Mode::Read,
@@ -1390,34 +1394,72 @@ impl Enso {
                 cx.background_executor()
                     .timer(std::time::Duration::from_millis(1500))
                     .await;
-                let Ok(open) = this.read_with(cx, |this, _| {
-                    this.documents
+                let Ok((open, shown)) = this.read_with(cx, |this, _| {
+                    let open = this
+                        .documents
                         .iter()
                         .filter(|d| !d.saving && !d.disk_prompt)
                         .filter_map(|d| {
                             Some((d.editor.entity_id(), d.path.clone()?, d.disk_stamp, d.saved.clone()))
                         })
-                        .collect::<Vec<_>>()
+                        .collect::<Vec<_>>();
+                    (open, this.shown_folders())
                 }) else {
                     return;
                 };
-                if open.is_empty() {
-                    continue;
-                }
-                let changes = cx
-                    .background_executor()
-                    .spawn(async move { files::changed_on_disk(open) })
-                    .await;
-                if changes.is_empty() {
-                    continue;
-                }
-                let _ = this.update_in(cx, |this, window, cx| {
-                    for change in changes {
-                        this.apply_disk_change(change, window, cx);
+                if !open.is_empty() {
+                    let changes = cx
+                        .background_executor()
+                        .spawn(async move { files::changed_on_disk(open) })
+                        .await;
+                    if !changes.is_empty() {
+                        let _ = this.update_in(cx, |this, window, cx| {
+                            for change in changes {
+                                this.apply_disk_change(change, window, cx);
+                            }
+                        });
                     }
-                });
+                }
+                if !shown.is_empty() {
+                    let changed = cx
+                        .background_executor()
+                        .spawn(async move { files::changed_folders(shown) })
+                        .await;
+                    if !changed.is_empty() {
+                        let _ = this.update(cx, |this, cx| this.refresh_folders(changed, cx));
+                    }
+                }
             }
         })
+    }
+
+    /// The folders the sidebar shows (the workspace and every expanded folder
+    /// in it) with the stamp each was listed at. Only these are watched:
+    /// a collapsed folder is read again when it's opened.
+    fn shown_folders(&self) -> Vec<(PathBuf, Option<std::time::SystemTime>)> {
+        let Some(root) = &self.root else {
+            return Vec::new();
+        };
+        self.expanded
+            .iter()
+            .filter(|folder| folder.starts_with(root) && self.folders.contains_key(*folder))
+            .map(|folder| (folder.clone(), self.folder_stamps.get(folder).copied()))
+            .collect()
+    }
+
+    /// Folders that changed on disk: list them again; ones that are gone
+    /// leave the sidebar (their parent's new listing drops their row).
+    fn refresh_folders(&mut self, changed: Vec<(PathBuf, bool)>, cx: &mut Context<Self>) {
+        for (folder, exists) in changed {
+            if exists {
+                self.load_folder(folder, cx);
+            } else {
+                self.folders.retain(|p, _| !p.starts_with(&folder));
+                self.folder_stamps.retain(|p, _| !p.starts_with(&folder));
+                self.expanded.retain(|p| !p.starts_with(&folder));
+                cx.notify();
+            }
+        }
     }
 
     fn apply_disk_change(
@@ -1775,17 +1817,23 @@ impl Enso {
 
     fn load_folder(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         let root = self.root.clone();
-        let task = cx
-            .background_executor()
-            .spawn(async move { (path.clone(), files::list_folder(&path)) });
+        let task = cx.background_executor().spawn(async move {
+            // Stamped before reading, so a change made while it's read is
+            // still seen by the next check.
+            let stamp = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
+            (path.clone(), stamp, files::list_folder(&path))
+        });
         cx.spawn(async move |this, cx| {
-            let (path, result) = task.await;
+            let (path, stamp, result) = task.await;
             let _ = this.update(cx, |this, cx| {
                 if this.root != root {
                     return;
                 }
                 match result {
                     Ok(entries) => {
+                        if let Some(stamp) = stamp {
+                            this.folder_stamps.insert(path.clone(), stamp);
+                        }
                         this.folders.insert(path, entries);
                         cx.notify();
                     }
@@ -1992,7 +2040,39 @@ impl Enso {
     /// asking: it can be restored from there. Only an item that can't be
     /// recycled is ever deleted outright, and then the system asks first
     /// (Windows) or the move fails and nothing is deleted (macOS, Linux).
-    fn delete_entry(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+    /// Delete from the sidebar or the palette: to the Trash, after a system
+    /// prompt unless Settings › Confirm Before Deleting is off.
+    fn delete_entry(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        if !settings::confirm_delete(cx) {
+            self.trash_entry(path, cx);
+            return;
+        }
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let bin = if cfg!(windows) { "Recycle Bin" } else { "Trash" };
+        let detail = if path.is_dir() {
+            format!("The folder and everything in it go to the {bin}.")
+        } else {
+            format!("You can restore it from the {bin}.")
+        };
+        let receiver = window.prompt(
+            PromptLevel::Warning,
+            &format!("Delete “{name}”?"),
+            Some(&detail),
+            &[format!("Move to {bin}").as_str(), "Cancel"],
+            cx,
+        );
+        cx.spawn_in(window, async move |this, cx| {
+            if receiver.await == Ok(0) {
+                let _ = this.update(cx, |this, cx| this.trash_entry(path, cx));
+            }
+        })
+        .detach();
+    }
+
+    fn trash_entry(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         let name = path
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
@@ -2034,6 +2114,19 @@ impl Enso {
             self.load_folder(parent.to_path_buf(), cx);
         }
         cx.notify();
+    }
+
+    /// Rename a note from anywhere (the command palette): its row in the
+    /// sidebar, shown and opened up to it, takes the new name inline.
+    pub(crate) fn rename_file(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.root.as_ref().is_some_and(|root| path.starts_with(root)) {
+            self.message("Open its folder as the workspace to rename it.", true, cx);
+            return;
+        }
+        self.sidebar_open = true;
+        self.reveal_in_tree(&path, cx);
+        self.selected = Some(path.clone());
+        self.start_rename(path, window, cx);
     }
 
     fn start_rename(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
@@ -3314,9 +3407,9 @@ impl Render for Enso {
                                             .on_click({
                                                 let weak = weak.clone();
                                                 let path = menu_path.clone();
-                                                move |_, _, cx| {
+                                                move |_, window, cx| {
                                                     let _ = weak.update(cx, |this, cx| {
-                                                        this.delete_entry(path.clone(), cx)
+                                                        this.delete_entry(path.clone(), window, cx)
                                                     });
                                                 }
                                             }),
@@ -3622,6 +3715,8 @@ impl Render for Enso {
                     let weak = cx.entity().downgrade();
                     div().debug_selector(|| "document-menu-trigger".into()).child(Popover::new("document-menu")
                         .overlay_closable(false)
+                        // Compact: the kit's 12px, halved twice; items bring their own.
+                        .p_1()
                         .trigger(ui::icon_button("document-menu-button", IconName::Ellipsis, "More")
                             .small().disabled(!markdown || self.active.is_none()))
                         .content(move |_, window, cx| {
@@ -3639,6 +3734,8 @@ impl Render for Enso {
                                 enso.active.is_some_and(|i| enso.documents[i].locked)
                             });
                             v_flex().debug_selector(|| "document-menu-panel".into()).w(px(240.))
+                                // Room under the last row, matching the top.
+                                .pb_1()
                                 // Select's popup can extend beyond this surface.
                                 // Wait for its outside-click handling before
                                 // deciding whether the parent should close.
@@ -3652,15 +3749,9 @@ impl Render for Enso {
                                     });
                                 })
                                 .child(controls)
-                                .child(div().h(px(1.)).mx_2().bg(theme.border))
-                                .child(Button::new("export-note").ghost().small().m_1().justify_start()
-                                    .icon(IconName::Share).label("Export…")
-                                    .on_click(move |_, window, cx| {
-                                        let _ = popover.update(cx, |state, cx| state.dismiss(window, cx));
-                                        let _ = weak.update(cx, |this, cx| this.open_export(window, cx));
-                                    }))
+                                .child(div().h(px(1.)).mx_1().my_1().bg(theme.border))
                                 // The switch shows the state; the whole row flips it.
-                                .child(h_flex().id("lock-page").mx_1().mb_1().px_2().h(px(28.)).gap_2()
+                                .child(h_flex().id("lock-page").px_2().h(px(28.)).gap_2()
                                     .items_center().rounded_md().cursor_pointer().text_sm()
                                     .hover(|row| row.bg(theme.secondary))
                                     .child(Icon::new(if locked { IconName::Lock } else { IconName::LockOpen })
@@ -3670,6 +3761,16 @@ impl Render for Enso {
                                         .checked(locked).small().accessibility_label("Lock Page"))
                                     .on_click(move |_, _, cx| {
                                         let _ = lock_weak.update(cx, |this, cx| this.toggle_lock(cx));
+                                    }))
+                                // Last, always: the one item that leaves this menu.
+                                .child(h_flex().id("export-note").px_2().h(px(28.)).gap_2()
+                                    .items_center().rounded_md().cursor_pointer().text_sm()
+                                    .hover(|row| row.bg(theme.secondary))
+                                    .child(Icon::new(IconName::Share).size_4().text_color(theme.muted_foreground))
+                                    .child(div().flex_1().child("Export…"))
+                                    .on_click(move |_, window, cx| {
+                                        let _ = popover.update(cx, |state, cx| state.dismiss(window, cx));
+                                        let _ = weak.update(cx, |this, cx| this.open_export(window, cx));
                                     }))
                         }))
                 }),
@@ -3784,7 +3885,7 @@ impl Render for Enso {
             }))
             .on_action(cx.listener(|this, _: &DeleteSelected, w, cx| {
                 match this.selected_entry().filter(|_| this.focus.is_focused(w)) {
-                    Some(path) => this.delete_entry(path, cx),
+                    Some(path) => this.delete_entry(path, w, cx),
                     None => cx.propagate(),
                 }
             }))
@@ -4597,6 +4698,95 @@ mod transition_tests {
         poll(cx);
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "mine");
         assert_eq!(state(cx), ("mine".into(), false));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn the_sidebar_follows_files_added_and_removed_outside_enso(cx: &mut TestAppContext) {
+        cx.update(|cx| { gpui_kit::init(cx); bind_view_keys(cx); });
+        let root = std::env::temp_dir().join(format!("enso-watch-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("open")).unwrap();
+        std::fs::create_dir_all(root.join("closed")).unwrap();
+        std::fs::write(root.join("first.md"), "").unwrap();
+        let (handle, view) = cx.update(|cx| gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+            cx.new(|cx| {
+                let mut app = Enso::new(window, cx);
+                app.open_folder(root.clone(), cx);
+                app.expanded.insert(root.join("open"));
+                app.load_folder(root.join("open"), cx);
+                app
+            })
+        }).unwrap());
+        cx.run_until_parked();
+        let names = |cx: &mut TestAppContext, folder: &std::path::Path| -> Option<Vec<String>> {
+            cx.update(|cx| {
+                view.read(cx).folders.get(folder).map(|entries| {
+                    let mut names: Vec<String> =
+                        entries.iter().map(|e| e.path.file_name().unwrap().to_string_lossy().into()).collect();
+                    names.sort();
+                    names
+                })
+            })
+        };
+        let tick = |cx: &mut TestAppContext| {
+            cx.executor().advance_clock(std::time::Duration::from_millis(1600));
+            cx.run_until_parked();
+        };
+        // Added, renamed and deleted outside enso: the root and the expanded folder follow.
+        std::fs::write(root.join("second.md"), "").unwrap();
+        std::fs::write(root.join("open/inside.md"), "").unwrap();
+        tick(cx);
+        assert_eq!(names(cx, &root).unwrap(), ["closed", "first.md", "open", "second.md"]);
+        assert_eq!(names(cx, &root.join("open")).unwrap(), ["inside.md"]);
+        std::fs::rename(root.join("first.md"), root.join("renamed.md")).unwrap();
+        std::fs::remove_file(root.join("open/inside.md")).unwrap();
+        tick(cx);
+        assert_eq!(names(cx, &root).unwrap(), ["closed", "open", "renamed.md", "second.md"]);
+        assert_eq!(names(cx, &root.join("open")).unwrap(), Vec::<String>::new());
+        // A collapsed folder isn't read until it's opened.
+        std::fs::write(root.join("closed/later.md"), "").unwrap();
+        tick(cx);
+        assert!(names(cx, &root.join("closed")).is_none());
+        // An expanded folder removed from disk leaves the sidebar.
+        std::fs::remove_dir_all(root.join("open")).unwrap();
+        tick(cx);
+        assert_eq!(names(cx, &root).unwrap(), ["closed", "renamed.md", "second.md"]);
+        cx.update(|cx| {
+            let app = view.read(cx);
+            assert!(!app.folders.contains_key(&root.join("open")));
+            assert!(!app.expanded.contains(&root.join("open")));
+        });
+        draw(cx, handle);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn deleting_asks_first_and_cancel_keeps_the_file(cx: &mut TestAppContext) {
+        cx.update(|cx| { gpui_kit::init(cx); bind_view_keys(cx); });
+        let root = std::env::temp_dir().join(format!("enso-confirm-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("keep.md"), "").unwrap();
+        let (handle, view) = cx.update(|cx| gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+            cx.new(|cx| {
+                let mut app = Enso::new(window, cx);
+                app.open_folder(root.clone(), cx);
+                app
+            })
+        }).unwrap());
+        cx.run_until_parked();
+        // Confirming is on unless turned off in Settings.
+        cx.update(|cx| assert!(crate::settings::confirm_delete(cx)));
+        let _ = handle.update(cx, |_, window, cx| {
+            view.update(cx, |app, cx| app.delete_entry(root.join("keep.md"), window, cx))
+        });
+        cx.run_until_parked();
+        assert!(cx.has_pending_prompt());
+        cx.simulate_prompt_answer("Cancel");
+        cx.run_until_parked();
+        assert!(root.join("keep.md").is_file());
+        draw(cx, handle);
         std::fs::remove_dir_all(root).unwrap();
     }
 

@@ -373,6 +373,19 @@ pub fn changed_on_disk(
         .collect()
 }
 
+/// Of the folders shown, the ones whose modified time moved since they were
+/// listed, each with whether it still exists. Only a stat per folder: their
+/// contents are read again only when this says so.
+pub fn changed_folders(shown: Vec<(PathBuf, Option<std::time::SystemTime>)>) -> Vec<(PathBuf, bool)> {
+    shown
+        .into_iter()
+        .filter_map(|(folder, stamp)| match fs::metadata(&folder).and_then(|m| m.modified()) {
+            Ok(now) => (Some(now) != stamp).then_some((folder, true)),
+            Err(_) => Some((folder, false)),
+        })
+        .collect()
+}
+
 pub fn save(path: &Path, expected: &str, content: &str) -> io::Result<()> {
     if read_text(path)? != expected {
         return Err(io::Error::other(
