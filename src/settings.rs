@@ -122,6 +122,7 @@ pub fn init(cx: &mut App) {
         .and_then(|path| std::fs::read_to_string(path).ok())
         .map(|text| WritingPrefs::parse(&text))
         .unwrap_or_default();
+    crate::text_rendering::apply(writing.crisp_text);
     cx.set_global(writing);
     cx.set_global(Preferences {
         appearance,
@@ -481,6 +482,10 @@ impl SettingsWindow {
     fn appearance_page(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
         let selected = current(cx);
+        let crisp = self.writing_setter(cx, |p, on: bool| {
+            p.crisp_text = on;
+            crate::text_rendering::apply(on);
+        });
         v_flex()
             .gap_6()
             .child(page_header(
@@ -550,6 +555,17 @@ impl SettingsWindow {
                         ),
                     ),
             )
+            .when(cfg!(target_os = "macos"), |page| {
+                page.child(setting_row(
+                    "Crisp text",
+                    "Draw text without the extra stroke weight older macOS versions added, like current Mac apps. Takes effect the next time enso opens.",
+                    Switch::new("crisp-text")
+                        .checked(WritingPrefs::get(cx).crisp_text)
+                        .accessibility_label("Crisp text")
+                        .on_change(move |on, _, cx| crisp(*on, cx)),
+                    &theme,
+                ))
+            })
     }
 
     fn writing_setter<T: 'static>(

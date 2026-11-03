@@ -60,6 +60,7 @@ pub struct WritingPrefs {
     pub focus: FocusMode,
     pub text_size: f32,
     pub hide_chrome: bool,
+    pub crisp_text: bool,
 }
 
 impl Default for WritingPrefs {
@@ -75,6 +76,7 @@ impl Default for WritingPrefs {
             focus: FocusMode::Off,
             text_size: 17.,
             hide_chrome: true,
+            crisp_text: true,
         }
     }
 }
@@ -105,7 +107,7 @@ impl WritingPrefs {
             CaretColor::Custom(value) => format!("#{value:06x}"),
         };
         format!(
-            "caret_color = {color}\ncaret_width = {}\ncaret_blink = {}\nblink_period_ms = {}\nblink_pattern = {:012b}\ntypewriter = {}\ntypewriter_guide = {:.3}\nfocus = {}\ntext_size = {}\nhide_chrome = {}\n",
+            "caret_color = {color}\ncaret_width = {}\ncaret_blink = {}\nblink_period_ms = {}\nblink_pattern = {:012b}\ntypewriter = {}\ntypewriter_guide = {:.3}\nfocus = {}\ntext_size = {}\nhide_chrome = {}\ncrisp_text = {}\n",
             self.caret_width,
             self.caret_blink,
             self.blink_period_ms,
@@ -115,6 +117,7 @@ impl WritingPrefs {
             self.focus.name(),
             self.text_size,
             self.hide_chrome,
+            self.crisp_text,
         )
     }
 
@@ -163,6 +166,7 @@ impl WritingPrefs {
                 }
                 "focus" => prefs.focus = FocusMode::parse(value),
                 "hide_chrome" => prefs.hide_chrome = value != "false",
+                "crisp_text" => prefs.crisp_text = value != "false",
                 "text_size" => {
                     if let Ok(v) = value.parse::<f32>() {
                         prefs.text_size = v.clamp(MIN_TEXT, MAX_TEXT);
@@ -192,6 +196,7 @@ mod tests {
             focus: FocusMode::Sentence,
             text_size: 19.,
             hide_chrome: false,
+            crisp_text: false,
         };
         assert_eq!(WritingPrefs::parse(&prefs.serialize()), prefs);
         let odd = WritingPrefs::parse("caret_width = 99\nblink_pattern = 0\nfocus = ??\nnoise\n");

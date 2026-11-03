@@ -7,6 +7,7 @@ mod reader;
 mod settings;
 mod shell_perf;
 mod stats;
+mod text_rendering;
 #[allow(dead_code)]
 mod tokens;
 mod visual;
