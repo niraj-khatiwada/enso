@@ -8,7 +8,17 @@ if [ "${1:-}" = "--debug" ]; then
     profile=debug
 fi
 
-if [ "$profile" = release ]; then
+binary="target/$profile/enso"
+if [ -n "${ENSO_TARGETS:-}" ]; then
+    slices=""
+    for target in $ENSO_TARGETS; do
+        cargo build --locked --release --target "$target"
+        slices="$slices target/$target/release/enso"
+    done
+    mkdir -p target/universal
+    lipo -create $slices -output target/universal/enso
+    binary=target/universal/enso
+elif [ "$profile" = release ]; then
     cargo build --locked --release
 else
     cargo build --locked
@@ -18,7 +28,7 @@ version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
 bundle="$PWD/target/enso.app"
 rm -rf "$bundle"
 mkdir -p "$bundle/Contents/MacOS" "$bundle/Contents/Resources"
-cp "target/$profile/enso" "$bundle/Contents/MacOS/enso"
+cp "$binary" "$bundle/Contents/MacOS/enso"
 cp assets/enso.icns "$bundle/Contents/Resources/enso.icns"
 cat > "$bundle/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
