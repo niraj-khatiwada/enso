@@ -1,9 +1,11 @@
+use crate::visual::prefs::{BLINK_CELLS, CaretColor, FocusMode, WritingPrefs};
 use gpui_kit::assets::IconName;
 use gpui_kit::component::{
-    ActiveTheme, Theme, ThemeMode, ThemeRegistry, TitleBar,
+    ActiveTheme, Sizable, Theme, ThemeMode, ThemeRegistry, TitleBar,
     button::{Button, ButtonVariants},
     h_flex,
     switch::Switch,
+    tooltip::Tooltip,
     v_flex,
 };
 use gpui_kit::{prelude::FluentBuilder, *};
@@ -78,6 +80,24 @@ fn set_line_numbers(on: bool, cx: &mut App) -> io::Result<()> {
     Ok(())
 }
 
+fn writing_path() -> Option<PathBuf> {
+    dirs::config_dir().map(|p| crate::files::app_folder(p).join("writing"))
+}
+
+pub fn set_writing(cx: &mut App, change: impl FnOnce(&mut WritingPrefs)) -> io::Result<()> {
+    let mut prefs = WritingPrefs::get(cx);
+    change(&mut prefs);
+    let text = prefs.serialize();
+    cx.set_global(prefs);
+    if let Some(path) = writing_path() {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(path, text)?;
+    }
+    Ok(())
+}
+
 fn load(path: &Path) -> Appearance {
     std::fs::read_to_string(path)
         .map(|value| Appearance::parse(&value))
@@ -90,6 +110,11 @@ pub fn init(cx: &mut App) {
     let line_numbers = line_numbers_path()
         .as_deref()
         .is_some_and(load_line_numbers);
+    let writing = writing_path()
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .map(|text| WritingPrefs::parse(&text))
+        .unwrap_or_default();
+    cx.set_global(writing);
     cx.set_global(Preferences {
         appearance,
         line_numbers,
@@ -268,25 +293,97 @@ pub fn open(cx: &mut App) {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Category {
     Appearance,
+    Writing,
+    Caret,
     Editor,
 }
 
 impl Category {
-    const ALL: [Category; 2] = [Category::Appearance, Category::Editor];
+    const ALL: [Category; 4] = [
+        Category::Appearance,
+        Category::Writing,
+        Category::Caret,
+        Category::Editor,
+    ];
 
     fn label(self) -> &'static str {
         match self {
             Self::Appearance => "Appearance",
-            Self::Editor => "Editor",
+            Self::Writing => "Writing",
+            Self::Caret => "Caret",
+            Self::Editor => "Source editor",
         }
     }
 
     fn icon(self) -> IconName {
         match self {
             Self::Appearance => IconName::Palette,
-            Self::Editor => IconName::Pencil,
+            Self::Writing => IconName::BookOpen,
+            Self::Caret => IconName::TextCursor,
+            Self::Editor => IconName::SquareTerminal,
         }
     }
+}
+
+const CARET_SWATCHES: [(u32, &str); 5] = [
+    (0x2f6fde, "Blue"),
+    (0x8a4fff, "Violet"),
+    (0xe0457b, "Pink"),
+    (0x1f9d55, "Green"),
+    (0xe8890c, "Orange"),
+];
+
+fn setting_row(
+    title: &'static str,
+    description: &'static str,
+    control: impl IntoElement,
+    theme: &Theme,
+) -> impl IntoElement {
+    h_flex()
+        .gap_4()
+        .items_center()
+        .justify_between()
+        .py_3()
+        .border_b_1()
+        .border_color(theme.border)
+        .child(
+            v_flex()
+                .gap_0p5()
+                .min_w_0()
+                .child(div().text_sm().font_weight(FontWeight::MEDIUM).child(title))
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .child(description),
+                ),
+        )
+        .child(control)
+}
+
+fn segmented<T: Copy + PartialEq + 'static>(
+    id: &'static str,
+    choices: Vec<(T, SharedString)>,
+    selected: T,
+    on_pick: impl Fn(T, &mut App) + Clone + 'static,
+    theme: &Theme,
+) -> impl IntoElement {
+    h_flex()
+        .p_0p5()
+        .gap_0p5()
+        .rounded_md()
+        .bg(theme.secondary.opacity(0.5))
+        .children(choices.into_iter().enumerate().map(|(i, (value, label))| {
+            let on_pick = on_pick.clone();
+            let active = value == selected;
+            Button::new((id, i))
+                .ghost()
+                .small()
+                .label(label.clone())
+                .accessibility_label(label)
+                .when(active, |b| b.bg(theme.background))
+                .on_click(move |_, _, cx| on_pick(value, cx))
+        }))
 }
 
 struct SettingsWindow {
@@ -423,6 +520,183 @@ impl SettingsWindow {
             )
     }
 
+    fn writing_setter<T: 'static>(
+        &self,
+        cx: &mut Context<Self>,
+        change: fn(&mut WritingPrefs, T),
+    ) -> impl Fn(T, &mut App) + Clone + 'static {
+        let weak = cx.entity().downgrade();
+        move |value, cx| {
+            let error = set_writing(cx, |prefs| change(prefs, value))
+                .err()
+                .map(|error| format!("Could not save writing settings: {error}"));
+            let _ = weak.update(cx, |this, cx| {
+                this.error = error;
+                cx.notify();
+            });
+        }
+    }
+
+    fn writing_page(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme().clone();
+        let prefs = WritingPrefs::get(cx);
+        let typewriter = self.writing_setter(cx, |p, on: bool| p.typewriter = on);
+        let focus = self.writing_setter(cx, |p, mode: FocusMode| p.focus = mode);
+        v_flex()
+            .gap_6()
+            .child(page_header(
+                "Writing",
+                "How the page behaves while you write.",
+                theme.muted_foreground,
+            ))
+            .child(
+                v_flex()
+                    .child(setting_row(
+                        "Typewriter mode",
+                        "Keep the line you are writing at the same height. Drag the guide in the page to move it.",
+                        Switch::new("typewriter")
+                            .checked(prefs.typewriter)
+                            .accessibility_label("Typewriter mode")
+                            .on_change(move |on, _, cx| typewriter(*on, cx)),
+                        &theme,
+                    ))
+                    .child(setting_row(
+                        "Focus",
+                        "Dim everything but the sentence or paragraph you are writing.",
+                        segmented(
+                            "focus",
+                            FocusMode::ALL
+                                .into_iter()
+                                .map(|m| (m, m.label().into()))
+                                .collect(),
+                            prefs.focus,
+                            focus,
+                            &theme,
+                        ),
+                        &theme,
+                    )),
+            )
+    }
+
+    fn caret_page(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme().clone();
+        let prefs = WritingPrefs::get(cx);
+        let color = self.writing_setter(cx, |p, c: CaretColor| p.caret_color = c);
+        let width = self.writing_setter(cx, |p, w: u32| p.caret_width = w as f32);
+        let blink = self.writing_setter(cx, |p, on: bool| p.caret_blink = on);
+        let rate = self.writing_setter(cx, |p, ms: u32| p.blink_period_ms = ms);
+        let cell = self.writing_setter(cx, |p, i: u32| {
+            let flipped = p.blink_pattern ^ (1 << i);
+            if flipped != 0 {
+                p.blink_pattern = flipped;
+            }
+        });
+        let swatch = |id: usize, value: CaretColor, fill: Hsla, label: &'static str| {
+            let color = color.clone();
+            let active = prefs.caret_color == value;
+            div()
+                .id(("caret-color", id))
+                .size(px(24.))
+                .rounded_full()
+                .bg(fill)
+                .border_2()
+                .border_color(if active {
+                    theme.foreground
+                } else {
+                    theme.border
+                })
+                .cursor_pointer()
+                .tooltip(move |window, cx| Tooltip::new(label).build(window, cx))
+                .on_click(move |_, _, cx| color(value, cx))
+        };
+        let mut swatches = vec![
+            swatch(0, CaretColor::Theme, theme.caret, "Theme"),
+            swatch(1, CaretColor::Accent, theme.primary, "Accent"),
+        ];
+        for (i, (value, label)) in CARET_SWATCHES.into_iter().enumerate() {
+            swatches.push(swatch(
+                2 + i,
+                CaretColor::Custom(value),
+                rgb(value).into(),
+                label,
+            ));
+        }
+        let pattern = h_flex().gap_0p5().children((0..BLINK_CELLS).map(|i| {
+            let cell = cell.clone();
+            let on = prefs.blink_pattern & (1 << i) != 0;
+            div()
+                .id(("blink-cell", i as usize))
+                .w(px(14.))
+                .h(px(20.))
+                .rounded_sm()
+                .border_1()
+                .border_color(theme.border)
+                .when(on, |c| c.bg(theme.foreground.opacity(0.75)))
+                .when(!prefs.caret_blink, |c| c.opacity(0.4))
+                .cursor_pointer()
+                .on_click(move |_, _, cx| cell(i, cx))
+        }));
+        v_flex()
+            .gap_6()
+            .child(page_header(
+                "Caret",
+                "The caret in the page. The source editor keeps its own.",
+                theme.muted_foreground,
+            ))
+            .child(
+                v_flex()
+                    .child(setting_row(
+                        "Color",
+                        "The theme's caret, its accent, or a color of your own.",
+                        h_flex().gap_2().children(swatches),
+                        &theme,
+                    ))
+                    .child(setting_row(
+                        "Thickness",
+                        "Caret width in pixels.",
+                        segmented(
+                            "caret-width",
+                            (1..=4u32).map(|w| (w, format!("{w} px").into())).collect(),
+                            prefs.caret_width.round() as u32,
+                            width,
+                            &theme,
+                        ),
+                        &theme,
+                    ))
+                    .child(setting_row(
+                        "Blink",
+                        "A steady caret, or one that blinks.",
+                        Switch::new("caret-blink")
+                            .checked(prefs.caret_blink)
+                            .accessibility_label("Caret blink")
+                            .on_change(move |on, _, cx| blink(*on, cx)),
+                        &theme,
+                    ))
+                    .child(setting_row(
+                        "Blink rate",
+                        "How long one blink takes.",
+                        segmented(
+                            "blink-rate",
+                            vec![
+                                (1400u32, "Slow".into()),
+                                (1060, "Medium".into()),
+                                (700, "Fast".into()),
+                            ],
+                            prefs.blink_period_ms,
+                            rate,
+                            &theme,
+                        ),
+                        &theme,
+                    ))
+                    .child(setting_row(
+                        "Blink pattern",
+                        "One blink in twelve steps: filled steps show the caret.",
+                        pattern,
+                        &theme,
+                    )),
+            )
+    }
+
     fn editor_page(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
         let line_numbers = line_numbers(cx);
@@ -479,6 +753,8 @@ impl Render for SettingsWindow {
         let category = self.category;
         let page = match category {
             Category::Appearance => self.appearance_page(cx).into_any_element(),
+            Category::Writing => self.writing_page(cx).into_any_element(),
+            Category::Caret => self.caret_page(cx).into_any_element(),
             Category::Editor => self.editor_page(cx).into_any_element(),
         };
         v_flex()
@@ -544,8 +820,11 @@ impl Render for SettingsWindow {
                     )
                     .child(
                         v_flex()
+                            .id("settings-page")
                             .flex_1()
                             .min_w_0()
+                            .h_full()
+                            .overflow_y_scroll()
                             .p_8()
                             .gap_6()
                             .child(page)

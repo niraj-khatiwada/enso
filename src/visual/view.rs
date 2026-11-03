@@ -102,6 +102,7 @@ pub struct VisualView {
     table_widths: HashMap<u64, (usize, Arc<Vec<f32>>)>,
     table_dirty: HashMap<u64, Vec<usize>>,
     _observe: Subscription,
+    _prefs: Subscription,
 }
 
 impl VisualView {
@@ -123,6 +124,10 @@ impl VisualView {
             .find(|b| !b.leaves.is_empty())
             .map_or(0, |b| b.start + b.leaves[0].leaf_to_src(0));
         let observe = cx.observe(&editor, |this, _, cx| this.sync(cx));
+        let prefs = cx.observe_global::<super::prefs::WritingPrefs>(|this, cx| {
+            this.caret_blink.reset(cx);
+            cx.notify();
+        });
         let mut view = Self {
             editor,
             doc,
@@ -152,6 +157,7 @@ impl VisualView {
             table_widths: HashMap::new(),
             table_dirty: HashMap::new(),
             _observe: observe,
+            _prefs: prefs,
         };
         if cut < source.len() {
             view.background.loading = true;
@@ -1311,10 +1317,14 @@ impl Element for Surface {
             && view.caret_blink.visible()
             && let Some((top, line_height, caret_height)) = view.caret_position()
         {
+            let prefs = super::prefs::WritingPrefs::get(cx);
             let y = top.y + (line_height - caret_height) / 2.;
-            let caret = Bounds::new(point(top.x, y), size(px(2.), caret_height));
+            let width = px(prefs.caret_width);
+            let x = top.x - px((prefs.caret_width / 2.).floor());
+            let caret = Bounds::new(point(x, y), size(width, caret_height));
+            let color = prefs.caret_hsla(cx.theme().caret, cx.theme().primary);
             window.with_content_mask(Some(ContentMask { bounds }), |window| {
-                window.paint_quad(fill(caret, cx.theme().caret));
+                window.paint_quad(fill(caret, color));
             });
         }
         let perf = view.perf.clone();

@@ -2,9 +2,8 @@ use std::time::Duration;
 
 use gpui_kit::{Context, Task};
 
+use super::prefs::{BLINK_CELLS, WritingPrefs};
 use super::view::VisualView;
-
-const BLINK: Duration = Duration::from_millis(530);
 
 pub struct Caret {
     visible: bool,
@@ -29,19 +28,32 @@ impl Caret {
     pub fn reset(&mut self, cx: &mut Context<VisualView>) {
         self.visible = true;
         self.epoch += 1;
-        if std::env::var_os("ENSO_NO_BLINK").is_some() {
+        let prefs = WritingPrefs::get(cx);
+        if !prefs.caret_blink || std::env::var_os("ENSO_SPIKE_NO_BLINK").is_some() {
+            self._task = None;
             return;
         }
         let epoch = self.epoch;
         self._task = Some(cx.spawn(async move |this, cx| {
+            let mut cell = 0u32;
             loop {
-                cx.background_executor().timer(BLINK).await;
+                let step = this
+                    .update(cx, |_, cx| {
+                        let prefs = WritingPrefs::get(cx);
+                        Duration::from_millis((prefs.blink_period_ms / BLINK_CELLS).max(16) as u64)
+                    })
+                    .unwrap_or(Duration::from_millis(88));
+                cx.background_executor().timer(step).await;
+                cell = (cell + 1) % BLINK_CELLS;
                 let alive = this.update(cx, |view, cx| {
                     if view.caret_blink.epoch != epoch {
                         return false;
                     }
-                    view.caret_blink.visible = !view.caret_blink.visible;
-                    cx.notify();
+                    let shown = WritingPrefs::get(cx).shows_in(cell);
+                    if shown != view.caret_blink.visible {
+                        view.caret_blink.visible = shown;
+                        cx.notify();
+                    }
                     true
                 });
                 if !matches!(alive, Ok(true)) {
