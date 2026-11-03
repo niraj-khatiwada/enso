@@ -49,6 +49,25 @@ Use Cmd on macOS and Ctrl on Windows/Linux: O opens a file, Shift O opens a fold
 
 The macOS app is ad-hoc signed, not notarized, so Gatekeeper asks on first open. On Linux, unpack the tarball (`tar -xzf enso-<version>-linux-<arch>.tar.gz`) and run `./install.sh` (or `sh install.sh`) to add enso to the app launcher.
 
+## Reading controls
+
+- Hover an image to drag its side handles and resize it while keeping its aspect ratio. The hover toolbar offers left (default), center, and right alignment. Its Edit button opens alt text and image replacement controls; replacements are copied into `.assets/images`.
+- Click **Edit table** below a table to edit its cells. Tab and Shift+Tab move between cells; hover a cell and click its three-dot menu to add or remove rows and columns. Apply saves one Markdown edit; Cancel leaves the source unchanged.
+- Click task checkboxes in Read or Split view to check or uncheck them without changing views.
+- The slim outline rail sits to the left of the document. Marks near the pointer widen smoothly, a nearby card previews the section, and clicking jumps there. Heading indexing runs in the background. **Settings → Editor → Document Outline** toggles the rail; it is enabled by default.
+
+## Command palette
+
+Press **Ctrl+Shift+P** (or **Cmd+Shift+P** on macOS), or choose **File → Command Palette…**. Search by name or everyday words such as “todo”, “photo” or “line”; use ↑/↓ and Enter, or click a command. Escape or clicking outside closes it and returns focus to where you were.
+
+In a Markdown file's Edit or Split view, **Insert** offers links, images, checkboxes, lists, tables, code blocks, quotes, dividers, footnotes, highlights and today's date. **Format** offers bold, italic, strikethrough, inline code, headings and body text. Formatting uses the selection you had before opening the palette. Highlight opens preset swatches and a custom color picker; to recolor an existing highlight, place the cursor inside it and run Highlight again. Images are copied into the workspace's hidden `.assets/images` folder; Table asks for data rows and columns (1–20 each) and adds a header row.
+
+**Files** searches filenames and relative paths throughout the current workspace, including collapsed folders. Selecting a result switches to its existing tab or opens it. Hidden files and folders and symlinks are excluded.
+
+**App** and **Workspaces** offer new files and folders, recent workspaces, view modes, swapping split sides, Settings and showing the current file in the system file manager. Insert and Format are hidden in Read view and for plain-text files.
+
+Type `/` on an empty Markdown line in Edit or Split to open the Insert menu beside the cursor. Select text and press **Cmd+/** on macOS (**Ctrl+/** on Windows/Linux) to open the same menu and apply Link, Highlight, or another Insert command to the selection. Choosing a command after typing `/` replaces the slash; Escape leaves it as text. Recently used commands appear first and are remembered across sessions.
+
 ## Keyboard shortcuts
 
 ⌘ on macOS, Ctrl on Windows and Linux.
@@ -56,11 +75,13 @@ The macOS app is ad-hoc signed, not notarized, so Gatekeeper asks on first open.
 | App | |
 |---|---|
 | ⌘O / ⌘⇧O | Open file / open folder as a workspace |
-| ⌘N / Ctrl⇧N | New file / new folder in the selected folder |
+| ⌘N / ⌘⇧N | New file / new folder in the selected folder |
 | Enter (F2 on Windows/Linux) | Rename the selected file or folder (or double-click its name) |
 | ⌘⌫ (Delete on Windows/Linux) | Delete the selected file or folder (to the Trash / Recycle Bin; only a permanent delete asks first) |
+| ⌘⇧P / Ctrl⇧P | Command palette |
 | ⌘S | Save now (saving is also automatic) |
 | ⌘W | Close the current file |
+| ⌘⇧T / Ctrl⇧T | Reopen the last closed tab; repeat for earlier tabs |
 | ⌘E | Switch between Read and Edit |
 | ⌘\\ | Split view |
 | ⌘, | Settings |
@@ -75,6 +96,7 @@ In the Markdown editor:
 | ⌘⇧X | Strikethrough `~~text~~` |
 | ⌘⇧C | Inline code `` `text` `` |
 | ⌘K | Link `[text](url)` |
+| ⌘/ | Insert popover for the selection (Ctrl+/ on Windows/Linux) |
 | ⌘1 – ⌘6 | Heading level 1–6 |
 | ⌘0 | Back to body text |
 | ⌘⇧8 | Bullet list |

@@ -29,6 +29,7 @@ pub struct LargeReader {
     list: ListState,
     base: Option<PathBuf>,
     cursor_anchor: Option<usize>,
+    controls: Option<(WeakEntity<crate::Enso>, EntityId)>,
 }
 
 impl LargeReader {
@@ -168,6 +169,10 @@ impl LargeReader {
         cx.notify();
     }
 
+    pub fn set_controls(&mut self, owner: WeakEntity<crate::Enso>, editor: EntityId) {
+        self.controls = Some((owner, editor));
+    }
+
     pub fn new(source: Arc<String>, sections: Vec<Section>, base: Option<PathBuf>) -> Self {
         let list = ListState::new(sections.len(), ListAlignment::Top, px(400.))
             .with_uniform_item_height(px(900.));
@@ -177,6 +182,7 @@ impl LargeReader {
             list,
             base,
             cursor_anchor: None,
+            controls: None,
         }
     }
 }
@@ -186,6 +192,7 @@ impl Render for LargeReader {
         let source = self.source.clone();
         let sections = self.sections.clone();
         let base = self.base.clone();
+        let controls = self.controls.clone();
         let last = sections.len().saturating_sub(1);
         let content = list(self.list.clone(), move |index, _, _| {
             let section = &sections[index];
@@ -210,6 +217,20 @@ impl Render for LargeReader {
                 .child(
                     div().w_full().child(
                         TextView::markdown(("section", index), text)
+                            .map(|view| {
+                                if let Some((owner, editor)) = &controls {
+                                    crate::rich::decorate(
+                                        view,
+                                        owner.clone(),
+                                        *editor,
+                                        base.clone(),
+                                        section.range.start,
+                                        section.prefix.len(),
+                                    )
+                                } else {
+                                    view
+                                }
+                            })
                             .selectable(true)
                             .w_full()
                             .image_source(move |uri| {

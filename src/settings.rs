@@ -40,6 +40,7 @@ pub struct Preferences {
     pub appearance: Appearance,
     /// Show line numbers beside the editor's text.
     pub line_numbers: bool,
+    pub document_outline: bool,
     /// Split view puts the reader on the left and the editor on the right.
     pub reader_first: bool,
     window: Option<AnyWindowHandle>,
@@ -54,6 +55,24 @@ fn path() -> Option<PathBuf> {
 }
 fn line_numbers_path() -> Option<PathBuf> {
     dirs::config_dir().map(|p| crate::files::app_folder(p).join("line-numbers"))
+}
+fn document_outline_path() -> Option<PathBuf> {
+    dirs::config_dir().map(|p| crate::files::app_folder(p).join("document-outline"))
+}
+fn load_document_outline(path: &Path) -> bool {
+    std::fs::read_to_string(path).map_or(true, |value| value.trim() != "off")
+}
+pub fn document_outline(cx: &App) -> bool {
+    cx.try_global::<Preferences>().is_none_or(|p| p.document_outline)
+}
+fn set_document_outline(on: bool, cx: &mut App) -> io::Result<()> {
+    if !cx.has_global::<Preferences>() { init(cx); }
+    cx.update_global::<Preferences, _>(|prefs, _| prefs.document_outline = on);
+    if let Some(path) = document_outline_path() {
+        if let Some(parent) = path.parent() { std::fs::create_dir_all(parent)?; }
+        std::fs::write(path, if on { "on" } else { "off" })?;
+    }
+    Ok(())
 }
 fn split_order_path() -> Option<PathBuf> {
     dirs::config_dir().map(|p| crate::files::app_folder(p).join("split-order"))
@@ -119,10 +138,12 @@ pub fn init(cx: &mut App) {
     let path = path();
     let appearance = path.as_ref().map(|p| load(p)).unwrap_or_default();
     let line_numbers = line_numbers_path().as_deref().is_some_and(load_line_numbers);
+    let document_outline = document_outline_path().as_deref().is_none_or(load_document_outline);
     let reader_first = split_order_path().as_deref().is_some_and(load_reader_first);
     cx.set_global(Preferences {
         appearance,
         line_numbers,
+        document_outline,
         reader_first,
         window: None,
         path,
@@ -175,7 +196,17 @@ fn blend_gutter(cx: &mut App) {
 /// on every change, so this runs again after each one.
 fn tune_theme(cx: &mut App) {
     blend_gutter(cx);
+    tone_surfaces(cx);
     thin_scrollbars(cx);
+}
+
+/// Floating surfaces stay opaque so document text never shows through them.
+/// Use softer neutral tones instead of pure black and white.
+fn tone_surfaces(cx: &mut App) {
+    let theme = Theme::global_mut(cx);
+    let surface: Hsla = if theme.mode.is_dark() { rgb(0x252628).into() } else { rgb(0xf5f5f3).into() };
+    theme.popover = surface;
+    theme.tokens.popover = surface.into();
 }
 
 /// Hairline scrollbar thumbs, a little wider while hovered or dragged. The kit's
@@ -444,6 +475,8 @@ impl SettingsWindow {
     fn editor_page(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
         let line_numbers = line_numbers(cx);
+        let outline = document_outline(cx);
+        let outline_weak = cx.entity().downgrade();
         let weak = cx.entity().downgrade();
         v_flex()
             .gap_6()
@@ -485,6 +518,17 @@ impl SettingsWindow {
                                 });
                             }),
                     ),
+            )
+            .child(
+                h_flex().gap_4().items_center().justify_between().py_3()
+                    .child(v_flex().gap_0p5()
+                        .child(div().text_sm().font_weight(FontWeight::MEDIUM).child("Document Outline"))
+                        .child(div().text_xs().text_color(theme.muted_foreground).child("Show the section navigation rail beside Markdown documents.")))
+                    .child(Switch::new("document-outline").checked(outline).accessibility_label("Document Outline")
+                        .on_change(move |on,_,cx| {
+                            let error=set_document_outline(*on,cx).err().map(|e|format!("Could not save editor settings: {e}"));
+                            let _=outline_weak.update(cx,|this,cx|{this.error=error;cx.notify();});
+                        }))
             )
     }
 }
@@ -575,6 +619,17 @@ impl Render for SettingsWindow {
 
 #[cfg(test)]
 mod tests {
+    #[::core::prelude::v1::test]
+    fn outline_defaults_on_and_remembers_saved_choice() {
+        let path=std::env::temp_dir().join(format!("enso-outline-setting-{}",std::process::id()));
+        let _=std::fs::remove_file(&path);
+        assert!(super::load_document_outline(&path));
+        std::fs::write(&path,"off").unwrap();
+        assert!(!super::load_document_outline(&path));
+        std::fs::write(&path,"on").unwrap();
+        assert!(super::load_document_outline(&path));
+        std::fs::remove_file(path).unwrap();
+    }
     #[::core::prelude::v1::test]
     fn appearance_values_round_trip() {
         use super::Appearance;

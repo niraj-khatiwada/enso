@@ -3,7 +3,10 @@ mod brand;
 mod files;
 mod markdown_edit;
 mod onboarding;
+mod outline;
+mod palette;
 mod reader;
+mod rich;
 mod settings;
 mod stats;
 mod workspaces;
@@ -41,13 +44,19 @@ actions!(
         OpenFolder,
         NewFile,
         CloseFile,
+        ReopenClosedTab,
         Save,
         ToggleView,
         ToggleSplit,
         NewFolder,
         RenameSelected,
         DeleteSelected,
-        Quit
+        Quit,
+        OpenCommandPalette,
+        DismissCommandPalette,
+        DismissRichControls,
+        OpenInsertMenu,
+        OpenSelectionInsertMenu
     ]
 );
 
@@ -93,6 +102,7 @@ struct Document {
     /// Whether `preview` holds this document's rendered Markdown. Only the few
     /// most recently viewed documents keep it; see `Enso::warm_documents`.
     preview_loaded: bool,
+    outline: Vec<outline::Heading>,
     /// When this document was last the active one (`Enso::view_clock`).
     last_viewed: u64,
     saved: Arc<String>,
@@ -272,9 +282,17 @@ impl Render for SidebarResize {
     }
 }
 
+struct ClosedTab {
+    path: Option<PathBuf>,
+    // Unsaved notes have no file to reload. Saved files stay lightweight.
+    source: Option<String>,
+    workspace: Option<PathBuf>,
+}
+
 struct Enso {
     focus: FocusHandle,
     documents: Vec<Document>,
+    closed_tabs: Vec<ClosedTab>,
     active: Option<usize>,
     root: Option<PathBuf>,
     folders: HashMap<PathBuf, Vec<files::Entry>>,
@@ -290,6 +308,13 @@ struct Enso {
     filename: Entity<InputState>,
     /// The tree row last clicked, file or folder; new entries go beside it.
     selected: Option<PathBuf>,
+    palette: Option<palette::Palette>,
+    controls: Option<rich::Controls>,
+    closing_controls: Option<rich::Controls>,
+    image_resize: Option<rich::ImageResize>,
+    outline_hover: Option<(EntityId, f32)>,
+    outline_bounds: Arc<std::sync::Mutex<Bounds<Pixels>>>,
+    closing_palette: Option<palette::Palette>,
     switcher_open: bool,
     switcher_hovered: bool,
     window_handle: AnyWindowHandle,
@@ -356,12 +381,14 @@ impl Enso {
                     doc.editor
                         .update(cx, |editor, cx| editor.set_line_number(on, window, cx));
                 }
+                if !settings::document_outline(cx) { this.outline_hover = None; }
                 // The split view's side order is a preference too.
                 cx.notify();
             });
         Self {
             focus,
             documents: Vec::new(),
+            closed_tabs: Vec::new(),
             active: None,
             root: None,
             folders: HashMap::new(),
@@ -375,6 +402,13 @@ impl Enso {
             naming: None,
             filename,
             selected: None,
+            palette: None,
+            controls: None,
+            closing_controls: None,
+            image_resize: None,
+            outline_hover: None,
+            outline_bounds: Arc::new(std::sync::Mutex::new(Bounds::default())),
+            closing_palette: None,
             switcher_open: false,
             switcher_hovered: false,
             window_handle,
@@ -565,14 +599,11 @@ impl Enso {
             }) else {
                 return;
             };
-            let count = cx
+            let (count, headings) = cx
                 .background_executor()
                 .spawn(async move {
-                    if let Some(rope) = rope {
-                        stats::word_count(rope.chars())
-                    } else {
-                        stats::word_count(saved.chars())
-                    }
+                    let source = rope.map(|r| r.to_string()).unwrap_or_else(||saved.as_ref().clone());
+                    (stats::word_count(source.chars()), outline::headings(&source))
                 })
                 .await;
             let _ = this.update(cx, |this, cx| {
@@ -582,6 +613,7 @@ impl Enso {
                     .find(|doc| doc.editor.entity_id() == editor_id && doc.revision == revision)
                 {
                     doc.stats = stats::label(count);
+                    doc.outline = headings;
                     cx.notify();
                 }
             });
@@ -794,6 +826,7 @@ impl Enso {
             editor,
             preview,
             preview_loaded: false,
+            outline: Vec::new(),
             last_viewed: 0,
             markdown,
             _subscriptions: vec![subscription, cursor_subscription, preview_subscription],
@@ -1277,7 +1310,13 @@ impl Enso {
         if self.hovered_tab == Some(self.documents[index].editor.entity_id()) {
             self.hovered_tab = None;
         }
-        self.documents.remove(index);
+        let doc = self.documents.remove(index);
+        self.closed_tabs.push(ClosedTab {
+            path: doc.path.clone(),
+            source: doc.path.is_none().then(|| doc.editor.read(cx).value().to_string()),
+            workspace: self.root.clone(),
+        });
+        if self.closed_tabs.len() > 30 { self.closed_tabs.remove(0); }
         self.active = match self.active {
             _ if self.documents.is_empty() => None,
             Some(active) if active > index => Some(active - 1),
@@ -1286,6 +1325,23 @@ impl Enso {
         };
         self.focus_after_close = true;
         cx.notify();
+    }
+
+    fn reopen_closed_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        while let Some(tab) = self.closed_tabs.pop() {
+            if tab.workspace != self.root { continue; }
+            if let Some(path) = tab.path {
+                // Deleted files are skipped; manually reopened files are already
+                // present and should not prevent restoring the next closed tab.
+                if !path.is_file() || self.documents.iter().any(|doc| doc.path.as_ref() == Some(&path)) {
+                    continue;
+                }
+                self.open_path(path, window, cx);
+            } else {
+                self.add_document(None, tab.source.unwrap_or_default(), None, window, cx);
+            }
+            return;
+        }
     }
 
     fn schedule_save(&mut self, index: usize, cx: &mut Context<Self>) {
@@ -2163,7 +2219,21 @@ impl Render for Enso {
                                             cx.notify();
                                         }
                                     });
+                                    let reveal = if cfg!(target_os = "macos") {
+                                        "Show in Finder"
+                                    } else {
+                                        "Show in File Explorer"
+                                    };
                                     menu.item(
+                                        PopupMenuItem::new(reveal)
+                                            .icon(IconName::FolderOpen)
+                                            .on_click({
+                                                let path = menu_path.clone();
+                                                move |_, _, cx| cx.reveal_path(&path)
+                                            }),
+                                    )
+                                    .item(PopupMenuItem::separator())
+                                    .item(
                                         PopupMenuItem::new("Rename")
                                             .icon(IconName::Pencil)
                                             .on_click({
@@ -2270,6 +2340,8 @@ impl Render for Enso {
             }
             if mode != Mode::Edit {
                 if let Some(reader) = &document.large_reader {
+                    let owner = cx.entity().downgrade();
+                    reader.update(cx, |reader, _| reader.set_controls(owner, document.editor.entity_id()));
                     reading_pane = Some(
                         div()
                             .id(("preview-pane", document.editor.entity_id()))
@@ -2301,7 +2373,7 @@ impl Render for Enso {
                                     // padding is inside the scroll box: text starts
                                     // where the editor's does (Read and Edit swap in
                                     // place) and stops short of the overlaid bar.
-                                    TextView::new(&document.preview)
+                                    rich::decorate(TextView::new(&document.preview), cx.entity().downgrade(), document.editor.entity_id(), base.clone(), 0, 0)
                                         .selectable(true)
                                         .scrollable(true)
                                         .size_full()
@@ -2537,10 +2609,21 @@ impl Render for Enso {
             // content column paints its own opaque background.
             .when(!backdrop, |view| view.bg(theme.background))
             .text_color(theme.foreground)
+            .on_action(cx.listener(|this, _: &OpenCommandPalette, w, cx| this.open_palette(w, cx)))
+            .on_action(cx.listener(|this, _: &OpenSelectionInsertMenu, w, cx| {
+                if !this.open_selection_insert_menu(w, cx) { cx.propagate(); }
+            }))
+            .on_action(cx.listener(|this, _: &OpenInsertMenu, w, cx| {
+                if !this.open_insert_menu(w, cx) { cx.propagate(); }
+            }))
+            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| this.move_image_resize(event,cx)))
+            .on_mouse_up(MouseButton::Left,cx.listener(|this,_,w,cx|this.finish_image_resize(w,cx)))
+            .on_mouse_up_out(MouseButton::Left,cx.listener(|this,_,w,cx|this.finish_image_resize(w,cx)))
             .on_action(cx.listener(|this, _: &OpenFile, w, cx| this.pick(false, w, cx)))
             .on_action(cx.listener(|this, _: &OpenFolder, w, cx| this.pick(true, w, cx)))
             .on_action(cx.listener(|this, _: &NewFile, w, cx| this.new_file(w, cx)))
             .on_action(cx.listener(|this, _: &Save, _, cx| this.save(cx)))
+            .on_action(cx.listener(|this, _: &ReopenClosedTab, w, cx| this.reopen_closed_tab(w, cx)))
             // Closes the current tab; with no tabs left, the window, as Cmd-W
             // does in other Mac apps (and quits after the last window).
             .on_action(cx.listener(|this, _: &CloseFile, window, cx| {
@@ -2640,7 +2723,7 @@ impl Render for Enso {
                                     )
                                 })
                                 .when_some(standard_header, |view, header| view.child(header))
-                                .child(body)
+                                .child(h_flex().flex_1().min_h_0().min_w_0().relative().child(self.outline_rail(window,cx)).child(body.h_full().min_w_0()))
                                 .child(
                                     h_flex()
                                         .relative()
@@ -2678,10 +2761,20 @@ impl Render for Enso {
             .when_some(custom_titlebar, |view, titlebar| {
                 view.child(div().absolute().top_0().left_0().right_0().child(titlebar))
             })
+            .when_some(self.palette_overlay(window, cx), |view, overlay| view.child(overlay))
+            .when_some(self.controls_overlay(window, cx), |view, overlay| view.child(overlay))
     }
 }
 
 fn bind_view_keys(cx: &mut App) {
+    cx.bind_keys([
+        KeyBinding::new("escape", DismissCommandPalette, Some("CommandPalette > Input")),
+        KeyBinding::new("escape", DismissRichControls, Some("RichControls > Input")),
+        KeyBinding::new("escape", DismissRichControls, Some("RichControls")),
+        KeyBinding::new(if cfg!(target_os = "macos") { "cmd-shift-t" } else { "ctrl-shift-t" }, ReopenClosedTab, Some("Enso")),
+        KeyBinding::new("ctrl-shift-p", OpenCommandPalette, Some("Enso")),
+        KeyBinding::new("cmd-shift-p", OpenCommandPalette, Some("Enso")),
+    ]);
     // Bind at the input's context depth too: macOS inputs normally
     // consume Ctrl+E as end-of-line before a parent action can see it.
     for context in ["Enso", "Enso > Input"] {
@@ -2762,6 +2855,8 @@ fn bind_markdown_keys(cx: &mut App) {
         };
     }
     cx.bind_keys([
+        KeyBinding::new("/", OpenInsertMenu, context),
+        KeyBinding::new(key!("/"), OpenSelectionInsertMenu, context),
         KeyBinding::new(key!("b"), Bold, context),
         KeyBinding::new(key!("i"), Italic, context),
         KeyBinding::new(key!("shift-x"), Strikethrough, context),
@@ -3080,11 +3175,14 @@ fn main() {
                 Menu {
                     name: "File".into(),
                     items: vec![
+                        MenuItem::action("Command Palette…", OpenCommandPalette),
+                        MenuItem::separator(),
                         MenuItem::action("Open File…", OpenFile),
                         MenuItem::action("Open Folder…", OpenFolder),
                         MenuItem::action("New File", NewFile),
                         MenuItem::action("New Folder", NewFolder),
                         MenuItem::action("Close File", CloseFile),
+                        MenuItem::action("Reopen Closed Tab", ReopenClosedTab),
                         #[cfg(not(target_os = "macos"))]
                         MenuItem::action("Settings…", OpenSettings),
                         MenuItem::separator(),
@@ -3150,6 +3248,48 @@ mod transition_tests {
         })
         .unwrap();
         cx.run_until_parked();
+    }
+
+    #[gpui_kit::test]
+    fn reopen_closed_tabs_in_reverse_order(cx: &mut TestAppContext) {
+        cx.update(|cx| { gpui_kit::init(cx); bind_view_keys(cx); });
+        let root = std::env::temp_dir().join(format!("enso-reopen-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let paths: Vec<_> = ["a.md", "b.md", "c.md"].iter().map(|name| root.join(name)).collect();
+        for path in &paths { std::fs::write(path, "original").unwrap(); }
+        let (handle, view) = cx.update(|cx| gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+            cx.new(|cx| {
+                let mut app = Enso::new(window, cx);
+                for path in &paths { app.add_document(Some(path.clone()), "original".into(), None, window, cx); }
+                app
+            })
+        }).unwrap());
+        draw(cx, handle);
+        cx.update(|cx| view.update(cx, |app, cx| { app.close_document(1, cx); app.close_document(1, cx); }));
+        std::fs::write(&paths[2], "changed on disk").unwrap();
+        let key = if cfg!(target_os = "macos") { "cmd-shift-t" } else { "ctrl-shift-t" };
+        draw(cx, handle);
+        for expected in [2, 1] {
+            cx.simulate_keystrokes(handle, key);
+            cx.run_until_parked();
+            draw(cx, handle);
+            cx.update(|cx| {
+                let app = view.read(cx);
+                let doc = &app.documents[app.active.unwrap()];
+                assert_eq!(doc.path.as_ref(), Some(&paths[expected]));
+                if expected == 2 { assert_eq!(doc.saved.as_str(), "changed on disk"); }
+            });
+        }
+        // No history is harmless and never creates a duplicate tab.
+        cx.simulate_keystrokes(handle, key);
+        draw(cx, handle);
+        assert_eq!(cx.update(|cx| view.read(cx).documents.len()), 3);
+        cx.update(|cx| view.update(cx, |app, cx| app.close_document(2, cx)));
+        std::fs::remove_file(&paths[1]).unwrap();
+        cx.simulate_keystrokes(handle, key);
+        draw(cx, handle);
+        assert_eq!(cx.update(|cx| view.read(cx).documents.len()), 2);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[gpui_kit::test]
