@@ -1,13 +1,8 @@
-# Release builds of enso for macOS (Apple silicon), Windows (x64, ARM64) and
-# Linux (x64, ARM64).
-#
-# Run it by hand: Actions -> Release -> Run workflow. It builds every package
-# and puts them in a draft GitHub Release for the version in Cargo.toml
-# (v0.1.0 and so on), to check and publish from the Releases page. Running it
-# again for the same version replaces the draft's files.
 name: Release
 
 on:
+  push:
+    tags: ["v*"]
   workflow_dispatch:
 
 permissions:
@@ -18,31 +13,65 @@ env:
   CARGO_NET_GIT_FETCH_WITH_CLI: "true"
 
 jobs:
+  version:
+    name: Version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+      prerelease: ${{ steps.version.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: version
+        name: Read and check the version
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
+          tag="v$version"
+          if [ "$GITHUB_REF_TYPE" = tag ] && [ "$GITHUB_REF_NAME" != "$tag" ]; then
+            echo "::error::The tag $GITHUB_REF_NAME does not match the version in Cargo.toml ($version). Use make release VERSION=x.y.z."
+            exit 1
+          fi
+          case "$version" in *-*) prerelease=true ;; *) prerelease=false ;; esac
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "prerelease=$prerelease" >> "$GITHUB_OUTPUT"
+
   macos:
-    name: macOS (Apple silicon)
+    name: macOS (Apple silicon and Intel)
+    needs: version
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
       - name: Credentials for the gpui-base fork
         shell: bash
         run: git config --global url."https://x-access-token:${{ github.token }}@github.com/viai957/enso".insteadOf "https://github.com/viai957/enso"
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.97.0
+        with:
+          targets: aarch64-apple-darwin, x86_64-apple-darwin
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: |
             .
             macos/quicklook -> ../../target/quicklook
-      # Release build, enso.app with its Quick Look extension, ad-hoc
-      # signature and disk image. Not notarized: Gatekeeper asks on first open.
-      - run: ./scripts/build-mac.sh
+      - name: Build, sign and package
+        env:
+          ENSO_TARGETS: aarch64-apple-darwin x86_64-apple-darwin
+          ENSO_DMG_NAME: enso-macos.dmg
+          MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+        run: ./scripts/build-mac.sh
       - uses: actions/upload-artifact@v4
         with:
-          name: enso-macos-arm64
-          path: target/enso-*.dmg
+          name: enso-macos
+          path: target/enso-macos.dmg
           if-no-files-found: error
 
   windows:
     name: Windows (${{ matrix.arch }})
+    needs: version
     strategy:
       fail-fast: false
       matrix:
@@ -57,38 +86,45 @@ jobs:
       - name: Credentials for the gpui-base fork
         shell: bash
         run: git config --global url."https://x-access-token:${{ github.token }}@github.com/viai957/enso".insteadOf "https://github.com/viai957/enso"
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.97.0
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.arch }}
-      # build.rs embeds the app icon; .cargo/config.toml gives the main
-      # thread the 8 MB stack GPUI needs.
       - run: cargo build --release --locked
-      - name: Package
+      - name: Install Inno Setup
         shell: pwsh
         run: |
-          $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"' | Select-Object -First 1).Matches.Groups[1].Value
-          $dir = "enso-$version-windows-${{ matrix.arch }}"
-          New-Item -ItemType Directory $dir | Out-Null
-          Copy-Item target/release/enso.exe "$dir/enso.exe"
-          Copy-Item README.md $dir
-          Compress-Archive -Path $dir -DestinationPath "$dir.zip"
+          $installer = Join-Path $env:RUNNER_TEMP "innosetup.exe"
+          Invoke-WebRequest -Uri "https://files.jrsoftware.org/is/6/innosetup-6.4.3.exe" -OutFile $installer
+          Start-Process -FilePath $installer -ArgumentList "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/SP-" -Wait
+          "${env:ProgramFiles(x86)}\Inno Setup 6" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+      - name: Installer and portable zip
+        shell: pwsh
+        run: |
+          $source = Join-Path $PWD "target\release\enso.exe"
+          iscc "/DAppVersion=${{ needs.version.outputs.version }}" "/DArch=${{ matrix.arch }}" "/DSource=$source" packaging\windows\enso.iss
+          $portable = "enso-windows-${{ matrix.arch }}-portable"
+          New-Item -ItemType Directory $portable | Out-Null
+          Copy-Item $source "$portable\enso.exe"
+          Copy-Item README.md $portable
+          Compress-Archive -Path $portable -DestinationPath "dist\$portable.zip"
       - uses: actions/upload-artifact@v4
         with:
           name: enso-windows-${{ matrix.arch }}
-          path: enso-*-windows-*.zip
+          path: dist/*
           if-no-files-found: error
 
   linux:
     name: Linux (${{ matrix.arch }})
+    needs: version
     strategy:
       fail-fast: false
       matrix:
         include:
           - arch: x64
-            runner: ubuntu-24.04
+            runner: ubuntu-22.04
           - arch: arm64
-            runner: ubuntu-24.04-arm
+            runner: ubuntu-22.04-arm
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
@@ -101,76 +137,88 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             pkg-config libfontconfig-dev libfreetype-dev libwayland-dev \
             libxkbcommon-dev libxkbcommon-x11-dev libxcb1-dev libx11-xcb-dev \
-            libvulkan-dev libssl-dev libzstd-dev
-      - uses: dtolnay/rust-toolchain@stable
+            libvulkan-dev libssl-dev libzstd-dev libfuse2 file
+      - uses: dtolnay/rust-toolchain@1.97.0
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.arch }}
       - run: cargo build --release --locked
-      # The binary, its launcher icon and the script that installs both:
-      # after unpacking, run ./install.sh (or sh install.sh) to add enso to
-      # the app launcher.
-      - name: Package
-        run: |
-          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
-          dir="enso-$version-linux-${{ matrix.arch }}"
-          mkdir -p "$dir/assets" "$dir/scripts"
-          cp target/release/enso "$dir/enso"
-          cp -R assets/linux "$dir/assets/"
-          cp scripts/install-linux.sh "$dir/scripts/"
-          cat > "$dir/install.sh" <<'EOF'
-          #!/bin/sh
-          # Add enso to the app launcher, with its icon, for the current user.
-          # Works as `sh install.sh` too: some archive tools unpack without
-          # the executable bits, so they're restored here.
-          here=$(cd "$(dirname "$0")" && pwd)
-          chmod +x "$here/enso" "$here/scripts/install-linux.sh" "$here/install.sh" 2>/dev/null || true
-          exec sh "$here/scripts/install-linux.sh" "$here/enso"
-          EOF
-          chmod +x "$dir/install.sh" "$dir/enso"
-          cp README.md "$dir/"
-          tar -czf "$dir.tar.gz" "$dir"
+      - name: Debian package and AppImage
+        run: ./scripts/package-linux.sh target/release/enso dist
       - uses: actions/upload-artifact@v4
         with:
           name: enso-linux-${{ matrix.arch }}
-          path: enso-*-linux-*.tar.gz
+          path: dist/*
           if-no-files-found: error
 
   release:
-    name: Draft release
-    needs: [macos, windows, linux]
+    name: Publish
+    needs: [version, macos, windows, linux]
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@v4
-      - name: Credentials for the gpui-base fork
-        shell: bash
-        run: git config --global url."https://x-access-token:${{ github.token }}@github.com/viai957/enso".insteadOf "https://github.com/viai957/enso"
       - uses: actions/download-artifact@v4
         with:
           path: dist
           merge-multiple: true
-      - name: Create or update the draft
+      - name: Release notes
+        run: |
+          cat > notes.md <<'NOTES'
+          ## Download
+
+          | Your computer | Download | Then |
+          |---|---|---|
+          | **Mac** (Apple silicon or Intel) | [enso-macos.dmg](${REPO_URL}/releases/download/${TAG}/enso-macos.dmg) | Open it and drag **enso** onto **Applications**. |
+          | **Windows** | [enso-windows-x64-setup.exe](${REPO_URL}/releases/download/${TAG}/enso-windows-x64-setup.exe) | Run it and follow the steps. On ARM laptops (Surface Pro X, Snapdragon), use [the ARM64 installer](${REPO_URL}/releases/download/${TAG}/enso-windows-arm64-setup.exe). |
+          | **Ubuntu, Debian, Mint, Pop!_OS** | [enso-linux-amd64.deb](${REPO_URL}/releases/download/${TAG}/enso-linux-amd64.deb) | Double-click it and choose **Install**. |
+          | **Other Linux** | [enso-linux-x86_64.AppImage](${REPO_URL}/releases/download/${TAG}/enso-linux-x86_64.AppImage) | Right-click › Properties › allow running as a program, then double-click it. |
+
+          ARM Linux: [.deb](${REPO_URL}/releases/download/${TAG}/enso-linux-arm64.deb) · [AppImage](${REPO_URL}/releases/download/${TAG}/enso-linux-aarch64.AppImage). Windows without installing: [x64 zip](${REPO_URL}/releases/download/${TAG}/enso-windows-x64-portable.zip) · [ARM64 zip](${REPO_URL}/releases/download/${TAG}/enso-windows-arm64-portable.zip).
+
+          **First launch.** If your Mac says it can't check enso for malicious software, open **System Settings › Privacy & Security** and click **Open Anyway**. If Windows shows "Windows protected your PC", click **More info › Run anyway**. You only need to do this once.
+
+          NOTES
+          sed -i "s#\${TAG}#${{ needs.version.outputs.tag }}#g; s#\${REPO_URL}#${{ github.server_url }}/${{ github.repository }}#g" notes.md
+          ls -l dist
+      - name: Publish the release
+        if: github.ref_type == 'tag'
         env:
           GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.version.outputs.tag }}
         run: |
-          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
-          tag="v$version"
-          ls -l dist
-          if draft=$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft 2>/dev/null); then
-            if [ "$draft" != "true" ]; then
-              echo "::error::$tag is already published. Bump the version in Cargo.toml for a new release."
+          prerelease=""
+          if [ "${{ needs.version.outputs.prerelease }}" = true ]; then prerelease="--prerelease"; fi
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create "$TAG" dist/* \
+              --repo "$GITHUB_REPOSITORY" \
+              --verify-tag \
+              --title "enso $TAG" \
+              --notes-file notes.md \
+              --generate-notes \
+              $prerelease
+          fi
+      - name: Draft a test release
+        if: github.ref_type != 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.version.outputs.tag }}
+        run: |
+          if draft=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft 2>/dev/null); then
+            if [ "$draft" != true ]; then
+              echo "::error::$TAG is already published. Use make release VERSION=x.y.z for a new version."
               exit 1
             fi
-            # Already drafted for this version: refresh its files.
-            gh release upload "$tag" dist/* --repo "$GITHUB_REPOSITORY" --clobber
+            gh release upload "$TAG" dist/* --repo "$GITHUB_REPOSITORY" --clobber
           else
-            # A draft: nothing is public, and the tag is only created on publish.
-            gh release create "$tag" dist/* \
+            gh release create "$TAG" dist/* \
               --repo "$GITHUB_REPOSITORY" \
               --draft \
               --target "$GITHUB_SHA" \
-              --title "enso $tag" \
+              --title "enso $TAG" \
+              --notes-file notes.md \
               --generate-notes
           fi

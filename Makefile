@@ -3,7 +3,7 @@
 APP := target/enso.app
 LSREGISTER := /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister
 
-.PHONY: help run check test bench build.macos app app.debug quicklook install install.linux clean
+.PHONY: help run check test bench build.macos app app.debug quicklook install install.linux release clean
 
 help: ## List the targets
 	@awk 'BEGIN {FS = ":.*## "} /^[a-zA-Z_.-]+:.*## / {printf "  make %-12s %s\n", $$1, $$2}' $(MAKEFILE_LIST)
@@ -20,6 +20,10 @@ test: ## Run the app's and the Quick Look renderer's tests
 
 bench: ## Visual editor benchmark suite (1k, 50k, 200k, 255k), prints result tables
 	./scripts/bench.sh
+
+release: ## Tag and publish a release: make release VERSION=1.2.3
+	@test -n "$(VERSION)" || { echo "Usage: make release VERSION=1.2.3"; exit 1; }
+	./scripts/release.sh $(VERSION)
 
 build.macos: ## Release build, enso.app with Quick Look, signature and DMG
 	./scripts/build-mac.sh
