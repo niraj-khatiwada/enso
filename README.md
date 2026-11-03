@@ -70,6 +70,21 @@ Click into a table and edit cells directly, including bold, links and code. Tab 
 
 <p align="center"><img src="assets/screenshots/table-light.png" alt="Editing a table with its toolbar" width="880"></p>
 
+## Math
+
+Write LaTeX between dollar signs and it is typeset in the page: `$\nabla_\theta L$` inline, and `$$ … $$` on its own lines for display equations. Fractions, sums, integrals, roots, matrices, `\operatorname`, `\text` and the rest of everyday LaTeX math render with proper math fonts, offline, and follow the light or dark theme. Amounts like "$5 and $10" stay plain text.
+
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/math-dark.png">
+    <img src="assets/screenshots/math-light.png" alt="Inline and display LaTeX math typeset in the page" width="880">
+  </picture>
+</p>
+
+Click a display formula, or double-click an inline one, to edit it with a live preview; ⌘⇧M inserts a new formula. The file keeps plain `$…$` and `$$…$$`.
+
+<p align="center"><img src="assets/screenshots/math-dialog-light.png" alt="Editing a formula with a live preview" width="880"></p>
+
 ## Front matter
 
 YAML and TOML front matter opens in its own panel above the page, with syntax highlighting. Edit it there and the header of your file changes with it; fold the panel away when you don't need it.
@@ -78,7 +93,7 @@ YAML and TOML front matter opens in its own panel above the page, with syntax hi
 
 ## Make it yours
 
-Choose the caret's colour, thickness, blink rate and blink pattern, the size of the text in the page, and how the page behaves while you write. Light and dark themes follow the system, or pick one yourself.
+Choose the caret's colour, thickness, blink rate and blink pattern, the size of the text in the page, and how the page behaves while you write. Light and dark themes follow the system, or pick one yourself. On macOS, text is drawn crisply, the way current Mac apps draw it; Settings › Appearance can switch back to the heavier, older style.
 
 <p align="center">
   <img src="assets/screenshots/settings-writing-light.png" alt="Writing settings" width="430">
@@ -140,6 +155,7 @@ Typing is built to fit inside a 120 Hz frame on documents of hundreds of kilobyt
 | ⌘Z / ⌘⇧Z | Undo / redo |
 | ⌥Enter | Follow the link or footnote at the caret |
 | ⌘⇧I | Insert or edit an image |
+| ⌘⇧M | Insert a formula; ⌘Enter saves it |
 | Tab / ⇧Tab in a table | Next / previous cell |
 | ⌘⌥↑ / ⌘⌥↓ | Insert a table row above / below |
 | ⌘⌥← / ⌘⌥→ | Insert a table column left / right |
