@@ -1195,6 +1195,10 @@ impl VisualView {
         window.focus(&self.focus, cx);
         self.selected_image = None;
         if let Some(src) = self.source_for_point(event.position) {
+            if event.modifiers.secondary(cx) && self.follow_footnote(src, cx) {
+                self.perf.borrow_mut().handler_done();
+                return;
+            }
             if event.modifiers.shift {
                 self.anchor.get_or_insert(self.caret);
             } else {

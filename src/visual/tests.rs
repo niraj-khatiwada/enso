@@ -1121,3 +1121,22 @@ fn tables_tab_between_cells_and_change_shape(cx: &mut TestAppContext) {
     );
     assert_synced(cx, &view, "after table edits");
 }
+
+#[gpui_kit::test]
+fn footnotes_jump_to_their_note_and_back(cx: &mut TestAppContext) {
+    let doc = "A claim[^src] worth checking.\n\nMore text.\n\n[^src]: Where it came from.\n";
+    let (handle, view) = open(cx, doc);
+    let reference = doc.find("[^src]").unwrap() + 2;
+    cx.update(|cx| view.update(cx, |v, _| v.caret = reference));
+    cx.simulate_keystrokes(handle, "alt-enter");
+    let caret = cx.update(|cx| view.read(cx).caret);
+    assert_eq!(caret, doc.find("Where").unwrap());
+    let label = doc.rfind("[^src]").unwrap() + 3;
+    cx.update(|cx| view.update(cx, |v, _| v.caret = label));
+    cx.simulate_keystrokes(handle, "alt-enter");
+    let caret = cx.update(|cx| view.read(cx).caret);
+    assert!(
+        (doc.find("[^src]").unwrap()..doc.find(" worth").unwrap() + 1).contains(&caret),
+        "{caret}"
+    );
+}

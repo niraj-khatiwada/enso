@@ -53,7 +53,8 @@ actions!(
         TableColumnRight,
         TableDeleteRow,
         TableDeleteColumn,
-        TableTidy
+        TableTidy,
+        FollowLink
     ]
 );
 
@@ -108,6 +109,7 @@ pub fn init(cx: &mut App) {
         KeyBinding::new(key!("alt-backspace"), TableDeleteRow, c),
         KeyBinding::new(key!("alt-shift-backspace"), TableDeleteColumn, c),
         KeyBinding::new(key!("alt-t"), TableTidy, c),
+        KeyBinding::new("alt-enter", FollowLink, c),
     ]);
     #[cfg(target_os = "macos")]
     cx.bind_keys([
@@ -275,6 +277,7 @@ pub fn listeners(root: Stateful<Div>, cx: &mut Context<VisualView>) -> Stateful<
         w,
         cx
     ));
+    let root = on!(root, FollowLink, |this, _w, cx| this.follow_at_caret(cx));
     let root = on!(root, TableTidy, |this, w, cx| this.table_op(
         TableOp::Tidy,
         w,
@@ -454,5 +457,153 @@ impl VisualView {
         self.anchor = Some(self.doc.src_of(bix, lix, 0));
         self.caret = self.doc.src_of(bix, lix, len);
         cx.notify();
+    }
+}
+
+pub fn footnote_at(text: &str, offset: usize) -> Option<(String, bool)> {
+    let offset = offset.min(text.len());
+    let line_start = text[..offset].rfind('\n').map_or(0, |i| i + 1);
+    let line_end = text[offset..].find('\n').map_or(text.len(), |i| offset + i);
+    let line = &text[line_start..line_end];
+    let at = offset - line_start;
+    let mut search = 0;
+    while let Some(open) = line[search..].find("[^").map(|i| search + i) {
+        let Some(close) = line[open..].find(']').map(|i| open + i) else {
+            break;
+        };
+        if open <= at && at <= close + 1 {
+            let id = line[open + 2..close].to_string();
+            let definition = open == 0 && line[close + 1..].starts_with(':');
+            return (!id.is_empty()).then_some((id, definition));
+        }
+        search = close + 1;
+    }
+    None
+}
+
+pub fn link_at(text: &str, offset: usize) -> Option<(String, bool)> {
+    let offset = offset.min(text.len());
+    let line_start = text[..offset].rfind('\n').map_or(0, |i| i + 1);
+    let line_end = text[offset..].find('\n').map_or(text.len(), |i| offset + i);
+    let line = &text[line_start..line_end];
+    let at = offset - line_start;
+    let mut search = 0;
+    while let Some(open) = line[search..].find('[').map(|i| search + i) {
+        let Some(close) = line[open..].find(']').map(|i| open + i) else {
+            break;
+        };
+        let rest = &line[close + 1..];
+        let (end, target, reference) = if let Some(inner) = rest.strip_prefix('(') {
+            let Some(len) = inner.find(')') else {
+                search = close + 1;
+                continue;
+            };
+            let url = inner[..len].split_whitespace().next().unwrap_or("");
+            (
+                close + 2 + len,
+                url.trim_matches(['<', '>']).to_string(),
+                false,
+            )
+        } else if let Some(inner) = rest.strip_prefix('[') {
+            let Some(len) = inner.find(']') else {
+                search = close + 1;
+                continue;
+            };
+            let id = if len == 0 {
+                line[open + 1..close].to_string()
+            } else {
+                inner[..len].to_string()
+            };
+            (close + 2 + len, id, true)
+        } else {
+            (close + 1, line[open + 1..close].to_string(), true)
+        };
+        if open <= at && at <= end && !line[open..].starts_with("[^") {
+            return Some((target, reference));
+        }
+        search = close + 1;
+    }
+    None
+}
+
+impl VisualView {
+    pub fn follow_footnote(&mut self, offset: usize, cx: &mut Context<Self>) -> bool {
+        let text = self.editor.read(cx).text().to_string();
+        let Some((id, definition)) = footnote_at(&text, offset) else {
+            return false;
+        };
+        let label = format!("[^{id}]");
+        let target = if definition {
+            text.match_indices(&label)
+                .map(|(i, _)| i)
+                .find(|&i| !text[i + label.len()..].starts_with(':'))
+        } else {
+            text.match_indices(&format!("{label}:"))
+                .map(|(i, _)| i)
+                .find(|&i| i == 0 || text[..i].ends_with('\n'))
+                .map(|i| {
+                    let after = i + label.len() + 1;
+                    after + text[after..].len() - text[after..].trim_start_matches(' ').len()
+                })
+        };
+        let Some(target) = target else {
+            return false;
+        };
+        self.place_caret(target, None, cx);
+        true
+    }
+
+    pub fn follow_at_caret(&mut self, cx: &mut Context<Self>) {
+        let caret = self.caret;
+        if self.follow_footnote(caret, cx) {
+            return;
+        }
+        let text = self.editor.read(cx).text().to_string();
+        let Some((target, reference)) = link_at(&text, caret) else {
+            return;
+        };
+        let url = if reference {
+            let id = target.to_lowercase();
+            self.doc
+                .link_references()
+                .into_iter()
+                .find(|(identifier, _, _)| identifier.to_lowercase() == id)
+                .map(|(_, url, _)| url)
+        } else {
+            Some(target)
+        };
+        let Some(url) = url else {
+            return;
+        };
+        if url.starts_with("https://") || url.starts_with("http://") || url.starts_with("mailto:") {
+            cx.open_url(&url);
+        } else if !url.contains(':')
+            && !url.starts_with('#')
+            && let Some(base) = &self.base
+        {
+            cx.reveal_path(&base.join(&url));
+        }
+    }
+}
+
+#[cfg(test)]
+mod link_tests {
+    use super::*;
+
+    #[test]
+    fn finds_footnotes_and_links_at_an_offset() {
+        let text = "See this[^note] and [docs](https://a.example \"T\") or [ref][r].\n\n[^note]: The note.\n";
+        assert_eq!(footnote_at(text, 10), Some(("note".into(), false)));
+        let def = text.find("[^note]:").unwrap();
+        assert_eq!(footnote_at(text, def + 2), Some(("note".into(), true)));
+        assert_eq!(footnote_at(text, 2), None);
+        let docs = text.find("docs").unwrap();
+        assert_eq!(
+            link_at(text, docs),
+            Some(("https://a.example".into(), false))
+        );
+        let r = text.find("ref").unwrap();
+        assert_eq!(link_at(text, r), Some(("r".into(), true)));
+        assert_eq!(link_at(text, 10), None);
     }
 }
