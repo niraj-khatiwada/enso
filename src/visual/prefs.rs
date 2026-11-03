@@ -45,6 +45,8 @@ impl FocusMode {
 }
 
 pub const BLINK_CELLS: u32 = 12;
+pub const MIN_TEXT: f32 = 13.;
+pub const MAX_TEXT: f32 = 26.;
 
 #[derive(Clone, PartialEq, Debug)]
 pub struct WritingPrefs {
@@ -56,6 +58,7 @@ pub struct WritingPrefs {
     pub typewriter: bool,
     pub typewriter_guide: f32,
     pub focus: FocusMode,
+    pub text_size: f32,
 }
 
 impl Default for WritingPrefs {
@@ -69,6 +72,7 @@ impl Default for WritingPrefs {
             typewriter: false,
             typewriter_guide: 0.5,
             focus: FocusMode::Off,
+            text_size: 17.,
         }
     }
 }
@@ -99,7 +103,7 @@ impl WritingPrefs {
             CaretColor::Custom(value) => format!("#{value:06x}"),
         };
         format!(
-            "caret_color = {color}\ncaret_width = {}\ncaret_blink = {}\nblink_period_ms = {}\nblink_pattern = {:012b}\ntypewriter = {}\ntypewriter_guide = {:.3}\nfocus = {}\n",
+            "caret_color = {color}\ncaret_width = {}\ncaret_blink = {}\nblink_period_ms = {}\nblink_pattern = {:012b}\ntypewriter = {}\ntypewriter_guide = {:.3}\nfocus = {}\ntext_size = {}\n",
             self.caret_width,
             self.caret_blink,
             self.blink_period_ms,
@@ -107,6 +111,7 @@ impl WritingPrefs {
             self.typewriter,
             self.typewriter_guide,
             self.focus.name(),
+            self.text_size,
         )
     }
 
@@ -154,6 +159,11 @@ impl WritingPrefs {
                     }
                 }
                 "focus" => prefs.focus = FocusMode::parse(value),
+                "text_size" => {
+                    if let Ok(v) = value.parse::<f32>() {
+                        prefs.text_size = v.clamp(MIN_TEXT, MAX_TEXT);
+                    }
+                }
                 _ => {}
             }
         }
@@ -176,6 +186,7 @@ mod tests {
             typewriter: true,
             typewriter_guide: 0.4,
             focus: FocusMode::Sentence,
+            text_size: 19.,
         };
         assert_eq!(WritingPrefs::parse(&prefs.serialize()), prefs);
         let odd = WritingPrefs::parse("caret_width = 99\nblink_pattern = 0\nfocus = ??\nnoise\n");

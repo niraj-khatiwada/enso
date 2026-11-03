@@ -555,6 +555,7 @@ impl SettingsWindow {
         let prefs = WritingPrefs::get(cx);
         let typewriter = self.writing_setter(cx, |p, on: bool| p.typewriter = on);
         let focus = self.writing_setter(cx, |p, mode: FocusMode| p.focus = mode);
+        let size = self.writing_setter(cx, |p, size: u32| p.text_size = size as f32);
         v_flex()
             .gap_6()
             .child(page_header(
@@ -571,6 +572,23 @@ impl SettingsWindow {
                             .checked(prefs.typewriter)
                             .accessibility_label("Typewriter mode")
                             .on_change(move |on, _, cx| typewriter(*on, cx)),
+                        &theme,
+                    ))
+                    .child(setting_row(
+                        "Text size",
+                        "The size of body text in the page. Cmd+= and Cmd+- change it while you write.",
+                        segmented(
+                            "text-size",
+                            vec![
+                                (15u32, "Small".into()),
+                                (17, "Medium".into()),
+                                (19, "Large".into()),
+                                (22, "Larger".into()),
+                            ],
+                            prefs.text_size.round() as u32,
+                            size,
+                            &theme,
+                        ),
                         &theme,
                     ))
                     .child(setting_row(

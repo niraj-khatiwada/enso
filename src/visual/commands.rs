@@ -54,7 +54,9 @@ actions!(
         TableDeleteRow,
         TableDeleteColumn,
         TableTidy,
-        FollowLink
+        FollowLink,
+        LargerText,
+        SmallerText
     ]
 );
 
@@ -110,6 +112,9 @@ pub fn init(cx: &mut App) {
         KeyBinding::new(key!("alt-shift-backspace"), TableDeleteColumn, c),
         KeyBinding::new(key!("alt-t"), TableTidy, c),
         KeyBinding::new("alt-enter", FollowLink, c),
+        KeyBinding::new(key!("="), LargerText, c),
+        KeyBinding::new(key!("+"), LargerText, c),
+        KeyBinding::new(key!("-"), SmallerText, c),
     ]);
     #[cfg(target_os = "macos")]
     cx.bind_keys([
@@ -278,6 +283,8 @@ pub fn listeners(root: Stateful<Div>, cx: &mut Context<VisualView>) -> Stateful<
         cx
     ));
     let root = on!(root, FollowLink, |this, _w, cx| this.follow_at_caret(cx));
+    let root = on!(root, LargerText, |this, _w, cx| step_text_size(1., cx));
+    let root = on!(root, SmallerText, |this, _w, cx| step_text_size(-1., cx));
     let root = on!(root, TableTidy, |this, w, cx| this.table_op(
         TableOp::Tidy,
         w,
@@ -457,6 +464,15 @@ impl VisualView {
         self.anchor = Some(self.doc.src_of(bix, lix, 0));
         self.caret = self.doc.src_of(bix, lix, len);
         cx.notify();
+    }
+}
+
+fn step_text_size(step: f32, cx: &mut App) {
+    let mut prefs = WritingPrefs::get(cx);
+    let size = (prefs.text_size + step).clamp(super::prefs::MIN_TEXT, super::prefs::MAX_TEXT);
+    if size != prefs.text_size {
+        prefs.text_size = size;
+        cx.set_global(prefs);
     }
 }
 

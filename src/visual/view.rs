@@ -172,6 +172,7 @@ pub struct VisualView {
     pub caret_blink: Caret,
     render_cx: RenderContext,
     pub(super) base: Option<std::path::PathBuf>,
+    text_size: f32,
     render_defs: String,
     synced_text: Rope,
     synced_revision: u64,
@@ -207,6 +208,13 @@ impl VisualView {
         let observe = cx.observe(&editor, |this, _, cx| this.sync(cx));
         let prefs = cx.observe_global::<super::prefs::WritingPrefs>(|this, cx| {
             this.caret_blink.reset(cx);
+            if super::prefs::WritingPrefs::get(cx).text_size != this.text_size {
+                this.refresh_render_cx(cx);
+                this.table_widths.clear();
+                this.table_dirty.clear();
+                let count = this.rows.len();
+                this.splice_list(0..count, count);
+            }
             cx.notify();
         });
         let mut view = Self {
@@ -237,6 +245,7 @@ impl VisualView {
             caret_blink: Caret::new(cx),
             render_cx,
             base: None,
+            text_size: BODY_SIZE,
             render_defs: String::new(),
             synced_text: text,
             synced_revision: revision,
@@ -723,6 +732,47 @@ impl VisualView {
         }
     }
 
+    pub fn a11y_outline(&self) -> Vec<(Role, String, Option<usize>)> {
+        let first = self.list.logical_scroll_top().item_ix;
+        let mut seen = None;
+        let mut out = Vec::new();
+        for row in self.rows.rows.iter().skip(first).take(80) {
+            if seen == Some(row.block) {
+                continue;
+            }
+            seen = Some(row.block);
+            let Some(block) = self.doc.blocks.get(row.block) else {
+                break;
+            };
+            let text = |range: Range<usize>| {
+                block.leaves[range.start.min(block.leaves.len())..range.end.min(block.leaves.len())]
+                    .iter()
+                    .map(|l| l.text.trim().to_string())
+                    .filter(|t| !t.is_empty())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            };
+            let all = 0..block.leaves.len();
+            match (&block.kind, &block.node) {
+                (Kind::Image(image), _) => out.push((Role::Image, image.alt.clone(), None)),
+                (Kind::List { items }, _) => {
+                    for item in items {
+                        out.push((Role::ListItem, text(item.leaves.clone()), None));
+                    }
+                }
+                (Kind::Table { .. }, _) => out.push((Role::Table, text(all), None)),
+                (Kind::Fence { .. }, _) => out.push((Role::Code, text(all), None)),
+                (_, BlockNode::Heading { level, .. }) => {
+                    out.push((Role::Heading, text(all), Some(*level as usize)))
+                }
+                (_, BlockNode::Blockquote { .. }) => out.push((Role::Blockquote, text(all), None)),
+                _ if !block.leaves.is_empty() => out.push((Role::Paragraph, text(all), None)),
+                _ => {}
+            }
+        }
+        out
+    }
+
     fn guide(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let y = self.guide_line_y(cx)?;
         let theme = cx.theme();
@@ -951,8 +1001,9 @@ impl VisualView {
     fn refresh_render_cx(&mut self, cx: &App) {
         let images = self.base.clone();
         let base = self.base.clone();
+        self.text_size = super::prefs::WritingPrefs::get(cx).text_size;
         let mut render_cx = RenderContext::from_app(cx)
-            .with_body_font_size(px(BODY_SIZE))
+            .with_body_font_size(px(self.text_size))
             .with_image_source(move |uri| {
                 let source = uri.to_string();
                 match &images {
@@ -1601,10 +1652,29 @@ impl Render for VisualView {
                 .pt(px(PAGE_TOP))
                 .flex()
                 .flex_col()
+                .text_size(px(self.text_size))
+                .line_height(px((self.text_size * 1.53).round()))
                 .child(list),
         );
+        let outline = window.is_a11y_enabled().then(|| self.a11y_outline());
         let root = div()
             .id("visual-editor")
+            .role(Role::Document)
+            .aria_label("Page")
+            .aria_description("Editable Markdown page. Cmd+E shows the Markdown source.")
+            .when_some(outline, |root, outline| {
+                root.a11y_synthetic_children(move |builder| {
+                    for (ix, (role, label, level)) in outline.into_iter().enumerate() {
+                        let id = builder.synthetic_node_id(ix);
+                        let mut node = gpui_kit::accesskit::Node::new(role);
+                        node.set_label(label);
+                        if let Some(level) = level {
+                            node.set_level(level);
+                        }
+                        builder.push_child(id, node);
+                    }
+                })
+            })
             .key_context(CONTEXT)
             .track_focus(&self.focus)
             .relative()

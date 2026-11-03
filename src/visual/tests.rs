@@ -1140,3 +1140,35 @@ fn footnotes_jump_to_their_note_and_back(cx: &mut TestAppContext) {
         "{caret}"
     );
 }
+
+#[gpui_kit::test]
+fn the_page_reports_its_structure_and_resizes_its_text(cx: &mut TestAppContext) {
+    let doc = "# Title\n\nA paragraph.\n\n- one\n- two\n\n![Ridge](r.png)\n\n> Quoted\n";
+    let (handle, view) = open(cx, doc);
+    let outline = cx.update(|cx| view.read(cx).a11y_outline());
+    let roles: Vec<_> = outline
+        .iter()
+        .map(|(role, label, level)| (*role, label.as_str(), *level))
+        .collect();
+    assert_eq!(
+        roles,
+        [
+            (gpui_kit::Role::Heading, "Title", Some(1)),
+            (gpui_kit::Role::Paragraph, "A paragraph.", None),
+            (gpui_kit::Role::ListItem, "one", None),
+            (gpui_kit::Role::ListItem, "two", None),
+            (gpui_kit::Role::Image, "Ridge", None),
+            (gpui_kit::Role::Blockquote, "Quoted", None),
+        ]
+    );
+    let at = doc.find("paragraph").unwrap();
+    cx.update(|cx| view.update(cx, |v, _| v.caret = at));
+    draw(cx, handle);
+    let before = cx.update(|cx| view.read(cx).caret_position().unwrap().1);
+    cx.simulate_keystrokes(handle, &format!("{MOD}-= {MOD}-= {MOD}-="));
+    draw(cx, handle);
+    draw(cx, handle);
+    let after = cx.update(|cx| view.read(cx).caret_position().unwrap().1);
+    assert!(after > before, "{before:?} -> {after:?}");
+    cx.update(|cx| assert_eq!(super::prefs::WritingPrefs::get(cx).text_size, 20.));
+}
