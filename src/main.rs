@@ -470,7 +470,10 @@ struct Enso {
     closing: Option<CloseTarget>,
     sidebar_open: bool,
     sidebar_width: Pixels,
-    focus_after_close: bool,
+    /// The active tab changed (opened, reopened, switched to or closed): the
+    /// keyboard follows it on the next frame. Left on a tab that's no longer
+    /// shown, keys would reach nothing, not even app shortcuts like Reopen.
+    refocus: bool,
     hovered_tab: Option<EntityId>,
     /// The tab strip's scroll position, and the tab last scrolled into view.
     tab_scroll: ScrollHandle,
@@ -478,6 +481,9 @@ struct Enso {
     /// Counts document switches, to tell which documents were viewed last.
     view_clock: u64,
     warmed_doc: Option<EntityId>,
+    /// The active file the sidebar last followed: switching to another one
+    /// (a tab, the palette, a link) selects and reveals its row.
+    followed_path: Option<PathBuf>,
     /// The workspace session last saved from this window, and whether the
     /// saved one is still being reopened (and must not be overwritten yet).
     saved_session: Option<(PathBuf, session::Session)>,
@@ -596,12 +602,13 @@ impl Enso {
             closing: None,
             sidebar_open: true,
             sidebar_width: px(248.),
-            focus_after_close: false,
+            refocus: false,
             hovered_tab: None,
             tab_scroll: ScrollHandle::new(),
             scrolled_to_tab: None,
             view_clock: 0,
             warmed_doc: None,
+            followed_path: None,
             saved_session: None,
             restoring_session: false,
             _disk_watch: Self::watch_disk(window, cx),
@@ -1030,6 +1037,7 @@ impl Enso {
             .position(|d| path.is_some() && d.path == path)
         {
             self.active = Some(index);
+            self.refocus = true;
             cx.notify();
             return;
         }
@@ -1214,6 +1222,7 @@ impl Enso {
             _subscriptions: vec![subscription, cursor_subscription, preview_subscription],
         });
         self.active = Some(self.documents.len() - 1);
+        self.refocus = true;
         if let Some(path) = self.documents.last().and_then(|d| d.path.clone()) {
             self.reveal_in_tree(&path, cx);
             if lock::is_locked(&path, cx) {
@@ -1236,6 +1245,7 @@ impl Enso {
             .position(|d| d.path.as_ref() == Some(&path))
         {
             self.active = Some(index);
+            self.refocus = true;
             cx.notify();
             return;
         }
@@ -1277,6 +1287,7 @@ impl Enso {
     ) {
         if let Some(index) = self.documents.iter().position(|d| d.path.as_ref() == Some(&path)) {
             self.active = Some(index);
+            self.refocus = true;
             self.pending_jump = Some((self.documents[index].editor.entity_id(), offset, 120));
             cx.notify();
             return;
@@ -2036,10 +2047,6 @@ impl Enso {
             .filter(|path| path != root && path.starts_with(root) && path.exists())
     }
 
-    /// Move a file or folder to the Trash (Recycle Bin on Windows), without
-    /// asking: it can be restored from there. Only an item that can't be
-    /// recycled is ever deleted outright, and then the system asks first
-    /// (Windows) or the move fails and nothing is deleted (macOS, Linux).
     /// Delete from the sidebar or the palette: to the Trash, after a system
     /// prompt unless Settings › Confirm Before Deleting is off.
     fn delete_entry(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
@@ -2072,6 +2079,10 @@ impl Enso {
         .detach();
     }
 
+    /// Move a file or folder to the Trash (Recycle Bin on Windows). Only an
+    /// item that can't be recycled is ever deleted outright, and then the
+    /// system asks first (Windows) or the move fails and nothing is deleted
+    /// (macOS, Linux).
     fn trash_entry(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         let name = path
             .file_name()
@@ -2377,7 +2388,7 @@ impl Enso {
             Some(active) if active == index => Some(index.min(self.documents.len() - 1)),
             other => other,
         };
-        self.focus_after_close = true;
+        self.refocus = true;
         cx.notify();
     }
 
@@ -2582,8 +2593,8 @@ impl Enso {
 impl Render for Enso {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.save_session(cx);
-        if self.focus_after_close {
-            self.focus_after_close = false;
+        if self.refocus {
+            self.refocus = false;
             let focus = self
                 .active
                 .filter(|index| self.mode != Mode::Read || !self.documents[*index].markdown)
@@ -2609,6 +2620,13 @@ impl Render for Enso {
         let sidebar_width = self.sidebar_width;
 
         let active_path = self.active.and_then(|i| self.documents[i].path.clone());
+        if active_path != self.followed_path {
+            self.followed_path = active_path.clone();
+            if let Some(path) = &active_path {
+                self.selected = Some(path.clone());
+                self.reveal_in_tree(path, cx);
+            }
+        }
         let markdown = self.active.is_none_or(|i| self.documents[i].markdown);
         let mode = if markdown { self.mode } else { Mode::Edit };
         let active_doc = self.active.map(|i| self.documents[i].editor.entity_id());
@@ -4558,6 +4576,59 @@ mod transition_tests {
     }
 
     #[gpui_kit::test]
+    fn quick_reopens_bring_back_every_closed_tab(cx: &mut TestAppContext) {
+        cx.update(|cx| { gpui_kit::init(cx); bind_view_keys(cx); });
+        let root = std::env::temp_dir().join(format!("enso-reopen-quick-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let paths: Vec<_> = ["a.md", "b.md", "c.md", "d.md", "e.md"].iter().map(|name| root.join(name)).collect();
+        for path in &paths { std::fs::write(path, "text").unwrap(); }
+        let (handle, view) = cx.update(|cx| gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+            cx.new(|cx| {
+                let mut app = Enso::new(window, cx);
+                app.open_folder(root.clone(), cx);
+                app
+            })
+        }).unwrap());
+        cx.run_until_parked();
+        for path in &paths {
+            let path = path.clone();
+            cx.update_window(handle, |_, window, cx| {
+                view.update(cx, |app, cx| app.open_path(path, window, cx))
+            }).unwrap();
+            cx.run_until_parked();
+            draw(cx, handle);
+        }
+        for _ in 0..4 {
+            cx.simulate_keystrokes(handle, "ctrl-w");
+            cx.run_until_parked();
+            draw(cx, handle);
+        }
+        assert_eq!(cx.update(|cx| view.read(cx).documents.len()), 1);
+        // Typing in the tab that's left, then a press per closed tab: each
+        // reopened tab takes the keyboard, so the next press still lands.
+        cx.update_window(handle, |_, window, cx| {
+            view.update(cx, |app, _| app.mode = Mode::Split);
+            let editor = view.read(cx).documents[0].editor.clone();
+            editor.focus_handle(cx).focus(window, cx);
+        }).unwrap();
+        draw(cx, handle);
+        let key = if cfg!(target_os = "macos") { "cmd-shift-t" } else { "ctrl-shift-t" };
+        for _ in 0..4 {
+            cx.simulate_keystrokes(handle, key);
+            cx.run_until_parked();
+            draw(cx, handle);
+        }
+        cx.update(|cx| {
+            let app = view.read(cx);
+            let mut open: Vec<_> = app.documents.iter().filter_map(|d| d.path.clone()).collect();
+            open.sort();
+            assert_eq!(open, paths);
+        });
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[gpui_kit::test]
     fn reopen_brings_back_every_closed_tab_in_turn(cx: &mut TestAppContext) {
         cx.update(|cx| { gpui_kit::init(cx); bind_view_keys(cx); });
         let root = std::env::temp_dir().join(format!("enso-reopen-all-{}", std::process::id()));
@@ -4758,6 +4829,47 @@ mod transition_tests {
             assert!(!app.expanded.contains(&root.join("open")));
         });
         draw(cx, handle);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn the_sidebar_selects_the_file_switched_to(cx: &mut TestAppContext) {
+        cx.update(|cx| { gpui_kit::init(cx); bind_view_keys(cx); });
+        let root = std::env::temp_dir().join(format!("enso-follow-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("deep")).unwrap();
+        std::fs::write(root.join("one.md"), "one").unwrap();
+        std::fs::write(root.join("deep/two.md"), "two").unwrap();
+        let (handle, view) = cx.update(|cx| gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+            cx.new(|cx| {
+                let mut app = Enso::new(window, cx);
+                app.open_folder(root.clone(), cx);
+                app.add_document(Some(root.join("deep/two.md")), "two".into(), None, window, cx);
+                app.add_document(Some(root.join("one.md")), "one".into(), None, window, cx);
+                app
+            })
+        }).unwrap());
+        cx.run_until_parked();
+        draw(cx, handle);
+        // Clicked in the sidebar, then the folder collapsed.
+        cx.update(|cx| view.update(cx, |app, _| {
+            app.selected = Some(root.join("one.md"));
+            app.expanded.remove(&root.join("deep"));
+        }));
+        // Switching from the palette (an open tab): its row is selected and shown.
+        let _ = handle.update(cx, |_, window, cx| {
+            view.update(cx, |app, cx| app.open_path(root.join("deep/two.md"), window, cx))
+        });
+        draw(cx, handle);
+        cx.update(|cx| {
+            let app = view.read(cx);
+            assert_eq!(app.selected.as_ref(), Some(&root.join("deep/two.md")));
+            assert!(app.expanded.contains(&root.join("deep")));
+        });
+        // A folder clicked while the tab stays the same keeps the selection.
+        cx.update(|cx| view.update(cx, |app, _| app.selected = Some(root.join("deep"))));
+        draw(cx, handle);
+        cx.update(|cx| assert_eq!(view.read(cx).selected.as_ref(), Some(&root.join("deep"))));
         std::fs::remove_dir_all(root).unwrap();
     }
 
