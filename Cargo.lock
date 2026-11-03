@@ -1487,15 +1487,18 @@ dependencies = [
  "gpui-pre",
  "image",
  "krilla",
+ "libloading",
  "markdown",
  "memmap2",
  "objc2 0.6.5",
  "objc2-app-kit 0.3.2",
  "objc2-foundation 0.3.2",
+ "ropey",
  "rustybuzz",
  "trash",
  "unicode-linebreak",
  "url",
+ "windows 0.62.2",
  "windows-sys 0.61.2",
 ]
 

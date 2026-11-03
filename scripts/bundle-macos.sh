@@ -20,6 +20,7 @@ rm -rf "$bundle"
 mkdir -p "$bundle/Contents/MacOS" "$bundle/Contents/Resources"
 cp "target/$profile/enso" "$bundle/Contents/MacOS/enso"
 cp assets/enso.icns "$bundle/Contents/Resources/enso.icns"
+cp assets/font-licenses.txt "$bundle/Contents/Resources/font-licenses.txt"
 cat > "$bundle/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">

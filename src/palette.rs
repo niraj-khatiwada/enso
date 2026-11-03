@@ -184,6 +184,7 @@ impl Choice {
             Self::OpenWorkspace => Box::new(OpenFolder),
             Self::Settings => Box::new(OpenSettings),
             Self::Mode(Mode::Split) => Box::new(ToggleSplit),
+            Self::Swap => Box::new(SwapSplitSides),
             Self::SearchEverything => Box::new(SearchEverything),
             Self::Export => Box::new(ExportNote),
             Self::CopyRichText => Box::new(CopyRichText),

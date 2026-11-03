@@ -92,6 +92,7 @@ pub struct PdfLayout {
     pub paper: Paper,
     pub landscape: bool,
     pub images: bool,
+    pub font: crate::typography::ReadingFont,
 }
 
 const MARGIN_X: f32 = 62.;
@@ -107,8 +108,8 @@ pub fn pdf(source: &str, base: Option<&Path>, title: &str, settings: PdfLayout) 
     let mut headings: Vec<(u8, String, usize, f32)> = Vec::new();
     let total = pages.len();
     for (index, page_items) in pages.iter().enumerate() {
-        let settings = PageSettings::from_wh(width, height).ok_or("Invalid page size")?;
-        let mut page = document.start_page_with(settings);
+        let page_settings = PageSettings::from_wh(width, height).ok_or("Invalid page size")?;
+        let mut page = document.start_page_with(page_settings);
         let mut links = Vec::new();
         let mut surface = page.surface();
         for (y, item) in page_items {
@@ -119,7 +120,7 @@ pub fn pdf(source: &str, base: Option<&Path>, title: &str, settings: PdfLayout) 
             }
         }
         if total > 1 {
-            page_number(&mut surface, index + 1, width, height);
+            page_number(&mut surface, index + 1, width, height, settings.font);
         }
         surface.finish();
         for (rect, url) in links {
@@ -148,7 +149,7 @@ fn typeset(source: &str, base: Option<&Path>, settings: PdfLayout) -> Result<Vec
     options.constructs.math_flow = true;
     options.constructs.math_text = true;
     let tree = markdown::to_mdast(source, &options).map_err(|e| e.to_string())?;
-    let fonts = fonts::Fonts::get()?;
+    let fonts = fonts::Fonts::get(settings.font)?;
     let (width, height) = page_size(settings);
     let content_height = height - MARGIN_TOP - MARGIN_BOTTOM;
     let mut layout = layout::Layout::new(fonts, base, settings.images, content_height);
@@ -432,8 +433,8 @@ fn paint_line(surface: &mut Surface, line: &Line, dx: f32, top: f32, links: &mut
     }
 }
 
-fn page_number(surface: &mut Surface, number: usize, width: f32, height: f32) {
-    let Ok(fonts) = fonts::Fonts::get() else { return };
+fn page_number(surface: &mut Surface, number: usize, width: f32, height: f32, font: crate::typography::ReadingFont) {
+    let Ok(fonts) = fonts::Fonts::get(font) else { return };
     let face = fonts.face(fonts::Variant::default());
     let text = number.to_string();
     let size = 8.5;
@@ -479,7 +480,7 @@ fn outline(headings: &[(u8, String, usize, f32)]) -> Outline {
 mod tests {
     use super::*;
 
-    const LAYOUT: PdfLayout = PdfLayout { paper: Paper::A4, landscape: false, images: true };
+    const LAYOUT: PdfLayout = PdfLayout { paper: Paper::A4, landscape: false, images: true, font: crate::typography::ReadingFont::Default };
 
     #[test]
     fn the_features_sample_becomes_a_pdf() {
@@ -550,9 +551,22 @@ mod tests {
 
     #[test]
     fn landscape_letter_pages() {
-        let settings = PdfLayout { paper: Paper::Letter, landscape: true, images: true };
+        let settings = PdfLayout { paper: Paper::Letter, landscape: true, ..LAYOUT };
         assert_eq!(page_size(settings), (792., 612.));
         assert!(pdf("x", None, "t", settings).unwrap().starts_with(b"%PDF"));
+    }
+
+    #[test]
+    fn selected_bundled_fonts_are_embedded_in_the_pdf() {
+        use crate::typography::ReadingFont;
+        for (font, name) in [(ReadingFont::Inter, "Inter"), (ReadingFont::Lora, "Lora"),
+            (ReadingFont::Mono, "JetBrainsMono"), (ReadingFont::Poppins, "Poppins"),
+            (ReadingFont::FiraCode, "FiraCode")] {
+            let bytes = pdf("# Heading\n\nRegular **bold** *italic* ***both***.", None, "Fonts", PdfLayout { font, ..LAYOUT }).unwrap();
+            let contents = String::from_utf8_lossy(&bytes);
+            assert!(contents.contains(name), "selected {name} font must be embedded");
+            assert!(contents.contains("/FontFile2") || contents.contains("/FontFile3"), "PDF must contain font data");
+        }
     }
 
     const SAMPLE: &str = r##"# Heading 1

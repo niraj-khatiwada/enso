@@ -65,6 +65,7 @@ jobs:
           New-Item -ItemType Directory $dir | Out-Null
           Copy-Item target/release/enso.exe "$dir/enso.exe"
           Copy-Item README.md $dir
+          Copy-Item assets/font-licenses.txt $dir
           Compress-Archive -Path $dir -DestinationPath "$dir.zip"
       - uses: actions/upload-artifact@v4
         with:
@@ -106,6 +107,7 @@ jobs:
           dir="enso-$version-linux-${{ matrix.arch }}"
           mkdir -p "$dir/assets" "$dir/scripts"
           cp target/release/enso "$dir/enso"
+          cp assets/font-licenses.txt "$dir/font-licenses.txt"
           cp -R assets/linux "$dir/assets/"
           cp scripts/install-linux.sh "$dir/scripts/"
           cat > "$dir/install.sh" <<'EOF'

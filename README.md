@@ -51,10 +51,14 @@ The macOS app is ad-hoc signed, not notarized, so Gatekeeper asks on first open.
 
 ## Reading controls
 
+- **Settings → Appearance → Font Style** offers the current default, Inter, Lora, JetBrains Mono, Poppins and Fira Code. The fonts are bundled for offline use. The document’s **⋯** menu also offers these fonts and a small-to-large size slider with a live preview and Reset. Reading preferences apply to every file/window and are remembered; application controls and the source editor keep their own typography.
+- **Export → Font Style** starts with your reading font and lets you choose a different font for PDF or HTML without changing the reader. PDF embeds the selected font. HTML exports as `Note Name/index.html`, with styles in `public/style.css`, local images in `public/images/`, and the selected bundled fonts and license in `public/fonts/`. Open `index.html` or share the whole folder. Choose a new folder name if one already exists; existing folders are preserved.
 - Hover an image to drag its side handles and resize it while keeping its aspect ratio. The hover toolbar offers left (default), center, and right alignment. Its Edit button opens alt text and image replacement controls; replacements are copied into `.assets/images`.
 - Click **Edit table** below a table to edit its cells. Tab and Shift+Tab move between cells; hover a cell and click its three-dot menu to add or remove rows and columns. Apply saves one Markdown edit; Cancel leaves the source unchanged.
 - Click task checkboxes in Read or Split view to check or uncheck them without changing views.
 - The slim outline rail sits to the left of the document. Marks near the pointer widen smoothly, a nearby card previews the section, and clicking jumps there. Heading indexing runs in the background. **Settings → Editor → Document Outline** toggles the rail; it is enabled by default.
+
+**Settings → Editor → Spell Check** is enabled by default. Misspellings in Markdown prose have a wavy underline; right-click for spelling suggestions. Checks run locally after a typing pause, using macOS’s spelling service or the Windows Spell Checking API. Linux uses Enchant 2 and an installed dictionary (for example, `libenchant-2-2` and `hunspell-en-us` on Debian/Ubuntu). Code and link destinations are excluded. Spell check is automatically disabled for files of 2.5 MiB or larger, without changing the global setting. No document text is sent to a web service.
 
 ## Command palette
 
@@ -84,6 +88,7 @@ Type `/` on an empty Markdown line in Edit or Split to open the Insert menu besi
 | ⌘⇧T / Ctrl⇧T | Reopen the last closed tab; repeat for earlier tabs |
 | ⌘E | Switch between Read and Edit |
 | ⌘\\ | Split view |
+| ⌘⇧\\ | Swap editor and reader in Split view |
 | ⌘, | Settings |
 | ⌘Q | Quit |
 

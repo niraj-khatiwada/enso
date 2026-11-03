@@ -1,5 +1,4 @@
-//! A note as HTML: a page with its images in a folder beside it (as browsers
-//! save pages), and the bare body that Copy as Rich Text puts on the
+//! A portable HTML folder (index.html and public assets), and the bare body that Copy as Rich Text puts on the
 //! clipboard with its images inline.
 
 use base64::Engine as _;
@@ -37,26 +36,56 @@ pub fn body(source: &str, base: Option<&Path>, images: &mut Images) -> String {
     rewrite_images(&marks(&html), base, images)
 }
 
-/// Write the note as `target` (an .html file). With `with_images`, its local
-/// images are copied into a `<name>_files` folder beside it; without, the
-/// page has no images.
+/// Write a new export folder. Refuse an existing target rather than replacing
+/// an unrelated directory; remove only our new folder if an asset write fails.
 pub fn export(
     source: &str,
     base: Option<&Path>,
     title: &str,
     target: &Path,
     with_images: bool,
+    font: crate::typography::ReadingFont,
 ) -> io::Result<()> {
-    let stem = target.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-    let name = format!("{stem}_files");
-    let folder = target.with_file_name(&name);
-    let mut images = if with_images {
-        Images::Folder { folder, link: encode(&name), copied: HashMap::new() }
-    } else {
-        Images::None
-    };
-    let page = document(&body(source, base, &mut images), title);
-    std::fs::write(target, page)
+    std::fs::create_dir(target)?;
+    let result = (|| {
+        let public = target.join("public");
+        std::fs::create_dir(&public)?;
+        let mut images = if with_images {
+            Images::Folder { folder: public.join("images"), link: "public/images".into(), copied: HashMap::new() }
+        } else { Images::None };
+        let assets = font.assets();
+        let mut style = String::new();
+        if !assets.is_empty() {
+            std::fs::create_dir(public.join("fonts"))?;
+            for asset in assets {
+                std::fs::write(public.join("fonts").join(&asset.file_name), asset.data)?;
+                style.push_str(&format!(
+                    "@font-face {{ font-family: \"{}\"; src: url(\"fonts/{}\") format(\"truetype\"); font-weight: {}; font-style: {}; }}\n",
+                    font.name(), asset.file_name, if asset.bold { 700 } else { 400 }, if asset.italic { "italic" } else { "normal" }));
+            }
+            std::fs::write(public.join("fonts/OFL.txt"), font.license())?;
+        }
+        style.push_str(STYLE);
+        if font != crate::typography::ReadingFont::Default {
+            style.push_str(&format!("\nbody {{ font-family: \"{}\", {}; }}\n", font.name(), match font {
+                crate::typography::ReadingFont::Lora => "serif",
+                crate::typography::ReadingFont::Mono | crate::typography::ReadingFont::FiraCode => "monospace",
+                _ => "sans-serif",
+            }));
+        }
+        std::fs::write(public.join("style.css"), style)?;
+        let page = document(&body(source, base, &mut images), title);
+        std::fs::write(target.join("index.html"), page)
+    })();
+    if result.is_err() { let _ = std::fs::remove_dir_all(target); }
+    result
+}
+
+/// Save dialogs may still supply a .html suffix. The exported folder has none.
+pub fn export_folder(target: &Path) -> PathBuf {
+    if target.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("html") || ext.eq_ignore_ascii_case("htm")) {
+        target.with_extension("")
+    } else { target.to_owned() }
 }
 
 /// The note's Markdown without its images (`![…](…)` and `<img>`), for the
@@ -114,7 +143,7 @@ pub fn document(body: &str, title: &str) -> String {
     format!(
         "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n\
          <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n\
-         <meta name=\"generator\" content=\"enso\">\n<title>{}</title>\n<style>\n{STYLE}</style>\n\
+         <meta name=\"generator\" content=\"enso\">\n<title>{}</title>\n<link rel=\"stylesheet\" href=\"public/style.css\">\n\
          </head>\n<body>\n<article>\n{body}</article>\n</body>\n</html>\n",
         escape(title)
     )
@@ -364,22 +393,32 @@ mod tests {
     use super::*;
 
     #[test]
-    fn exports_put_images_in_a_folder_beside_the_page() {
+    fn exports_put_page_images_and_fonts_in_one_portable_folder() {
         let dir = std::env::temp_dir().join(format!("enso-html-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join(".assets/images")).unwrap();
         image::RgbImage::new(2, 2).save(dir.join(".assets/images/dot.png")).unwrap();
         let source = "# Title\n\n- [x] done\n\n<mark color=\"#ff000059\">red</mark> and <img src=\".assets/images/dot.png\" width=\"50%\" />\n\n![again](.assets/images/dot.png)\n\n![web](https://example.com/a.png)\n";
-        let target = dir.join("My Note.html");
-        export(source, Some(&dir), "Tom & Jerry", &target, true).unwrap();
-        let html = std::fs::read_to_string(&target).unwrap();
+        let target = dir.join("My Note");
+        export(source, Some(&dir), "Tom & Jerry", &target, true, crate::typography::ReadingFont::Poppins).unwrap();
+        let html = std::fs::read_to_string(target.join("index.html")).unwrap();
         assert!(html.contains("<title>Tom &amp; Jerry</title>"));
         assert!(html.contains("<h1>Title</h1>"));
         assert!(html.contains("type=\"checkbox\""));
         assert!(html.contains("<mark style=\"background-color: #ff000059\">red</mark>"));
         // Each image is copied once and linked relative to the page.
-        assert_eq!(html.matches("src=\"My%20Note_files/dot.png\"").count(), 2, "{html}");
-        assert!(dir.join("My Note_files/dot.png").is_file());
+        assert_eq!(html.matches("src=\"public/images/dot.png\"").count(), 2, "{html}");
+        assert!(target.join("public/images/dot.png").is_file());
+        assert!(html.contains("href=\"public/style.css\""));
+        let css = std::fs::read_to_string(target.join("public/style.css")).unwrap();
+        assert!(css.contains("font-family: \"Poppins\""));
+        assert!(css.contains("url(\"fonts/Poppins-Regular.ttf\")"));
+        assert!(css.contains("font-style: italic"));
+        for asset in crate::typography::ReadingFont::Poppins.assets() {
+            assert_eq!(std::fs::read(target.join("public/fonts").join(asset.file_name)).unwrap(), asset.data);
+        }
+        assert!(target.join("public/fonts/OFL.txt").is_file());
+        assert!(!dir.join("My Note.html").exists());
         assert!(html.contains("width=\"50%\""));
         // Web images stay links; nothing is downloaded.
         assert!(html.contains("src=\"https://example.com/a.png\""));
@@ -419,10 +458,13 @@ mod tests {
     }
 
     #[test]
-    fn notes_without_local_images_make_no_folder() {
+    fn notes_without_local_images_still_export_index_and_public_styles() {
         let dir = std::env::temp_dir().join(format!("enso-html-plain-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        export("plain *text*", None, "t", &dir.join("n.html"), true).unwrap();
+        export("plain *text*", None, "t", &dir.join("n"), true, crate::typography::ReadingFont::Default).unwrap();
+        assert!(dir.join("n/index.html").is_file());
+        assert!(dir.join("n/public/style.css").is_file());
+        assert!(!dir.join("n/public/images").exists());
         assert!(!dir.join("n_files").exists());
         std::fs::remove_dir_all(dir).unwrap();
     }

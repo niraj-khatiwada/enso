@@ -1,5 +1,4 @@
-//! Exporting a note: PDF (typeset by Typst), HTML (a page with an images
-//! folder beside it), and rich text on the clipboard.
+//! Exporting a note: native PDF, portable HTML folders, and rich text.
 
 pub mod html;
 pub mod pdf;
@@ -47,6 +46,7 @@ impl Format {
 pub struct ExportDialog {
     pub(crate) choice: ExportChoice,
     focus: FocusHandle,
+    font_picker: Entity<typography::FontPicker>,
 }
 
 /// What the Export dialog offers, remembered between exports.
@@ -56,11 +56,12 @@ pub struct ExportChoice {
     pub images: bool,
     pub paper: pdf::Paper,
     pub landscape: bool,
+    pub font: typography::ReadingFont,
 }
 
 impl Default for ExportChoice {
     fn default() -> Self {
-        Self { format: Format::Pdf, images: true, paper: pdf::Paper::local(), landscape: false }
+        Self { format: Format::Pdf, images: true, paper: pdf::Paper::local(), landscape: false, font: typography::ReadingFont::Default }
     }
 }
 
@@ -98,7 +99,9 @@ impl Enso {
         let focus = cx.focus_handle();
         focus.focus(window, cx);
         self.closing_export = None;
-        self.export_dialog = Some(ExportDialog { choice: self.export_choice, focus });
+        let choice = ExportChoice { font: typography::current(cx).font, ..self.export_choice };
+        let font_picker = cx.new(|cx| typography::FontPicker::for_export(choice.font, window, cx));
+        self.export_dialog = Some(ExportDialog { choice, focus, font_picker });
         cx.notify();
     }
 
@@ -115,7 +118,7 @@ impl Enso {
         let Some(dialog) = self.export_dialog.as_ref() else {
             return;
         };
-        let choice = dialog.choice;
+        let choice = ExportChoice { font: dialog.font_picker.read(cx).selected_font(cx), ..dialog.choice };
         self.export_choice = choice;
         self.close_export(window, cx);
         match choice.format {
@@ -136,12 +139,13 @@ impl Enso {
             .clone()
             .or_else(dirs::document_dir)
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-        let name = format!("{title}.{}", format.extension());
+        let name = if format == Format::Html { title.clone() } else { format!("{title}.{}", format.extension()) };
         let receiver = cx.prompt_for_new_path(&folder, Some(&name));
         cx.spawn_in(window, async move |this, cx| {
             let Ok(Ok(Some(target))) = receiver.await else {
                 return;
             };
+            let target = if format == Format::Html { html::export_folder(&target) } else { target };
             let file = target
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
@@ -161,10 +165,10 @@ impl Enso {
                             &source,
                             base.as_deref(),
                             &title,
-                            pdf::PdfLayout { paper: choice.paper, landscape: choice.landscape, images },
+                            pdf::PdfLayout { paper: choice.paper, landscape: choice.landscape, images, font: choice.font },
                         )
                             .and_then(|bytes| std::fs::write(&target, bytes).map_err(|e| e.to_string())),
-                        Format::Html => html::export(&source, base.as_deref(), &title, &target, images)
+                        Format::Html => html::export(&source, base.as_deref(), &title, &target, images, choice.font)
                             .map_err(|e| e.to_string()),
                         Format::RichText => Ok(()),
                     }
@@ -329,7 +333,7 @@ impl Enso {
                     .gap_0p5()
                     .child(div().text_sm().child("Include Images"))
                     .child(div().text_xs().text_color(theme.muted_foreground).child(match dialog.choice.format {
-                        Format::Html => "Copied into a folder beside the page",
+                        Format::Html => "Copied into public/images",
                         Format::RichText => "Included where the app accepts images, like Mail or Docs",
                         Format::Pdf => "Fitted to the page",
                     })),
@@ -368,6 +372,11 @@ impl Enso {
             .when(dialog.choice.format == Format::Pdf, |panel| {
                 panel.child(self.page_options(&dialog.choice, &theme, cx))
             })
+            .when(dialog.choice.format != Format::RichText, |panel| panel.child(
+                h_flex().items_center().justify_between().gap_4()
+                    .child(div().text_sm().child("Font Style"))
+                    .child(div().w(px(216.)).child(dialog.font_picker.clone()))
+            ))
             .child(images)
             .child(actions);
         Some(
@@ -379,7 +388,8 @@ impl Enso {
                 .track_focus(&dialog.focus)
                 .on_action(cx.listener(|this, _: &DismissExport, w, cx| this.close_export(w, cx)))
                 .on_key_down(cx.listener(|this, event: &KeyDownEvent, w, cx| {
-                    if event.keystroke.key == "enter" {
+                    if event.keystroke.key == "enter"
+                        && this.export_dialog.as_ref().is_some_and(|dialog| dialog.focus.is_focused(w)) {
                         this.run_export(w, cx);
                     }
                 }))

@@ -3,6 +3,7 @@
 //! run, and kept for it.
 
 use krilla::text::Font;
+use crate::typography::ReadingFont;
 use std::{ops::Range, sync::OnceLock};
 
 /// A loaded face: what krilla embeds, and what measures text the way krilla
@@ -105,14 +106,22 @@ const FALLBACK: &[&str] = &[
 
 impl Fonts {
     /// The fonts, found on first use.
-    pub fn get() -> Result<&'static Fonts, String> {
-        static FONTS: OnceLock<Result<Fonts, String>> = OnceLock::new();
-        FONTS.get_or_init(Self::load).as_ref().map_err(Clone::clone)
+    pub fn get(font: ReadingFont) -> Result<&'static Fonts, String> {
+        static FONTS: [OnceLock<Result<Fonts, String>>; ReadingFont::ALL.len()] = [const { OnceLock::new() }; ReadingFont::ALL.len()];
+        FONTS[font as usize].get_or_init(|| Self::load(font)).as_ref().map_err(Clone::clone)
     }
 
-    fn load() -> Result<Self, String> {
-        let mut db = fontdb::Database::new();
-        db.load_system_fonts();
+    fn load(font: ReadingFont) -> Result<Self, String> {
+        static DATABASE: OnceLock<fontdb::Database> = OnceLock::new();
+        let db = DATABASE.get_or_init(|| {
+            let mut db = fontdb::Database::new();
+            db.load_system_fonts();
+            // Bundled fallbacks also make PDF export work on minimal systems.
+            for family in ReadingFont::ALL {
+                for asset in family.assets() { db.load_font_data(asset.data.to_vec()); }
+            }
+            db
+        }).clone();
         let face = |names: &[&str], generic: fontdb::Family<'static>, bold: bool, italic: bool| {
             let families: Vec<fontdb::Family> = names
                 .iter()
@@ -128,12 +137,20 @@ impl Fonts {
             load(&db, id)
         };
         let missing = || "No usable fonts were found on this system.".to_string();
-        let sans = [
-            face(SANS, fontdb::Family::SansSerif, false, false).ok_or_else(missing)?,
-            face(SANS, fontdb::Family::SansSerif, true, false).ok_or_else(missing)?,
-            face(SANS, fontdb::Family::SansSerif, false, true).ok_or_else(missing)?,
-            face(SANS, fontdb::Family::SansSerif, true, true).ok_or_else(missing)?,
-        ];
+        let assets = font.assets();
+        let primary = |bold: bool, italic: bool| {
+            if font == ReadingFont::Default {
+                face(SANS, fontdb::Family::SansSerif, bold, italic)
+            } else {
+                // Use bundled bytes directly, even if another version of the
+                // same family is installed. Fira Code has no italic faces.
+                assets.iter().find(|a| a.bold == bold && a.italic == italic)
+                    .or_else(|| assets.iter().find(|a| a.bold == bold))
+                    .and_then(|a| Face::load(a.data, 0))
+            }
+        };
+        let sans = [primary(false, false).ok_or_else(missing)?, primary(true, false).ok_or_else(missing)?,
+            primary(false, true).ok_or_else(missing)?, primary(true, true).ok_or_else(missing)?];
         let mono = [
             face(MONO, fontdb::Family::Monospace, false, false).ok_or_else(missing)?,
             face(MONO, fontdb::Family::Monospace, true, false).ok_or_else(missing)?,

@@ -12,6 +12,7 @@ chrono = "0.4"
 url = "2"
 gpui-test = { package = "gpui-pre", version = "=0.3.10", features = ["test-support"], optional = true }
 gpui-kit = "0.8.1"
+ropey = "=2.0.0-beta.1"
 # Export: Markdown parsed as the reader parses it, HTML with its images, PDFs
 # laid out by enso itself and written by krilla (text shaped by rustybuzz, in
 # the system's fonts), and HTML on the clipboard for Copy as Rich Text.
@@ -36,16 +37,18 @@ embed-resource = "3"
 trash = "5"
 
 [target.'cfg(target_os = "linux")'.dependencies]
+libloading = "0.8.9"
 # Rich text on the clipboard under Wayland as well as X11.
 arboard = { version = "3.7", default-features = false, features = ["wayland-data-control"] }
 
 [target.'cfg(windows)'.dependencies]
+windows = { version = "0.62.2", features = ["Win32_Globalization", "Win32_System_Com"] }
 windows-sys = { version = "0.61", features = ["Win32_UI_Shell", "Win32_Foundation"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
-objc2-app-kit = { version = "0.3", default-features = false, features = ["NSApplication", "NSImage"] }
-objc2-foundation = { version = "0.3", default-features = false, features = ["NSData"] }
+objc2-app-kit = { version = "0.3", default-features = false, features = ["NSApplication", "NSImage", "NSSpellChecker"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["NSData", "NSString", "NSArray", "NSRange"] }
 
 [profile.dev]
 debug = 0

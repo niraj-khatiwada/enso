@@ -194,7 +194,7 @@ impl Render for LargeReader {
         let base = self.base.clone();
         let controls = self.controls.clone();
         let last = sections.len().saturating_sub(1);
-        let content = list(self.list.clone(), move |index, _, _| {
+        let content = list(self.list.clone(), move |index, _, cx| {
             let section = &sections[index];
             let text = format!(
                 "{}{}{}",
@@ -217,6 +217,7 @@ impl Render for LargeReader {
                 .child(
                     div().w_full().child(
                         TextView::markdown(("section", index), text)
+                            .map(|view| crate::typography::style(view, cx))
                             .map(|view| {
                                 if let Some((owner, editor)) = &controls {
                                     crate::rich::decorate(

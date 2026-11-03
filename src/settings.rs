@@ -38,11 +38,15 @@ impl Appearance {
 
 pub struct Preferences {
     pub appearance: Appearance,
+    pub reading: crate::typography::ReadingStyle,
+    pub(crate) reading_path: Option<PathBuf>,
     /// Show line numbers beside the editor's text.
     pub line_numbers: bool,
     pub document_outline: bool,
+    pub spell_check: bool,
     /// Split view puts the reader on the left and the editor on the right.
     pub reader_first: bool,
+    pub(crate) split_order_path: Option<PathBuf>,
     window: Option<AnyWindowHandle>,
     path: Option<PathBuf>,
 }
@@ -61,6 +65,21 @@ fn document_outline_path() -> Option<PathBuf> {
 }
 fn load_document_outline(path: &Path) -> bool {
     std::fs::read_to_string(path).map_or(true, |value| value.trim() != "off")
+}
+fn spell_check_path() -> Option<PathBuf> {
+    dirs::config_dir().map(|p| crate::files::app_folder(p).join("spell-check"))
+}
+pub fn spell_check(cx: &App) -> bool {
+    cx.try_global::<Preferences>().is_none_or(|p| p.spell_check)
+}
+fn set_spell_check(on: bool, cx: &mut App) -> io::Result<()> {
+    if !cx.has_global::<Preferences>() { init(cx); }
+    cx.update_global::<Preferences, _>(|prefs, _| prefs.spell_check = on);
+    if let Some(path) = spell_check_path() {
+        if let Some(parent) = path.parent() { std::fs::create_dir_all(parent)?; }
+        std::fs::write(path, if on { "on" } else { "off" })?;
+    }
+    Ok(())
 }
 pub fn document_outline(cx: &App) -> bool {
     cx.try_global::<Preferences>().is_none_or(|p| p.document_outline)
@@ -94,7 +113,7 @@ pub fn set_reader_first(on: bool, cx: &mut App) -> io::Result<()> {
         init(cx);
     }
     cx.update_global::<Preferences, _>(|prefs, _| prefs.reader_first = on);
-    if let Some(path) = split_order_path() {
+    if let Some(path) = cx.global::<Preferences>().split_order_path.clone() {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -139,12 +158,21 @@ pub fn init(cx: &mut App) {
     let appearance = path.as_ref().map(|p| load(p)).unwrap_or_default();
     let line_numbers = line_numbers_path().as_deref().is_some_and(load_line_numbers);
     let document_outline = document_outline_path().as_deref().is_none_or(load_document_outline);
-    let reader_first = split_order_path().as_deref().is_some_and(load_reader_first);
+    let spell_check = spell_check_path().as_deref().is_none_or(load_document_outline);
+    let split_order_path = split_order_path();
+    let reader_first = split_order_path.as_deref().is_some_and(load_reader_first);
+    let reading_path = crate::typography::preference_path();
+    let reading = reading_path.as_deref()
+        .map(crate::typography::ReadingStyle::load).unwrap_or_default();
     cx.set_global(Preferences {
         appearance,
+        reading,
+        reading_path,
         line_numbers,
         document_outline,
+        spell_check,
         reader_first,
+        split_order_path,
         window: None,
         path,
     });
@@ -326,6 +354,7 @@ pub fn open(cx: &mut App) {
                     category: Category::Appearance,
                     error: None,
                     _appearance: watch_system(window),
+                    _preferences: cx.observe_global::<Preferences>(|_, cx| cx.notify()),
                 }
             })
         },
@@ -364,6 +393,7 @@ struct SettingsWindow {
     category: Category,
     error: Option<String>,
     _appearance: Subscription,
+    _preferences: Subscription,
 }
 
 fn preview(appearance: Appearance) -> impl IntoElement {
@@ -478,6 +508,30 @@ impl SettingsWindow {
                         ),
                     ),
             )
+            .child({
+                use crate::typography::{ReadingFont, current, set};
+                let reading = current(cx);
+                v_flex().gap_3()
+                    .child(div().text_sm().font_weight(FontWeight::MEDIUM).child("Font Style"))
+                    .child(v_flex().gap_2().children(ReadingFont::ALL.chunks(3).enumerate().map(|(row, fonts)| {
+                        h_flex().gap_2().children(fonts.iter().copied().enumerate().map(|(col, font)| {
+                            let selected = font == reading.font;
+                            Button::new(("reading-font-card", row * 3 + col)).ghost()
+                                .flex_1().min_w_0().h(px(82.)).p_2()
+                                .border_1().border_color(if selected { theme.primary } else { theme.border })
+                                .when(selected, |b| b.bg(theme.secondary))
+                                .accessibility_label(format!("{} reading font", font.name()))
+                                .child(v_flex().gap_1().items_start().w_full()
+                                    .child(div().font_family(font.family(cx)).text_size(px(24.)).child("Aa"))
+                                    .child(div().text_xs().child(font.name())))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.error = set(crate::typography::ReadingStyle { font, ..current(cx) }, true, cx)
+                                        .err().map(|e| format!("Could not save reading font: {e}"));
+                                    cx.notify();
+                                }))
+                        }))
+                    })))
+            })
     }
 
     fn editor_page(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -493,6 +547,22 @@ impl SettingsWindow {
                 "How the writing pane looks while you edit.",
                 theme.muted_foreground,
             ))
+            .child({
+                let weak = cx.entity().downgrade();
+                h_flex().gap_4().items_center().justify_between().py_3()
+                    .border_b_1().border_color(theme.border)
+                    .child(v_flex().gap_0p5()
+                        .child(div().text_sm().font_weight(FontWeight::MEDIUM).child("Spell Check"))
+                        .child(div().text_xs().text_color(theme.muted_foreground).child(
+                            if cfg!(target_os = "linux") { "Underline misspellings using Enchant and your system dictionaries." }
+                            else { "Underline misspellings using your system’s spelling service." })))
+                    .child(Switch::new("spell-check").checked(spell_check(cx))
+                        .accessibility_label("Spell Check")
+                        .on_change(move |on, _, cx| {
+                            let error = set_spell_check(*on, cx).err().map(|e| format!("Could not save spell check: {e}"));
+                            let _ = weak.update(cx, |this, cx| { this.error = error; cx.notify(); });
+                        }))
+            })
             .child(
                 h_flex()
                     .gap_4()
@@ -612,11 +682,14 @@ impl Render for SettingsWindow {
                     )
                     .child(
                         v_flex()
+                            .id("settings-page")
                             .flex_1()
                             .min_w_0()
+                            .h_full()
+                            .overflow_y_scroll()
                             .p_8()
                             .gap_6()
-                            .child(page)
+                            .child(div().flex_shrink_0().child(page))
                             .when_some(self.error.clone(), |page, error| {
                                 page.child(div().text_xs().text_color(theme.danger).child(error))
                             }),

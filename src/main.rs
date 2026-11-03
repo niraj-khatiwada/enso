@@ -11,20 +11,21 @@ mod rich;
 mod search;
 mod session;
 mod settings;
+mod spellcheck;
 mod stats;
+mod typography;
 mod ui;
 mod workspaces;
 
 use gpui_kit::assets::IconName;
 use gpui_kit::base::{ResizeHandleContext, ResizeHandleState, Transition, transition};
-#[cfg(all(test, feature = "ui-tests"))]
 extern crate gpui_kit as gpui;
 use gpui_kit::component::{
     ActiveTheme, Disableable, Icon, Sizable, TitleBar,
     button::{Button, ButtonVariants},
     h_flex,
     input::{Editor, EditorState, Input, InputEvent, InputState},
-    menu::{ContextMenuExt, DropdownMenu, PopupMenuItem},
+    menu::{ContextMenuExt, PopupMenuItem},
     tooltip::Tooltip,
     popover::Popover,
     resizable::{
@@ -53,6 +54,7 @@ actions!(
         Save,
         ToggleView,
         ToggleSplit,
+        SwapSplitSides,
         NewFolder,
         RenameSelected,
         DeleteSelected,
@@ -121,6 +123,7 @@ struct Document {
     large_reader: Option<Entity<reader::LargeReader>>,
     stats: String,
     _stats_task: Option<Task<()>>,
+    spellcheck: Option<Entity<spellcheck::Spellcheck>>,
     last_reader_cursor: Option<usize>,
     last_preview_text: Option<RenderedText>,
     _preview_task: Option<Task<()>>,
@@ -495,6 +498,10 @@ impl Enso {
                 for doc in &this.documents {
                     doc.editor
                         .update(cx, |editor, cx| editor.set_line_number(on, window, cx));
+                    doc.preview.update(cx, |preview, cx| preview.invalidate_inline_layout(cx));
+                    if let Some(reader) = &doc.large_reader {
+                        reader.update(cx, |reader, cx| reader.refresh_layout(cx));
+                    }
                 }
                 if !settings::document_outline(cx) { this.outline_hover = None; }
                 // The split view's side order is a preference too.
@@ -1047,6 +1054,7 @@ impl Enso {
                 this.reveal_editor_cursor(index, cx);
             }
         });
+        let spellcheck = markdown.then(|| cx.new(|cx| spellcheck::Spellcheck::new(&editor, source.len(), cx)));
         self.documents.push(Document {
             path,
             saved: source,
@@ -1055,6 +1063,7 @@ impl Enso {
             large_reader,
             stats,
             _stats_task: None,
+            spellcheck,
             last_reader_cursor: None,
             last_preview_text: None,
             _preview_task: None,
@@ -2112,6 +2121,17 @@ impl Enso {
         cx.notify();
     }
 
+    /// Insertion boundary under the pointer, including gaps and trailing space.
+    /// ScrollHandle stores item bounds before its scroll offset is applied.
+    fn tab_insertion_slot(&self, x: Pixels) -> usize {
+        let offset = self.tab_scroll.offset().x;
+        (0..self.documents.len())
+            .find(|&i| self.tab_scroll.bounds_for_item(i).is_some_and(|bounds| {
+                x < bounds.center().x + offset
+            }))
+            .unwrap_or(self.documents.len())
+    }
+
     fn remove_document(&mut self, index: usize, cx: &mut Context<Self>) {
         if self.hovered_tab == Some(self.documents[index].editor.entity_id()) {
             self.hovered_tab = None;
@@ -2406,7 +2426,22 @@ impl Render for Enso {
             .items_center()
             .flex_1()
             .min_w_0()
-            .overflow_x_scroll();
+            .overflow_x_scroll()
+            .on_drag_move(cx.listener(|this, event: &DragMoveEvent<DraggedTab>, _, cx| {
+                let slot = event.bounds.contains(&event.event.position)
+                    .then(|| this.tab_insertion_slot(event.event.position.x));
+                if this.tab_drop != slot {
+                    this.tab_drop = slot;
+                    cx.notify();
+                }
+            }))
+            .on_drop(cx.listener(|this, tab: &DraggedTab, window, cx| {
+                let slot = this.tab_insertion_slot(window.mouse_position().x);
+                // Removing the source shifts every later insertion boundary left.
+                let to = if slot > tab.from { slot - 1 } else { slot };
+                this.tab_drop = None;
+                this.move_tab(tab.from, to, cx);
+            }));
         for (i, document) in self.documents.iter().enumerate() {
             let editor_id = document.editor.entity_id();
             let hovered = self.hovered_tab == Some(editor_id);
@@ -2429,6 +2464,7 @@ impl Render for Enso {
             }).child(
                 h_flex()
                     .id(("file-tab", editor_id))
+                    .debug_selector(move || format!("file-tab-{i}"))
                     .flex_shrink_0()
                     .h(px(28.))
                     .pl_2p5()
@@ -2451,8 +2487,8 @@ impl Render for Enso {
                             cx.notify();
                         }
                     }))
-                    // Drag a tab onto another to take its place: a line grows in
-                    // the gap it would land in, and the dragged tab fades.
+                    // The whole strip handles drops, including between pills.
+                    // Each tab only starts the drag and draws its insertion line.
                     .relative()
                     .on_drag(DraggedTab { from: i, title: document.title().into() }, {
                         let weak = cx.entity().downgrade();
@@ -2461,22 +2497,14 @@ impl Render for Enso {
                             cx.new(|_| tab.clone())
                         }
                     })
-                    .on_drag_move(cx.listener(move |this, event: &DragMoveEvent<DraggedTab>, _, cx| {
-                        if event.bounds.contains(&event.event.position) && this.tab_drop != Some(i) {
-                            this.tab_drop = Some(i);
-                            cx.notify();
-                        }
-                    }))
-                    .on_drop(cx.listener(move |this, tab: &DraggedTab, _, cx| {
-                        this.tab_drop = None;
-                        this.move_tab(tab.from, i, cx);
-                    }))
                     .when(self.dragging_tab == Some(i), |tab| tab.opacity(0.4))
                     .child({
-                        // Moving right lands after this tab, moving left before it.
-                        let from = self.dragging_tab;
-                        let shown = self.tab_drop == Some(i) && from.is_some_and(|f| f != i);
-                        let after = from.is_some_and(|f| f < i);
+                        let slot = self.tab_drop;
+                        let after = slot == Some(self.documents.len());
+                        let shown = (slot == Some(i) || (after && i + 1 == self.documents.len()))
+                            && self.dragging_tab.is_some_and(|from| {
+                                slot != Some(from) && slot != Some(from + 1)
+                            });
                         div()
                             .absolute()
                             .top_0()
@@ -3200,6 +3228,13 @@ impl Render for Enso {
                                 .size_full()
                                 .font_family(theme.mono_font_family.clone())
                                 .text_sm()
+                                .when(document.markdown, |editor_view| {
+                                    let editor = document.editor.clone();
+                                    let checker = document.spellcheck.clone();
+                                    editor_view.context_menu(move |menu, _, cx| {
+                                        spellcheck::context_menu(menu, &editor, checker.as_ref(), cx)
+                                    })
+                                })
                                 .on_paste({
                                     let weak = cx.entity().downgrade();
                                     let editor = document.editor.clone();
@@ -3274,6 +3309,7 @@ impl Render for Enso {
                                     // where the editor's does (Read and Edit swap in
                                     // place) and stops short of the overlaid bar.
                                     rich::decorate(TextView::new(&document.preview), cx.entity().downgrade(), document.editor.entity_id(), base.clone(), 0, 0)
+                                        .map(|view| typography::style(view, cx))
                                         .selectable(true)
                                         .scrollable(true)
                                         .size_full()
@@ -3429,22 +3465,44 @@ impl Render for Enso {
                             }))
                     }),
                 )
-                // More document actions; for now, exporting.
+                // Reading preferences are global, with live size preview.
                 .child({
                     let weak = cx.entity().downgrade();
-                    ui::icon_button("document-menu", IconName::Ellipsis, "More")
-                        .small()
-                        .disabled(!markdown || self.active.is_none())
-                        .dropdown_menu(move |menu, _, _| {
+                    div().debug_selector(|| "document-menu-trigger".into()).child(Popover::new("document-menu")
+                        .overlay_closable(false)
+                        .trigger(ui::icon_button("document-menu-button", IconName::Ellipsis, "More")
+                            .small().disabled(!markdown || self.active.is_none()))
+                        .content(move |_, window, cx| {
+                            let controls = window.use_keyed_state("document-reading-controls", cx, |window, cx| {
+                                typography::ReadingControls::new(window, cx)
+                            });
                             let weak = weak.clone();
-                            menu.item(
-                                PopupMenuItem::new("Export…")
-                                    .icon(IconName::Share)
+                            let popover = cx.entity().downgrade();
+                            let theme = cx.theme().clone();
+                            let dismiss_controls = controls.clone();
+                            let dismiss_popover = popover.clone();
+                            v_flex().debug_selector(|| "document-menu-panel".into()).w(px(240.))
+                                // Select's popup can extend beyond this surface.
+                                // Wait for its outside-click handling before
+                                // deciding whether the parent should close.
+                                .on_mouse_down_out(move |_, window, cx| {
+                                    let controls = dismiss_controls.clone();
+                                    let popover = dismiss_popover.clone();
+                                    window.defer(cx, move |window, cx| {
+                                        if !controls.read(cx).font_dropdown_has_focus(window, cx) {
+                                            let _ = popover.update(cx, |state, cx| state.dismiss(window, cx));
+                                        }
+                                    });
+                                })
+                                .child(controls)
+                                .child(div().h(px(1.)).mx_2().bg(theme.border))
+                                .child(Button::new("export-note").ghost().small().m_1().justify_start()
+                                    .icon(IconName::Share).label("Export…")
                                     .on_click(move |_, window, cx| {
+                                        let _ = popover.update(cx, |state, cx| state.dismiss(window, cx));
                                         let _ = weak.update(cx, |this, cx| this.open_export(window, cx));
-                                    }),
-                            )
-                        })
+                                    }))
+                        }))
                 }),
             );
         let (custom_titlebar, standard_header) = if CUSTOM_TITLEBAR {
@@ -3515,6 +3573,7 @@ impl Render for Enso {
             .on_action(cx.listener(|this, _: &OpenCommandPalette, w, cx| this.open_palette(w, cx)))
             .on_action(cx.listener(|this, _: &SearchEverything, w, cx| this.toggle_content_search(w, cx)))
             .on_action(cx.listener(|this, _: &PasteFiles, w, cx| this.paste_files(w, cx)))
+            .on_action(cx.listener(|this, action: &spellcheck::ReplaceSpelling, w, cx| this.replace_spelling(action, w, cx)))
             .on_action(cx.listener(|this, _: &ExportNote, w, cx| this.open_export(w, cx)))
             .on_action(cx.listener(|this, _: &CopyRichText, _, cx| {
                 let images = this.export_choice.images;
@@ -3574,6 +3633,12 @@ impl Render for Enso {
                     Mode::Split
                 };
                 this.set_mode(next, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &SwapSplitSides, _, cx| {
+                if this.mode != Mode::Split { return; }
+                if let Err(error) = settings::set_reader_first(!settings::reader_first(cx), cx) {
+                    this.message(format!("Could not save split order: {error}"), true, cx);
+                }
             }))
             .child(
                 div().flex_1().min_h_0().w_full().child(
@@ -3683,6 +3748,11 @@ fn bind_view_keys(cx: &mut App) {
     // consume Ctrl+E as end-of-line before a parent action can see it.
     for context in ["Enso", "Enso > Input"] {
         cx.bind_keys([
+            KeyBinding::new(if cfg!(target_os = "macos") { "cmd-shift-\\" } else { "ctrl-shift-\\" }, SwapSplitSides, Some(context)),
+            // Shifted punctuation is delivered as `|` on macOS, consuming
+            // Shift. Accept both representations from platform keyboards.
+            KeyBinding::new(if cfg!(target_os = "macos") { "cmd-|" } else { "ctrl-|" }, SwapSplitSides, Some(context)),
+            KeyBinding::new(if cfg!(target_os = "macos") { "cmd-shift-|" } else { "ctrl-shift-|" }, SwapSplitSides, Some(context)),
             KeyBinding::new("ctrl-e", ToggleView, Some(context)),
             KeyBinding::new("ctrl-w", CloseFile, Some(context)),
             KeyBinding::new("ctrl-\\", ToggleSplit, Some(context)),
@@ -4017,6 +4087,7 @@ fn main() {
     });
     app.run(move |cx| {
             gpui_kit::init(cx);
+            typography::init(cx);
             app_icon::init();
             settings::init(cx);
             workspaces::init(cx);
@@ -4395,7 +4466,11 @@ mod transition_tests {
 
     #[gpui_kit::test]
     fn export_dialog_writes_the_chosen_format(cx: &mut TestAppContext) {
-        cx.update(|cx| { gpui_kit::init(cx); bind_view_keys(cx); });
+        use gpui_kit::BorrowAppContext;
+        cx.update(|cx| {
+            gpui_kit::init(cx); bind_view_keys(cx); super::settings::init(cx);
+            cx.update_global::<super::settings::Preferences, _>(|p, _| p.reading.font = super::typography::ReadingFont::Poppins);
+        });
         let root = std::env::temp_dir().join(format!("enso-export-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("pics")).unwrap();
@@ -4434,13 +4509,16 @@ mod transition_tests {
             draw(cx, handle);
         };
         run(cx, crate::export::Format::Html, false, "a.html");
-        let html = std::fs::read_to_string(root.join("a.html")).unwrap();
+        let html = std::fs::read_to_string(root.join("a/index.html")).unwrap();
         assert!(html.contains("<h1>Trip</h1>") && !html.contains("<img"));
+        assert!(root.join("a/public/fonts/Poppins-Regular.ttf").is_file());
+        assert!(std::fs::read_to_string(root.join("a/public/style.css")).unwrap().contains("font-family: \"Poppins\""));
         assert!(!root.join("a_files").exists());
         run(cx, crate::export::Format::Html, true, "b.html");
-        assert!(root.join("b_files/p.png").is_file());
+        assert!(root.join("b/public/images/p.png").is_file());
         run(cx, crate::export::Format::Pdf, true, "c.pdf");
         assert!(std::fs::read(root.join("c.pdf")).unwrap().starts_with(b"%PDF"));
+        assert!(String::from_utf8_lossy(&std::fs::read(root.join("c.pdf")).unwrap()).contains("Poppins"));
         // The dialog offers the last choice again.
         assert!(cx.update(|cx| view.read(cx).export_choice.format) == crate::export::Format::Pdf);
         // Each export ends in one toast (its "Exporting…" one replaced).
@@ -4517,6 +4595,124 @@ mod transition_tests {
         cx.update(|cx| view.update(cx, |app, cx| app.move_tab(0, 9, cx)));
         assert_eq!(order(cx).0.len(), 3);
         draw(cx, handle);
+    }
+
+    #[gpui_kit::test]
+    fn shortcut_swaps_split_sides_from_editor_and_reader_and_remembers_it(cx: &mut TestAppContext) {
+        use gpui_kit::BorrowAppContext;
+        let path = std::env::temp_dir().join(format!("enso-split-shortcut-{}", std::process::id()));
+        cx.update(|cx| {
+            gpui_kit::init(cx); bind_view_keys(cx); super::settings::init(cx);
+            cx.update_global::<super::settings::Preferences, _>(|p, _| {
+                p.reader_first = false;
+                p.split_order_path = Some(path.clone());
+            });
+        });
+        let (handle, view) = cx.update(|cx| gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+            cx.new(|cx| {
+                let mut app = Enso::new(window, cx);
+                app.add_document(None, "# Heading\n\nBody".into(), None, window, cx);
+                app
+            })
+        }).unwrap());
+        draw(cx, handle);
+        let shortcut = if cfg!(target_os = "macos") { "cmd-shift-\\" } else { "ctrl-shift-\\" };
+        cx.simulate_keystrokes(handle, shortcut);
+        assert!(!cx.update(|cx| super::settings::reader_first(cx)), "Read mode does not swap");
+        cx.update_window(handle, |_, w, cx| view.update(cx, |app, cx| app.set_mode(Mode::Split, w, cx))).unwrap();
+        draw(cx, handle);
+        cx.simulate_keystrokes(handle, shortcut);
+        draw(cx, handle);
+        assert!(cx.update(|cx| super::settings::reader_first(cx)));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "reader-first");
+        cx.update_window(handle, |_, w, cx| view.update(cx, |app, cx| app.focus.focus(w, cx))).unwrap();
+        // macOS reports Shift+backslash as the shifted character `|`, with
+        // Shift consumed, rather than as an unshifted key plus a modifier.
+        let shifted_character = if cfg!(target_os = "macos") { "cmd-|" } else { "ctrl-|" };
+        cx.simulate_keystrokes(handle, shifted_character);
+        draw(cx, handle);
+        assert!(!cx.update(|cx| super::settings::reader_first(cx)));
+        assert!(cx.update(|cx| view.read(cx).mode == Mode::Split));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "editor-first");
+        let retained_shift = if cfg!(target_os = "macos") { "cmd-shift-|" } else { "ctrl-shift-|" };
+        cx.simulate_keystrokes(handle, retained_shift);
+        draw(cx, handle);
+        assert!(cx.update(|cx| super::settings::reader_first(cx)));
+        assert!(cx.update(|cx| view.read(cx).mode == Mode::Split));
+        // Without Shift, the same physical key still only toggles Split.
+        let toggle = if cfg!(target_os = "macos") { "cmd-\\" } else { "ctrl-\\" };
+        cx.simulate_keystrokes(handle, toggle);
+        draw(cx, handle);
+        assert!(cx.update(|cx| view.read(cx).mode == Mode::Read));
+        cx.simulate_keystrokes(handle, toggle);
+        draw(cx, handle);
+        assert!(cx.update(|cx| view.read(cx).mode == Mode::Split));
+        assert!(cx.update(|cx| super::settings::reader_first(cx)));
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn dragging_tabs_both_ways_including_gaps_and_end_of_strip(cx: &mut TestAppContext) {
+        use gpui_kit::{Modifiers, MouseButton, VisualTestContext, point};
+        cx.update(|cx| { gpui_kit::init(cx); bind_view_keys(cx); });
+        let (handle, view) = cx.update(|cx| gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+            cx.new(|cx| {
+                let mut app = Enso::new(window, cx);
+                for name in ["a.md", "b.md", "c.md"] {
+                    app.add_document(Some(PathBuf::from(name)), String::new(), None, window, cx);
+                }
+                app.active = Some(0);
+                app
+            })
+        }).unwrap());
+        draw(cx, handle);
+        let mut visual = VisualTestContext::from_window(handle, cx);
+        let order = |cx: &mut TestAppContext| cx.update(|cx| {
+            let app = view.read(cx);
+            (app.documents.iter().map(|doc| doc.title()).collect::<Vec<_>>(), app.active)
+        });
+        let mut drag = |from: usize, to: usize, after: bool, cx: &mut TestAppContext| {
+            draw(cx, handle);
+            let selectors = ["file-tab-0", "file-tab-1", "file-tab-2"];
+            let start = visual.debug_bounds(selectors[from]).unwrap().center();
+            let target = visual.debug_bounds(selectors[to]).unwrap();
+            // Test insertion gaps. The strip starts at the first pill's edge.
+            let finish = point(
+                if after { target.right() + px(2.) }
+                else if to == 0 { target.left() + px(2.) }
+                else { target.left() - px(1.) },
+                target.center().y,
+            );
+            visual.simulate_mouse_move(start, None, Modifiers::default());
+            visual.simulate_mouse_down(start, MouseButton::Left, Modifiers::default());
+            visual.simulate_mouse_move(start + point(px(5.), px(0.)), Some(MouseButton::Left), Modifiers::default());
+            draw(cx, handle);
+            visual.simulate_mouse_move(finish, Some(MouseButton::Left), Modifiers::default());
+            draw(cx, handle);
+            visual.simulate_mouse_up(finish, MouseButton::Left, Modifiers::default());
+            draw(cx, handle);
+        };
+        drag(0, 2, true, cx);
+        assert_eq!(order(cx), (vec!["b.md".to_string(), "c.md".to_string(), "a.md".to_string()], Some(2)));
+        drag(2, 0, false, cx);
+        assert_eq!(order(cx), (vec!["a.md".to_string(), "b.md".to_string(), "c.md".to_string()], Some(0)));
+        drag(0, 1, true, cx);
+        assert_eq!(order(cx), (vec!["b.md".to_string(), "a.md".to_string(), "c.md".to_string()], Some(1)));
+        drag(1, 0, false, cx);
+        assert_eq!(order(cx), (vec!["a.md".to_string(), "b.md".to_string(), "c.md".to_string()], Some(0)));
+        // Dropping beside the source is a no-op; dropping outside cancels.
+        drag(0, 0, true, cx);
+        assert_eq!(order(cx), (vec!["a.md".to_string(), "b.md".to_string(), "c.md".to_string()], Some(0)));
+        let start = visual.debug_bounds("file-tab-0").unwrap().center();
+        let outside = point(start.x, start.y + px(80.));
+        visual.simulate_mouse_down(start, MouseButton::Left, Modifiers::default());
+        visual.simulate_mouse_move(start + point(px(5.), px(0.)), Some(MouseButton::Left), Modifiers::default());
+        draw(cx, handle);
+        visual.simulate_mouse_move(outside, Some(MouseButton::Left), Modifiers::default());
+        draw(cx, handle);
+        visual.simulate_mouse_up(outside, MouseButton::Left, Modifiers::default());
+        draw(cx, handle);
+        assert_eq!(order(cx), (vec!["a.md".to_string(), "b.md".to_string(), "c.md".to_string()], Some(0)));
     }
 
     #[gpui_kit::test]
