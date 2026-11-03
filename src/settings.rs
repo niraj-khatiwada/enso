@@ -575,6 +575,7 @@ impl SettingsWindow {
         let typewriter = self.writing_setter(cx, |p, on: bool| p.typewriter = on);
         let focus = self.writing_setter(cx, |p, mode: FocusMode| p.focus = mode);
         let size = self.writing_setter(cx, |p, size: u32| p.text_size = size as f32);
+        let chrome = self.writing_setter(cx, |p, on: bool| p.hide_chrome = on);
         v_flex()
             .gap_6()
             .child(page_header(
@@ -591,6 +592,15 @@ impl SettingsWindow {
                             .checked(prefs.typewriter)
                             .accessibility_label("Typewriter mode")
                             .on_change(move |on, _, cx| typewriter(*on, cx)),
+                        &theme,
+                    ))
+                    .child(setting_row(
+                        "Hide the interface while typing",
+                        "The sidebar, tabs and status bar fade while you write and return when you move the pointer or press Escape.",
+                        Switch::new("hide-chrome")
+                            .checked(prefs.hide_chrome)
+                            .accessibility_label("Hide the interface while typing")
+                            .on_change(move |on, _, cx| chrome(*on, cx)),
                         &theme,
                     ))
                     .child(setting_row(

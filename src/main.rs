@@ -313,6 +313,7 @@ struct Enso {
     mode: Mode,
     previous_mode: Mode,
     pending_source_place: Option<(EntityId, usize, Pixels, u8)>,
+    chrome_hidden: bool,
     status: String,
     error: bool,
     /// Whether the last error is still on the status bar; it hides itself.
@@ -400,6 +401,7 @@ impl Enso {
             mode: Mode::Visual,
             previous_mode: Mode::Visual,
             pending_source_place: None,
+            chrome_hidden: false,
             status: "A little space for your thoughts.".into(),
             error: false,
             error_shown: false,
@@ -875,7 +877,11 @@ impl Enso {
                         this.schedule_save(index, cx);
                         this.schedule_word_count(index, false, cx);
                     }
-                    if became_dirty {
+                    let hide = visual::prefs::WritingPrefs::get(cx).hide_chrome;
+                    if hide && !this.chrome_hidden {
+                        this.chrome_hidden = true;
+                        cx.notify();
+                    } else if became_dirty {
                         cx.notify();
                     }
                 }
@@ -1673,6 +1679,18 @@ impl Enso {
             cx,
         )
         .clamp(0., 1.);
+        let chrome = transition(
+            "chrome",
+            if self.chrome_hidden {
+                tokens::HIDDEN
+            } else {
+                tokens::SHOWN
+            },
+            Transition::new(tokens::CHROME_FADE).easing(motion.easing_move.clone()),
+            window,
+            cx,
+        )
+        .clamp(0., 1.);
         let sidebar_width = self.sidebar_width;
 
         let markdown = self.active.is_none_or(|i| self.documents[i].markdown);
@@ -1873,16 +1891,45 @@ impl Enso {
                                     ),
                             )
                             .child(div().flex_shrink_0().w(px(header_offset)))
-                            .child(self.part(Part::Header, cx)),
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .h_full()
+                                    .opacity(chrome)
+                                    .child(self.part(Part::Header, cx)),
+                            ),
                     ),
                 );
             (Some(titlebar.into_any_element()), None)
         } else {
-            (None, Some(self.part(Part::Header, cx)))
+            (
+                None,
+                Some(
+                    div()
+                        .w_full()
+                        .flex_shrink_0()
+                        .opacity(chrome)
+                        .child(self.part(Part::Header, cx))
+                        .into_any_element(),
+                ),
+            )
         };
         v_flex()
             .id("enso")
             .key_context("Enso")
+            .on_mouse_move(cx.listener(|this, _: &MouseMoveEvent, _, cx| {
+                if this.chrome_hidden {
+                    this.chrome_hidden = false;
+                    cx.notify();
+                }
+            }))
+            .on_action(cx.listener(|this, _: &visual::view::Cancel, _, cx| {
+                if this.chrome_hidden {
+                    this.chrome_hidden = false;
+                    cx.notify();
+                }
+            }))
             .track_focus(&self.focus)
             .relative()
             .size_full()
@@ -1959,6 +2006,7 @@ impl Enso {
                                     div()
                                         .w(sidebar_width)
                                         .h_full()
+                                        .opacity(chrome)
                                         .child(self.part(Part::Sidebar, cx)),
                                 )
                                 .when(self.sidebar_open && sidebar_reveal >= 0.999, |sidebar| {
@@ -1988,7 +2036,13 @@ impl Enso {
                                 })
                                 .when_some(standard_header, |view, header| view.child(header))
                                 .child(body)
-                                .child(self.part(Part::Status, cx)),
+                                .child(
+                                    div()
+                                        .w_full()
+                                        .flex_shrink_0()
+                                        .opacity(chrome)
+                                        .child(self.part(Part::Status, cx)),
+                                ),
                         ),
                 ),
             )
@@ -3266,7 +3320,7 @@ fn main() {
 
 #[cfg(all(test, feature = "ui-tests"))]
 mod transition_tests {
-    use super::{Enso, Mode, bind_view_keys, reader};
+    use super::{Enso, Mode, bind_view_keys, reader, visual};
     use ::core::prelude::v1::test;
     use gpui_kit::Focusable;
     use gpui_kit::{
@@ -3472,6 +3526,64 @@ mod transition_tests {
             cx.update(|cx| assert!(!view.read(cx).documents[0].dirty, "{name}: saved"));
         }
         let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[gpui_kit::test]
+    fn the_interface_fades_while_typing_and_returns(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            bind_view_keys(cx);
+        });
+        let (handle, view) = cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| {
+                    let mut view = Enso::new(window, cx);
+                    view.add_document(
+                        Some(PathBuf::from("c.md")),
+                        "Some text.\n".into(),
+                        None,
+                        window,
+                        cx,
+                    );
+                    view
+                })
+            })
+            .unwrap()
+        });
+        draw(cx, handle);
+        let visual = cx.update(|cx| view.read(cx).documents[0].visual.clone().unwrap());
+        cx.update_window(handle, |_, window, cx| {
+            visual.update(cx, |v, cx| window.focus(&v.focus, cx));
+        })
+        .unwrap();
+        cx.simulate_input(handle, "x");
+        draw(cx, handle);
+        cx.update(|cx| assert!(view.read(cx).chrome_hidden));
+        cx.update_window(handle, |_, window, cx| {
+            use gpui_kit::InputEvent as _;
+            window.dispatch_event(
+                gpui_kit::MouseMoveEvent {
+                    position: gpui_kit::point(px(40.), px(40.)),
+                    pressed_button: None,
+                    modifiers: Default::default(),
+                }
+                .to_platform_input(),
+                cx,
+            );
+        })
+        .unwrap();
+        draw(cx, handle);
+        cx.update(|cx| assert!(!view.read(cx).chrome_hidden));
+        cx.simulate_input(handle, "y");
+        cx.simulate_keystrokes(handle, "escape");
+        cx.update(|cx| assert!(!view.read(cx).chrome_hidden));
+        cx.update(|cx| {
+            let mut prefs = visual::prefs::WritingPrefs::get(cx);
+            prefs.hide_chrome = false;
+            cx.set_global(prefs);
+        });
+        cx.simulate_input(handle, "z");
+        cx.update(|cx| assert!(!view.read(cx).chrome_hidden));
     }
 
     #[gpui_kit::test]

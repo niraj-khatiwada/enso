@@ -1731,8 +1731,10 @@ impl Render for VisualView {
             .on_action(cx.listener(|this, _: &Cancel, window, cx| {
                 if this.image_dialog.is_some() {
                     this.close_image_dialog(window, cx);
-                } else {
+                } else if this.selected_image.is_some() {
                     this.select_image(None, cx);
+                } else {
+                    cx.propagate();
                 }
             }))
             .on_action(cx.listener(|this, _: &Undo, window, cx| this.replay(true, window, cx)))
