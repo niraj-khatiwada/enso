@@ -46,6 +46,7 @@ pub const PAGE_TOP: f32 = tokens::PAGE_TOP;
 pub const PAGE_BOTTOM: f32 = tokens::PAGE_BOTTOM;
 const OVERDRAW: Pixels = px(600.);
 const EMPTY_LIMIT: usize = 64;
+const MEASURE_BATCH: usize = 24;
 const FOCUS_DIM: f32 = tokens::FOCUS_DIM;
 const FOCUS_FADE: Duration = tokens::FOCUS_FADE;
 
@@ -1377,6 +1378,7 @@ impl VisualView {
     fn table_widths(
         &mut self,
         bix: usize,
+        part: Range<usize>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Arc<Vec<f32>> {
@@ -1388,9 +1390,14 @@ impl VisualView {
         let table = |rows: Vec<Vec<_>>| Table::new(rows, aligns.clone());
         let measured = match self.table_widths.get(&id) {
             Some((count, widths)) if *count == rows.len() => {
-                let dirty = self.table_dirty.remove(&id).unwrap_or_default();
+                let mut dirty = self.table_dirty.remove(&id).unwrap_or_default();
                 if dirty.is_empty() {
                     return widths.clone();
+                }
+                if dirty.len() > MEASURE_BATCH {
+                    let rest = dirty.split_off(MEASURE_BATCH);
+                    self.table_dirty.insert(id, rest);
+                    window.request_animation_frame();
                 }
                 let mut sample = vec![rows[0].cells.clone()];
                 sample.extend(
@@ -1406,6 +1413,18 @@ impl VisualView {
                     *w = w.max(f);
                 }
                 widths
+            }
+            _ if rows.len() > MEASURE_BATCH * 2 => {
+                let shown = |r: &usize| *r == 0 || part.contains(r);
+                let first: Vec<_> = (0..rows.len())
+                    .filter(shown)
+                    .map(|r| rows[r].cells.clone())
+                    .collect();
+                let mut rest: Vec<usize> = (0..rows.len()).filter(|r| !shown(r)).collect();
+                rest.extend(self.table_dirty.remove(&id).unwrap_or_default());
+                self.table_dirty.insert(id, rest);
+                window.request_animation_frame();
+                table(first).measure_column_widths(&self.render_cx, window, cx)
             }
             _ => {
                 self.table_dirty.remove(&id);
@@ -1505,7 +1524,7 @@ impl VisualView {
                 span: None,
             },
             (_, Kind::Table { .. }) => {
-                let widths = self.table_widths(bix, window, cx);
+                let widths = self.table_widths(bix, part.clone(), window, cx);
                 let Kind::Table { rows, aligns } = &self.doc.blocks[bix].kind else {
                     return div().into_any_element();
                 };

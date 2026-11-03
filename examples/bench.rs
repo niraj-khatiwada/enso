@@ -104,6 +104,7 @@ enum Step {
     Input(String),
     Scroll(usize, f32),
     JumpToEnd,
+    Writing(bool, visual::prefs::FocusMode),
 }
 
 fn script(size: usize) -> Vec<Step> {
@@ -163,6 +164,18 @@ fn script(size: usize) -> Vec<Step> {
         ]);
     }
     s.extend([
+        Case("type: typewriter on"),
+        Writing(true, visual::prefs::FocusMode::Off),
+        CaretFraction(0.6),
+        Keys("a", 30),
+        Keys("enter", 5),
+        Case("type: sentence focus on"),
+        Writing(false, visual::prefs::FocusMode::Sentence),
+        CaretFraction(0.4),
+        Keys("a", 30),
+        Input(". Next".into()),
+        Keys("a", 10),
+        Writing(false, visual::prefs::FocusMode::Off),
         Case("paste 20 KiB"),
         CaretFraction(0.3),
         Input("Pasted line of ordinary prose for the benchmark.\n\n".repeat(400)),
@@ -388,6 +401,14 @@ fn main() {
                             }
                             let frames = cx.update(|cx| view.read(cx).perf.borrow().frames[start..].to_vec());
                             scroll_frames.push((label.to_string(), frames));
+                        }
+                        Step::Writing(typewriter, focus) => {
+                            cx.update(|cx| {
+                                let mut prefs = visual::prefs::WritingPrefs::get(cx);
+                                prefs.typewriter = typewriter;
+                                prefs.focus = focus;
+                                cx.set_global(prefs);
+                            });
                         }
                         Step::JumpToEnd => {
                             let start = cx.update(|cx| view.read(cx).perf.borrow().frames.len());
