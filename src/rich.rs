@@ -1,6 +1,5 @@
 //! Native controls for Markdown objects. Edits are committed as one source edit.
 use super::*;
-use gpui_kit::component::button::ButtonCustomVariant;
 use gpui_kit::component::color_picker::{ColorPicker, ColorPickerState};
 use gpui_kit::component::menu::DropdownMenu;
 use gpui_kit::component::text::{
@@ -223,8 +222,11 @@ pub fn decorate(
                 cx,
             )
         })
-        .markdown_block_renderer("enso-tasks", move |node, _, _| {
+        .markdown_block_renderer("enso-tasks", move |node, window, _| {
             let tasks = node.data::<Tasks>().unwrap();
+            // Markers sit in a box one text line tall, centered on the item's
+            // first line however tall the checkbox or the text is.
+            let line_height = window.line_height();
             let mut list = v_flex().gap_1().w_full();
             for (i, item) in tasks.items.iter().enumerate() {
                 let mut row = h_flex().items_start().gap_2().w_full();
@@ -236,6 +238,10 @@ pub fn decorate(
                         .map(|start| start + source_offset);
                     row = row.child(
                         div()
+                            .h(line_height)
+                            .flex_shrink_0()
+                            .flex()
+                            .items_center()
                             .debug_selector(move || {
                                 format!("task-checkbox-{}", marker.unwrap_or(i))
                             })
@@ -252,7 +258,7 @@ pub fn decorate(
                             ),
                     );
                 } else {
-                    row = row.child(div().w(px(16.)).child(if tasks.ordered {
+                    row = row.child(div().w(px(16.)).h(line_height).flex().items_center().child(if tasks.ordered {
                         format!("{}.", tasks.start + i as u32)
                     } else {
                         "•".into()
@@ -277,23 +283,40 @@ pub fn decorate(
             }
             list
         })
-        .table_actions(move |table, _, _| {
+        .table_actions(move |table, _, cx| {
             let range = table
                 .span
                 .clone()
                 .and_then(|r| shifted_range(r, source_offset, prefix_len));
             let owner = table_owner.clone();
+            // Only offer the editor for tables it can write back: HTML with
+            // merged cells or captions is edited in Edit mode.
+            let editable = range.clone().zip(owner.upgrade()).is_some_and(|(range, app)| {
+                app.read(cx)
+                    .documents
+                    .iter()
+                    .find(|doc| doc.editor.entity_id() == editor_id)
+                    .and_then(|doc| {
+                        let slice = doc.editor.read(cx).text().try_slice(range).ok()?;
+                        EditableTable::parse(&slice.to_string())
+                    })
+                    .is_some()
+            });
+            if !editable {
+                return div().into_any_element();
+            }
             Button::new("edit-table")
                 .ghost()
                 .small()
                 .icon(IconName::Pencil)
-                .label("Edit table")
+                .label("Edit Table")
                 .on_click(move |_, window, cx| {
                     if let Some(range) = range.clone() {
                         let _ = owner
                             .update(cx, |app, cx| app.open_table(editor_id, range, window, cx));
                     }
                 })
+                .into_any_element()
         })
 }
 #[derive(Clone)]
@@ -585,9 +608,7 @@ fn render_picture(
         .right(px(6.))
         .gap(px(2.))
         .p(px(2.))
-        .rounded_md()
-        .bg(theme.popover)
-        .shadow_md()
+        .toolbar_surface(&theme)
         .opacity(0.)
         .group_hover("enso-image", |bar| bar.opacity(1.))
         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation());
@@ -616,13 +637,9 @@ fn render_picture(
             div()
                 .debug_selector(move || format!("image-align-{alignment:?}").to_lowercase())
                 .child(
-                    Button::new(label)
-                        .ghost()
+                    ui::icon_button(label, icon, label)
                         .xsmall()
                         .compact()
-                        .icon(icon)
-                        .tooltip(label)
-                        .accessibility_label(label)
                         .when(picture.alignment == alignment, |button| {
                             button.bg(theme.accent)
                         })
@@ -647,13 +664,9 @@ fn render_picture(
     }
     toolbar = toolbar.child(
         div().debug_selector(|| "image-edit-button".into()).child(
-            Button::new("edit-image")
-                .ghost()
+            ui::icon_button("edit-image", IconName::Pencil, "Edit image")
                 .xsmall()
                 .compact()
-                .icon(IconName::Pencil)
-                .tooltip("Edit image")
-                .accessibility_label("Edit image")
                 .on_click(move |_, w, cx| {
                     cx.stop_propagation();
                     if let Some(range) = range.clone() {
@@ -826,6 +839,147 @@ pub struct TableForm {
     target: Target,
     cells: Vec<Vec<Entity<InputState>>>,
     aligns: Vec<String>,
+    syntax: TableSyntax,
+}
+
+/// How a table is written in the source, so saving writes it back the same way.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TableSyntax {
+    /// A pipe table; `aligns` holds its delimiter row.
+    Markdown,
+    /// A plain `<table>`; `header` says whether its first row is `<th>` cells.
+    Html { header: bool },
+}
+
+/// A table the table editor can open: its rows (header first) and how to
+/// write them back.
+#[derive(Debug, PartialEq)]
+struct EditableTable {
+    rows: Vec<Vec<String>>,
+    aligns: Vec<String>,
+    syntax: TableSyntax,
+}
+
+impl EditableTable {
+    fn parse(source: &str) -> Option<Self> {
+        if source.trim_start().starts_with('<') {
+            return Self::parse_html(source);
+        }
+        let mut rows: Vec<_> = source.lines().map(source_cells).collect();
+        if rows.len() < 2 || rows[0].is_empty() {
+            return None;
+        }
+        let cols = rows[0].len();
+        let mut aligns = rows.remove(1);
+        aligns.resize(cols, "---".into());
+        for row in &mut rows {
+            row.resize(cols, String::new());
+        }
+        Some(Self { rows, aligns, syntax: TableSyntax::Markdown })
+    }
+
+    /// Plain HTML tables only: rows of `<th>`/`<td>` cells, optionally in
+    /// `<thead>`/`<tbody>`. Merged cells, captions, column groups and nested
+    /// tables can't be shown as a grid, so those tables aren't editable.
+    fn parse_html(source: &str) -> Option<Self> {
+        let text = source.trim();
+        // ASCII lowercasing keeps byte offsets, so `lower` indexes `text`.
+        let lower = text.to_ascii_lowercase();
+        if !lower.starts_with("<table") || !lower.ends_with("</table>") {
+            return None;
+        }
+        let inner_start = lower.find('>')? + 1;
+        let inner_end = lower.len() - "</table>".len();
+        let inner = &lower[inner_start..inner_end];
+        if ["<table", "<caption", "<colgroup", "<col ", "<col>", "colspan", "rowspan"]
+            .iter()
+            .any(|tag| inner.contains(tag))
+        {
+            return None;
+        }
+        // The start of the next `<name` tag (not `<names…`) at or after `from`.
+        let open = |name: &str, from: usize| -> Option<usize> {
+            let mut at = from;
+            loop {
+                let i = lower[at..inner_end].find(&format!("<{name}"))? + at;
+                let next = lower.as_bytes().get(i + name.len() + 1)?;
+                if *next == b'>' || next.is_ascii_whitespace() {
+                    return Some(i);
+                }
+                at = i + 1;
+            }
+        };
+        let mut rows = Vec::new();
+        let mut header = false;
+        let mut at = inner_start;
+        while let Some(row_start) = open("tr", at) {
+            let row_end = lower[row_start..inner_end].find("</tr>")? + row_start;
+            let mut cells = Vec::new();
+            let mut cell_at = row_start + 3;
+            loop {
+                let next = [("th", open("th", cell_at)), ("td", open("td", cell_at))]
+                    .into_iter()
+                    .filter_map(|(name, i)| Some((name, i.filter(|&i| i < row_end)?)))
+                    .min_by_key(|(_, i)| *i);
+                let Some((name, start)) = next else { break };
+                let content_start = lower[start..row_end].find('>')? + start + 1;
+                let close = lower[content_start..row_end].find(&format!("</{name}>"))?
+                    + content_start;
+                if rows.is_empty() && cells.is_empty() {
+                    header = name == "th";
+                }
+                cells.push(
+                    text[content_start..close]
+                        .split_whitespace()
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                );
+                cell_at = close + name.len() + 3;
+            }
+            if cells.is_empty() {
+                return None;
+            }
+            rows.push(cells);
+            at = row_end + "</tr>".len();
+        }
+        let cols = rows.iter().map(Vec::len).max()?;
+        for row in &mut rows {
+            row.resize(cols, String::new());
+        }
+        Some(Self { rows, aligns: vec!["---".into(); cols], syntax: TableSyntax::Html { header } })
+    }
+
+    /// The table written back in its own syntax.
+    fn source(rows: &[Vec<String>], aligns: &[String], syntax: TableSyntax) -> String {
+        match syntax {
+            TableSyntax::Markdown => table_source(rows, aligns),
+            TableSyntax::Html { header } => {
+                let line = |tag: &str, row: &Vec<String>| {
+                    let cells: String = row
+                        .iter()
+                        .map(|c| format!("<{tag}>{}</{tag}>", c.replace(['\r', '\n'], " ")))
+                        .collect();
+                    format!("    <tr>{cells}</tr>")
+                };
+                let mut lines = vec!["<table>".to_string()];
+                let body = if header && !rows.is_empty() {
+                    lines.push("  <thead>".into());
+                    lines.push(line("th", &rows[0]));
+                    lines.push("  </thead>".into());
+                    &rows[1..]
+                } else {
+                    rows
+                };
+                if !body.is_empty() {
+                    lines.push("  <tbody>".into());
+                    lines.extend(body.iter().map(|row| line("td", row)));
+                    lines.push("  </tbody>".into());
+                }
+                lines.push("</table>".into());
+                lines.join("\n")
+            }
+        }
+    }
 }
 pub struct HighlightForm {
     target: Target,
@@ -1069,34 +1223,21 @@ impl Enso {
         let Some(target) = self.rich_target(id, range, window, cx) else {
             return;
         };
-        let rows: Vec<_> = target.expected.lines().map(source_cells).collect();
-        if rows.len() < 2 {
+        let Some(table) = EditableTable::parse(&target.expected) else {
             return;
-        }
-        let cols = rows[0].len();
-        if cols == 0 {
-            return;
-        }
-        let mut aligns = rows[1].clone();
-        aligns.resize(cols, "---".into());
-        let cells: Vec<Vec<_>> = rows
-            .into_iter()
-            .enumerate()
-            .filter(|(i, _)| *i != 1)
-            .map(|(_, mut row)| {
-                row.resize(cols, String::new());
-                row.into_iter()
-                    .take(cols)
-                    .map(|v| input(&v, window, cx))
-                    .collect()
-            })
+        };
+        let cells: Vec<Vec<_>> = table
+            .rows
+            .iter()
+            .map(|row| row.iter().map(|v| input(v, window, cx)).collect())
             .collect();
         cells[0][0].focus_handle(cx).focus(window, cx);
         self.closing_controls = None;
         self.controls = Some(Controls::Table(TableForm {
             target,
             cells,
-            aligns,
+            aligns: table.aligns,
+            syntax: table.syntax,
         }));
         cx.notify();
     }
@@ -1150,7 +1291,7 @@ impl Enso {
                     .iter()
                     .map(|row| row.iter().map(|c| c.read(cx).value().to_string()).collect())
                     .collect();
-                (&form.target, table_source(&rows, &form.aligns))
+                (&form.target, EditableTable::source(&rows, &form.aligns, form.syntax))
             }
         };
         if !self
@@ -1348,31 +1489,35 @@ impl Enso {
                         presets.into_iter().enumerate().map(|(i, (name, value))| {
                             let swatch: Hsla = rgb(value).into();
                             let selected = highlight_hex(swatch) == highlight_hex(color);
-                            // Own all interaction colors: a ghost button's default
-                            // hover background would replace the actual swatch.
-                            let variant = ButtonCustomVariant::new(cx)
-                                .color(swatch)
-                                .hover(swatch.blend(black().opacity(0.035)))
-                                .active(swatch.blend(black().opacity(0.07)))
-                                .foreground(rgb(0x303235).into());
+                            // A plain tile rather than a custom Button: the kit's
+                            // custom variant mixes its color 80% toward
+                            // transparent, which washes the swatch out.
+                            let hover = swatch.blend(black().opacity(0.06));
+                            let active = swatch.blend(black().opacity(0.12));
                             div()
                                 .debug_selector(move || format!("highlight-swatch-{i}"))
                                 .child(
-                                    Button::new(("highlight-color", i))
-                                        .custom(variant)
-                                        .xsmall()
-                                        .p_0()
-                                        .w(px(36.))
-                                        .h(px(36.))
+                                    div()
+                                        .id(("highlight-color", i))
+                                        .size(px(36.))
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
                                         .rounded(px(10.))
+                                        .bg(swatch)
                                         .border_1()
                                         .border_color(if selected {
                                             theme.foreground.opacity(0.45)
                                         } else {
-                                            swatch.blend(black().opacity(0.04))
+                                            swatch.blend(black().opacity(0.08))
                                         })
-                                        .accessibility_label(format!("{name} highlight"))
-                                        .tooltip(name)
+                                        .text_color(rgb(0x303235))
+                                        .cursor_pointer()
+                                        .hover(move |tile| tile.bg(hover))
+                                        .active(move |tile| tile.bg(active))
+                                        .tooltip(move |window, cx| {
+                                            Tooltip::new(name).build(window, cx)
+                                        })
                                         .child(
                                             Icon::new(IconName::Check)
                                                 .size(px(14.))
@@ -1398,14 +1543,12 @@ impl Enso {
                             .child(form.picture.src.clone()),
                     )
                     .child(
-                        Button::new("replace-image")
-                            .small()
-                            .label("Replace image…")
+                        ui::secondary_button("replace-image", "Replace Image…")
                             .on_click(cx.listener(|app, _, w, cx| app.replace_picture(w, cx))),
                     );
             }
             Controls::Table(form) => {
-                panel = panel.child(div().font_weight(FontWeight::SEMIBOLD).child("Edit table"));
+                panel = panel.child(div().font_weight(FontWeight::SEMIBOLD).child("Edit Table"));
                 let weak = cx.entity().downgrade();
                 let mut grid = v_flex()
                     .id("table-cells")
@@ -1436,21 +1579,21 @@ impl Enso {
                                         .group_hover(group, |menu| menu.opacity(1.))
                                         .debug_selector(move || format!("table-menu-{r}-{c}"))
                                         .child(
-                                            Button::new(("table-menu", r * columns + c))
-                                                .ghost()
-                                                .xsmall()
-                                                .compact()
-                                                .icon(IconName::Ellipsis)
-                                                .tab_stop(false)
-                                                .tooltip("Row and column options")
-                                                .accessibility_label("Row and column options")
+                                            ui::icon_button(
+                                                ("table-menu", r * columns + c),
+                                                IconName::Ellipsis,
+                                                "Row and column options",
+                                            )
+                                            .xsmall()
+                                            .compact()
+                                            .tab_stop(false)
                                                 .dropdown_menu(move |menu, _, _| {
                                                     let mut menu = menu;
                                                     for (action, label) in [
-                                                        (0, "Add row below"),
-                                                        (1, "Remove row"),
-                                                        (2, "Add column after"),
-                                                        (3, "Remove column"),
+                                                        (0, "Add Row Below"),
+                                                        (1, "Remove Row"),
+                                                        (2, "Add Column After"),
+                                                        (3, "Remove Column"),
                                                     ] {
                                                         let weak = weak.clone();
                                                         menu = menu.item(
@@ -1484,7 +1627,7 @@ impl Enso {
                     panel.child(grid).child(
                         h_flex()
                             .gap_2()
-                            .child(Button::new("add-row").small().label("+ Row").on_click(
+                            .child(ui::secondary_button("add-row", "+ Row").on_click(
                                 cx.listener(|app, _, w, cx| {
                                     let row = match &app.controls {
                                         Some(Controls::Table(f)) => f.cells.len() - 1,
@@ -1494,9 +1637,7 @@ impl Enso {
                                 }),
                             ))
                             .child(
-                                Button::new("add-column")
-                                    .small()
-                                    .label("+ Column")
+                                ui::secondary_button("add-column", "+ Column")
                                     .on_click(cx.listener(|app, _, w, cx| {
                                         let col = match &app.controls {
                                             Some(Controls::Table(f)) => f.aligns.len() - 1,
@@ -1508,32 +1649,14 @@ impl Enso {
                     );
             }
         }
-        let highlight = matches!(form, Controls::Highlight(_));
         let actions = h_flex()
             .gap_2()
             .child(
-                Button::new("cancel-object")
-                    .ghost()
-                    .map(|b| if highlight { b.small() } else { b })
-                    .label("Cancel")
+                ui::cancel_button("cancel-object")
                     .on_click(cx.listener(|app, _, w, cx| app.close_controls(w, cx))),
             )
             .child(
-                Button::new("save-object")
-                    .label("Apply")
-                    .map(|button| {
-                        if highlight {
-                            button.small().bg(theme.foreground).text_color(theme.popover).custom(
-                                ButtonCustomVariant::new(cx)
-                                    .color(theme.foreground)
-                                    .foreground(theme.popover)
-                                    .hover(theme.foreground.opacity(0.9))
-                                    .active(theme.foreground.opacity(0.8)),
-                            )
-                        } else {
-                            button
-                        }
-                    })
+                ui::primary_button("save-object", "Apply")
                     .on_click(cx.listener(|app, _, w, cx| app.save_controls(w, cx))),
             );
         panel = panel.child(
@@ -1565,7 +1688,7 @@ impl Enso {
                 .on_action(
                     cx.listener(|app, _: &DismissRichControls, w, cx| app.close_controls(w, cx)),
                 )
-                .bg(black().opacity(0.2 * progress))
+                .bg(black().opacity(ui::BACKDROP_OPACITY * progress))
                 .flex()
                 .items_center()
                 .justify_center()
@@ -1585,9 +1708,7 @@ impl Enso {
                         .relative()
                         .top(px(-8. * (1. - progress)))
                         .opacity(progress)
-                        .rounded_lg()
-                        .bg(theme.popover)
-                        .shadow_lg()
+                        .modal_surface(&theme)
                         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                         .child(panel),
                 )
@@ -1598,6 +1719,55 @@ impl Enso {
 
 #[cfg(test)]
 mod tests {
+    use super::{EditableTable, TableSyntax};
+
+    #[test]
+    fn html_tables_open_as_a_grid_and_save_as_html() {
+        let source = "<table>\n  <thead>\n    <tr><th>Format</th><th>Extension</th></tr>\n  </thead>\n  <tbody>\n    <tr><td>Markdown</td><td>.md</td></tr>\n    <tr><td>Plain <b>text</b></td><td>.txt</td></tr>\n  </tbody>\n</table>";
+        let table = EditableTable::parse(source).unwrap();
+        assert_eq!(table.syntax, TableSyntax::Html { header: true });
+        let rows: Vec<Vec<String>> = [
+            ["Format", "Extension"],
+            ["Markdown", ".md"],
+            ["Plain <b>text</b>", ".txt"],
+        ]
+        .iter()
+        .map(|row| row.iter().map(|c| c.to_string()).collect())
+        .collect();
+        assert_eq!(table.rows, rows);
+        // Unchanged cells write back the same table.
+        assert_eq!(EditableTable::source(&table.rows, &table.aligns, table.syntax), source);
+    }
+
+    #[test]
+    fn html_tables_without_a_header_keep_td_cells() {
+        let table = EditableTable::parse("<TABLE><tr><td>a</td><td>b</td></tr><tr><td>c</td></tr></TABLE>").unwrap();
+        assert_eq!(table.syntax, TableSyntax::Html { header: false });
+        assert_eq!(table.rows, vec![vec!["a".to_string(), "b".into()], vec!["c".into(), String::new()]]);
+        let out = EditableTable::source(&table.rows, &table.aligns, table.syntax);
+        assert!(!out.contains("<th>") && out.contains("<tr><td>c</td><td></td></tr>"));
+    }
+
+    #[test]
+    fn html_tables_the_grid_cannot_hold_are_not_editable() {
+        for source in [
+            "<table><tr><td colspan=\"2\">a</td></tr></table>",
+            "<table><caption>c</caption><tr><td>a</td></tr></table>",
+            "<table><tr><td><table><tr><td>x</td></tr></table></td></tr></table>",
+            "<table></table>",
+            "<div>not a table</div>",
+        ] {
+            assert_eq!(EditableTable::parse(source), None, "{source}");
+        }
+    }
+
+    #[test]
+    fn markdown_tables_keep_their_alignment_row() {
+        let table = EditableTable::parse("| a | b |\n| :-- | --: |\n| 1 | 2 |").unwrap();
+        assert_eq!(table.syntax, TableSyntax::Markdown);
+        assert_eq!(table.aligns, [":--", "--:"]);
+        assert_eq!(table.rows.len(), 2);
+    }
     #[test]
     fn image_attributes_and_dimensions_round_trip() {
         let image=super::html_picture("<img src='a&amp;b.png' alt='a &quot;quote&quot;' width='50%' height='200' title='test' />").unwrap();

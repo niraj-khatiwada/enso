@@ -1,5 +1,8 @@
 //! A small heading rail shared by the source editor and reading view.
 use super::*;
+/// Width of the heading rail beside the document.
+const RAIL_WIDTH: f32 = 28.;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Heading {
     pub title: String,
@@ -107,16 +110,25 @@ impl Enso {
         let measure = bounds.clone();
         let pointer_bounds = bounds.clone();
         let count = doc.outline.len().min(120);
+        // Blend into the pane beside the rail: the editor paints its own solid
+        // background, the reader shows the window's.
+        let beside_editor = self.mode == Mode::Edit
+            || (self.mode == Mode::Split && !settings::reader_first(cx));
+        let editor_background = theme
+            .highlight_theme
+            .style
+            .editor_background
+            .unwrap_or_else(|| theme.input_background());
         let mut rail = v_flex()
             .id("outline-rail")
             .debug_selector(|| "outline-rail".into())
             .relative()
-            .w(px(44.))
+            .w(px(RAIL_WIDTH))
             .h(px(count as f32 * 8. + 24.))
             .max_h(relative(0.5))
             .flex_shrink_0()
             .py_3()
-            .pl(px(10.))
+            .pl(px(8.))
             .cursor_pointer()
             .child(
                 canvas(
@@ -165,7 +177,7 @@ impl Enso {
             let selected = pointer.is_some_and(|p| (p * count as f32) as usize == i);
             let width = transition(
                 ("outline-tick-width", i.to_string()),
-                6. + 24. * influence,
+                4. + 14. * influence,
                 Transition::new(std::time::Duration::from_millis(100)),
                 window,
                 cx,
@@ -194,14 +206,12 @@ impl Enso {
                     deferred(
                         v_flex()
                             .absolute()
-                            .left(px(46.))
+                            .left(px(RAIL_WIDTH + 2.))
                             .top(px(top))
                             .w(px(300.))
                             .gap_2()
                             .p_3()
-                            .rounded(px(12.))
-                            .bg(theme.popover)
-                            .shadow_lg()
+                            .card_surface(&theme)
                             .occlude()
                             .child(
                                 div()
@@ -222,9 +232,18 @@ impl Enso {
                 );
             }
         }
-        rail.into_any_element()
+        // The background spans the column's full height, not just the rail,
+        // so the strip above and below it blends in too.
+        v_flex()
+            .h_full()
+            .w(px(RAIL_WIDTH))
+            .flex_shrink_0()
+            .justify_center()
+            .when(beside_editor, |column| column.bg(editor_background))
+            .child(rail)
+            .into_any_element()
     }
-    fn jump_to_heading(
+    pub(super) fn jump_to_heading(
         &mut self,
         id: EntityId,
         offset: usize,
@@ -239,10 +258,13 @@ impl Enso {
             return;
         };
         let doc = &self.documents[index];
-        if self.mode != Mode::Read {
+        // The cursor moves in Read too, so switching to Edit lands there.
+        if doc.editor_loaded {
             doc.editor.update(cx, |e, cx| {
                 e.set_selected_range(offset..offset, cx);
             });
+        }
+        if self.mode != Mode::Read {
             doc.editor.focus_handle(cx).focus(window, cx);
         }
         if self.mode != Mode::Edit {

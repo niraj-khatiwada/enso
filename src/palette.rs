@@ -15,7 +15,23 @@ pub struct Palette {
     groups: Vec<Vec<Entry>>,
     table_input: Option<Entity<InputState>>,
     table_error: Option<String>,
+    /// Set while the palette searches inside the workspace's notes.
+    search: Option<ContentSearch>,
     _subscription: Option<Subscription>,
+}
+
+/// "Search everything": the palette's second mode, searching file contents.
+struct ContentSearch {
+    root: PathBuf,
+    /// The workspace's text files, listed once when the mode opens.
+    files: Option<Arc<Vec<PathBuf>>>,
+    query: String,
+    hits: Vec<search::Hit>,
+    /// A search for `query` is running.
+    searching: bool,
+    /// Stops the search in flight when the query changes again.
+    cancel: Arc<std::sync::atomic::AtomicBool>,
+    _task: Option<Task<()>>,
 }
 
 const HISTORY_LIMIT: usize = 50;
@@ -102,6 +118,7 @@ enum Choice {
     Swap,
     Settings,
     Reveal,
+    SearchEverything,
 }
 impl Choice {
     fn key(&self) -> String {
@@ -134,6 +151,7 @@ impl Choice {
             Self::Swap => "swap".into(),
             Self::Settings => "settings".into(),
             Self::Reveal => "reveal".into(),
+            Self::SearchEverything => "search-everything".into(),
         }
     }
 
@@ -162,6 +180,7 @@ impl Choice {
             Self::OpenWorkspace => Box::new(OpenFolder),
             Self::Settings => Box::new(OpenSettings),
             Self::Mode(Mode::Split) => Box::new(ToggleSplit),
+            Self::SearchEverything => Box::new(SearchEverything),
             _ => return None,
         })
     }
@@ -285,20 +304,20 @@ impl Enso {
                     Some("⇧L"),
                 ),
                 entry(
-                    "Bullet list",
+                    "Bullet List",
                     &["unordered", "points"],
                     Choice::Block(Block::Bullet),
                     Some("⇧8"),
                 ),
                 entry(
-                    "Numbered list",
+                    "Numbered List",
                     &["ordered", "steps"],
                     Choice::Block(Block::Numbered),
                     Some("⇧7"),
                 ),
                 entry("Table…", &["rows", "columns", "grid"], Choice::Table, None),
                 entry(
-                    "Code block",
+                    "Code Block",
                     &["snippet", "fence"],
                     Choice::CodeBlock,
                     Some("⌥C"),
@@ -327,7 +346,7 @@ impl Enso {
                     Choice::Highlight,
                     None,
                 ),
-                entry("Today's date", &["today", "calendar"], Choice::Date, None),
+                entry("Today's Date", &["today", "calendar"], Choice::Date, None),
             ];
             format = vec![
                 entry("Bold", &["strong"], Choice::Inline(Inline::Bold), Some("B")),
@@ -344,7 +363,7 @@ impl Enso {
                     Some("⇧X"),
                 ),
                 entry(
-                    "Inline code",
+                    "Inline Code",
                     &["monospace", "code"],
                     Choice::Inline(Inline::Code),
                     Some("⇧C"),
@@ -366,16 +385,16 @@ impl Enso {
                 ));
             }
             format.push(entry(
-                "Body text",
+                "Body Text",
                 &["paragraph", "normal"],
                 Choice::Block(Block::Heading(0)),
                 Some("0"),
             ));
         }
         let mut app = vec![
-            entry("New file", &["note", "create"], Choice::NewFile, Some("N")),
+            entry("New File", &["note", "create"], Choice::NewFile, Some("N")),
             entry(
-                "Open new workspace…",
+                "Open New Workspace…",
                 &["folder", "switch workspace"],
                 Choice::OpenWorkspace,
                 Some("⇧O"),
@@ -388,8 +407,17 @@ impl Enso {
             ),
         ];
         if self.root.is_some() {
+            app.insert(
+                0,
+                entry(
+                    "Search Everything…",
+                    &["find", "text", "content", "grep", "notes"],
+                    Choice::SearchEverything,
+                    Some("⇧S"),
+                ),
+            );
             app.push(entry(
-                "New folder",
+                "New Folder",
                 &["directory", "create"],
                 Choice::NewFolder,
                 Some("⇧N"),
@@ -398,25 +426,25 @@ impl Enso {
         if self.active.is_some_and(|i| self.documents[i].markdown) {
             app.extend([
                 entry(
-                    "Read view",
+                    "Read View",
                     &["preview", "reading"],
                     Choice::Mode(Mode::Read),
                     None,
                 ),
                 entry(
-                    "Edit view",
+                    "Edit View",
                     &["source", "writing"],
                     Choice::Mode(Mode::Edit),
                     None,
                 ),
                 entry(
-                    "Split view",
+                    "Split View",
                     &["preview", "side by side"],
                     Choice::Mode(Mode::Split),
                     Some("\\"),
                 ),
                 entry(
-                    "Swap split sides",
+                    "Swap Split Sides",
                     &["switch", "left", "right", "reader", "editor"],
                     Choice::Swap,
                     None,
@@ -445,7 +473,7 @@ impl Enso {
             .filter(|w| w.exists())
             .map(|w| {
                 entry(
-                    format!("Switch workspace: {}", w.name()),
+                    format!("Switch Workspace: {}", w.name()),
                     &["open", "folder", "workspace"],
                     Choice::Workspace(w.path.clone()),
                     None,
@@ -483,6 +511,7 @@ impl Enso {
             groups,
             table_input: None,
             table_error: None,
+            search: None,
             _subscription: None,
         });
         if let Some(root) = self.root.clone() {
@@ -562,6 +591,11 @@ impl Enso {
         else {
             return;
         };
+        if matches!(choice, Choice::SearchEverything) {
+            self.remember_command(&choice, cx);
+            self.start_content_search(window, cx);
+            return;
+        }
         if matches!(choice, Choice::Table) {
             let input = cx.new(|cx| {
                 InputState::new(window, cx)
@@ -835,14 +869,16 @@ impl Enso {
             px(64.)
         };
         let theme = cx.theme().clone();
-        let content = if let Some(input) = &palette.table_input {
+        let content = if let Some(search) = &palette.search {
+            self.content_search_view(&palette.state, search, list_height, cx)
+        } else if let Some(input) = &palette.table_input {
             v_flex()
                 .p_4()
                 .gap_3()
                 .child(
                     div()
                         .font_weight(FontWeight::SEMIBOLD)
-                        .child("Insert table"),
+                        .child("Insert Table"),
                 )
                 .child(
                     div()
@@ -853,9 +889,15 @@ impl Enso {
                 .when_some(palette.table_error.clone(), |d, e| {
                     d.child(div().text_sm().text_color(theme.danger).child(e))
                 })
-                .child(Button::new("insert-table").label("Insert table").on_click(
-                    cx.listener(|this, _, window, cx| this.insert_palette_table(window, cx)),
-                ))
+                .child(
+                    h_flex().justify_end().child(
+                        ui::primary_button("insert-table", "Insert Table").on_click(
+                            cx.listener(|this, _, window, cx| {
+                                this.insert_palette_table(window, cx)
+                            }),
+                        ),
+                    ),
+                )
                 .into_any_element()
         } else {
             let mut command = Command::new(&palette.state)
@@ -866,7 +908,7 @@ impl Enso {
                 })
                 .max_h(list_height)
                 .scroll_bounce(false)
-                .rounded(px(15.))
+                .rounded(ui::MODAL_RADIUS - px(1.))
                 .bordered(false)
                 .bg(gpui_kit::transparent_black());
             for (name, entries) in ["Recent", "Insert", "Format", "App", "Workspaces", "Files"]
@@ -958,7 +1000,11 @@ impl Enso {
                 }))
                 .absolute()
                 .inset_0()
-                .bg(black().opacity(if anchor.is_some() { 0. } else { 0.3 * opacity }))
+                .bg(black().opacity(if anchor.is_some() {
+                    0.
+                } else {
+                    ui::BACKDROP_OPACITY * opacity
+                }))
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(|this, _, window, cx| this.close_palette(window, cx)),
@@ -981,30 +1027,19 @@ impl Enso {
                         )
                         .left(left)
                         .w(px(width))
-                        .rounded(px(16.))
                         .opacity(opacity)
-                        .bg(theme.popover)
-                        .border_1()
-                        .border_color(if theme.mode.is_dark() {
-                            white().opacity(0.10)
-                        } else {
-                            theme.border
-                        })
-                        .shadow(vec![
-                            BoxShadow::new(
-                                px(0.),
-                                px(6.),
-                                black().opacity(if theme.mode.is_dark() { 0.12 } else { 0.20 }),
-                            )
-                            .blur_radius(px(20.))
-                            .spread_radius(px(-4.)),
-                        ])
+                        .modal_surface(&theme)
                         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                         // Clip the command's own painted background and scroll
                         // list to the inside edge of the 1px border. Matching
                         // the inset radius avoids overlapping curved edges;
                         // leave the outer shadow unclipped.
-                        .child(div().rounded(px(15.)).overflow_hidden().child(content)),
+                        .child(
+                            div()
+                                .rounded(ui::MODAL_RADIUS - px(1.))
+                                .overflow_hidden()
+                                .child(content),
+                        ),
                 )
                 .into_any_element(),
         )
@@ -1012,6 +1047,248 @@ impl Enso {
 }
 // Reuse the explorer's hidden-file and symlink rules. All IO stays off
 // the UI thread, including folders the user has not expanded yet.
+impl Enso {
+    /// Cmd/Ctrl+Shift+S: the palette straight in "Search everything", or
+    /// closed again if it's already there.
+    pub(super) fn toggle_content_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.palette.as_ref().is_some_and(|p| p.search.is_some()) {
+            self.close_palette(window, cx);
+            return;
+        }
+        if self.root.is_none() {
+            self.message("Open a folder to search inside its notes.", true, cx);
+            return;
+        }
+        if self.palette.is_none() {
+            self.open_palette(window, cx);
+        }
+        self.start_content_search(window, cx);
+    }
+
+    /// Switch the open palette to searching inside the workspace's notes.
+    fn start_content_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(root) = self.root.clone() else {
+            return;
+        };
+        let state = cx.new(|cx| CommandState::new(window, cx));
+        state.update(cx, |state, cx| state.focus(window, cx));
+        let Some(palette) = self.palette.as_mut() else {
+            return;
+        };
+        if let Some((editor, _)) = &palette.target {
+            let focus = state.focus_handle(cx);
+            editor.update(cx, |editor, cx| editor.set_selection_focus(Some(focus), cx));
+        }
+        palette.state = state;
+        palette.anchor = None;
+        palette.search = Some(ContentSearch {
+            root: root.clone(),
+            files: None,
+            query: String::new(),
+            hits: Vec::new(),
+            searching: false,
+            cancel: Default::default(),
+            _task: None,
+        });
+        let task = cx.background_executor().spawn(async move {
+            workspace_files(&root)
+                .into_iter()
+                .filter(|path| search::is_searchable(path))
+                .collect::<Vec<_>>()
+        });
+        cx.spawn(async move |this, cx| {
+            let files = Arc::new(task.await);
+            let _ = this.update(cx, |this, cx| {
+                let Some(search) = this.palette.as_mut().and_then(|p| p.search.as_mut()) else {
+                    return;
+                };
+                search.files = Some(files);
+                // A query typed while the files were being listed runs now.
+                let query = search.query.clone();
+                if !query.is_empty() {
+                    this.run_content_search(query, cx);
+                }
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn run_content_search(&mut self, query: String, cx: &mut Context<Self>) {
+        let cache = self.search_cache.clone();
+        let Some(palette) = self.palette.as_mut() else {
+            return;
+        };
+        let state = palette.state.clone();
+        let Some(search) = palette.search.as_mut() else {
+            return;
+        };
+        search.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        search.query = query.clone();
+        let Some(files) = search.files.clone() else {
+            return; // Still listing files; it runs once they're in.
+        };
+        if query.trim().is_empty() {
+            search.hits.clear();
+            search.searching = false;
+            search._task = None;
+            cx.notify();
+            return;
+        }
+        let cancel: Arc<std::sync::atomic::AtomicBool> = Default::default();
+        search.cancel = cancel.clone();
+        search.searching = true;
+        let window = self.window_handle;
+        search._task = Some(cx.spawn(async move |this, cx| {
+            // Wait for a pause in typing.
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(120))
+                .await;
+            if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                return;
+            }
+            let _ = window.update(cx, |_, window, cx| {
+                state.update(cx, |s, cx| s.set_loading(true, window, cx))
+            });
+            let worker_cancel = cancel.clone();
+            let hits = cx
+                .background_executor()
+                .spawn(async move { search::search(&files, &query, &cache, &worker_cancel) })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                    return;
+                }
+                if let Some(search) = this.palette.as_mut().and_then(|p| p.search.as_mut()) {
+                    search.hits = hits;
+                    search.searching = false;
+                }
+                cx.notify();
+            });
+            let _ = window.update(cx, |_, window, cx| {
+                state.update(cx, |s, cx| s.set_loading(false, window, cx))
+            });
+        }));
+    }
+
+    /// The results list: one group per file, one row per matching line with
+    /// the matched words in bold.
+    fn content_search_view(
+        &self,
+        state: &Entity<CommandState>,
+        search: &ContentSearch,
+        list_height: Pixels,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let theme = cx.theme().clone();
+        let mut command = Command::new(state)
+            .placeholder("Search in all notes…")
+            .filterable(false)
+            .max_h(list_height)
+            .scroll_bounce(false)
+            .rounded(ui::MODAL_RADIUS - px(1.))
+            .bordered(false)
+            .bg(gpui_kit::transparent_black());
+        // Groups in the order their files' first hits appear.
+        let mut groups: Vec<(PathBuf, Vec<usize>)> = Vec::new();
+        for (i, hit) in search.hits.iter().enumerate() {
+            match groups.last_mut() {
+                Some((path, rows)) if *path == hit.path => rows.push(i),
+                _ => groups.push((hit.path.clone(), vec![i])),
+            }
+        }
+        for (path, rows) in &groups {
+            let label = path
+                .strip_prefix(&search.root)
+                .unwrap_or(path)
+                .to_string_lossy()
+                .into_owned();
+            let items = rows.iter().map(|&i| {
+                let hit = search.hits[i].clone();
+                let muted = theme.muted_foreground;
+                CommandItem::new()
+                    .label(hit.line.clone())
+                    .child(move |_, _| {
+                        let highlights = hit.ranges.iter().map(|r| {
+                            (
+                                r.clone(),
+                                HighlightStyle {
+                                    font_weight: Some(FontWeight::BOLD),
+                                    ..Default::default()
+                                },
+                            )
+                        });
+                        h_flex()
+                            .w_full()
+                            .min_w_0()
+                            .gap_3()
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .truncate()
+                                    .child(StyledText::new(hit.line.clone()).with_highlights(highlights)),
+                            )
+                            .child(
+                                div()
+                                    .flex_shrink_0()
+                                    .text_xs()
+                                    .text_color(muted)
+                                    .child(format!("line {}", hit.line_number)),
+                            )
+                    })
+            });
+            command = command.group(CommandGroup::new().label(label).items(items));
+        }
+        let empty = if search.query.trim().is_empty() {
+            "Type to search inside every note in this workspace."
+        } else if search.files.is_none() || search.searching {
+            ""
+        } else {
+            "No notes contain that."
+        };
+        let weak = cx.entity().downgrade();
+        let query_weak = weak.clone();
+        let cancel = weak.clone();
+        let rows: Vec<Vec<usize>> = groups.into_iter().map(|(_, rows)| rows).collect();
+        command
+            .empty(move |_, _, _| {
+                div()
+                    .p_4()
+                    .text_sm()
+                    .text_color(theme.muted_foreground)
+                    .child(empty)
+            })
+            .on_query(move |query, _, cx| {
+                let query = query.to_string();
+                let _ = query_weak.update(cx, |this, cx| this.run_content_search(query, cx));
+            })
+            .on_confirm(move |index, window, cx| {
+                let Some(&hit) = rows.get(index.section).and_then(|r| r.get(index.row)) else {
+                    return;
+                };
+                let _ = weak.update(cx, |this, cx| this.open_content_hit(hit, window, cx));
+            })
+            .on_cancel(move |window, cx| {
+                let _ = cancel.update(cx, |this, cx| this.close_palette(window, cx));
+            })
+            .into_any_element()
+    }
+
+    fn open_content_hit(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(hit) = self
+            .palette
+            .as_ref()
+            .and_then(|p| p.search.as_ref())
+            .and_then(|s| s.hits.get(index).cloned())
+        else {
+            return;
+        };
+        self.close_palette(window, cx);
+        self.open_path_at(hit.path, hit.offset, window, cx);
+    }
+}
+
 fn workspace_files(root: &std::path::Path) -> Vec<PathBuf> {
     let mut folders = vec![root.to_path_buf()];
     let mut files = Vec::new();
@@ -1246,6 +1523,65 @@ mod ui_tests {
                 "background reader must stay still"
             );
         });
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn search_everything_finds_lines_and_opens_at_the_match(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            cx.set_global(super::History::default());
+            bind_view_keys(cx);
+            bind_markdown_keys(cx);
+        });
+        let root = std::env::temp_dir().join(format!("enso-palette-grep-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("notes")).unwrap();
+        let path = root.join("notes/trip.md");
+        let text = "# Trip\n\nPack the blue umbrella.\n";
+        std::fs::write(&path, text).unwrap();
+        std::fs::write(root.join("other.md"), "nothing here\n").unwrap();
+        std::fs::write(root.join("photo.png"), "blue umbrella").unwrap();
+        let (handle, view) = cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| {
+                    let mut app = Enso::new(window, cx);
+                    app.root = Some(root.clone());
+                    app
+                })
+            })
+            .unwrap()
+        });
+        draw(cx, handle);
+        let key = if cfg!(target_os = "macos") { "cmd-shift-s" } else { "ctrl-shift-s" };
+        cx.simulate_keystrokes(handle, key);
+        draw(cx, handle);
+        cx.simulate_input(handle, "umbrella blue");
+        cx.executor().advance_clock(std::time::Duration::from_millis(500));
+        draw(cx, handle);
+        cx.update(|cx| {
+            let search = view.read(cx).palette.as_ref().unwrap().search.as_ref().unwrap();
+            // Only notes are searched, not other files.
+            assert_eq!(search.hits.len(), 1);
+            assert_eq!(search.hits[0].path, path);
+            assert_eq!(search.hits[0].line, "Pack the blue umbrella.");
+        });
+        cx.simulate_keystrokes(handle, "enter");
+        draw(cx, handle);
+        draw(cx, handle);
+        cx.update(|cx| {
+            let app = view.read(cx);
+            assert!(app.palette.is_none());
+            let doc = &app.documents[app.active.unwrap()];
+            assert_eq!(doc.path.as_ref(), Some(&path));
+            let cursor = doc.editor.read(cx).cursor();
+            assert_eq!(&text[cursor..cursor + 4], "blue");
+        });
+        // The shortcut closes the search again.
+        cx.simulate_keystrokes(handle, key);
+        draw(cx, handle);
+        cx.simulate_keystrokes(handle, key);
+        draw(cx, handle);
+        assert!(cx.update(|cx| view.read(cx).palette.is_none()));
         std::fs::remove_dir_all(root).unwrap();
     }
 

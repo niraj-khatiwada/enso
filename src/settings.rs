@@ -201,12 +201,20 @@ fn tune_theme(cx: &mut App) {
 }
 
 /// Floating surfaces stay opaque so document text never shows through them.
-/// Use softer neutral tones instead of pure black and white.
+/// Use softer neutral tones instead of pure black and white. In dark mode the
+/// surface stays close to the window's own neutral dark; its border and
+/// shadow (`ui::SurfaceExt`) lift it, not a lighter, bluer fill.
 fn tone_surfaces(cx: &mut App) {
     let theme = Theme::global_mut(cx);
-    let surface: Hsla = if theme.mode.is_dark() { rgb(0x252628).into() } else { rgb(0xf5f5f3).into() };
+    let surface: Hsla = if theme.mode.is_dark() { rgb(0x1f1f1f).into() } else { rgb(0xf5f5f3).into() };
     theme.popover = surface;
     theme.tokens.popover = surface.into();
+    // The highlighted row in menus and the command palette. The kit's own
+    // accent is a near-white in light mode, invisible on the surface above,
+    // so it's set a clear step away from that surface instead.
+    let accent: Hsla = if theme.mode.is_dark() { rgb(0x2e2e2e).into() } else { rgb(0xe6e6e3).into() };
+    theme.accent = accent;
+    theme.tokens.accent = accent.into();
 }
 
 /// Hairline scrollbar thumbs, a little wider while hovered or dragged. The kit's

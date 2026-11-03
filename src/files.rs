@@ -265,8 +265,114 @@ pub fn rename(path: &Path, name: &str) -> io::Result<PathBuf> {
     Ok(target)
 }
 
+/// Move a file or folder into the folder `dir`, keeping its name. Never
+/// replaces another entry, and a folder can't go inside itself.
+pub fn move_into(path: &Path, dir: &Path) -> io::Result<PathBuf> {
+    let name = path
+        .file_name()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "This item can't be moved."))?;
+    let target = dir.join(name);
+    if target == path {
+        return Ok(target);
+    }
+    if dir.starts_with(path) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "A folder can't be moved into itself.",
+        ));
+    }
+    if fs::symlink_metadata(&target).is_ok() {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!("“{}” already has an item with that name.", folder_name(dir)),
+        ));
+    }
+    fs::rename(path, &target)?;
+    Ok(target)
+}
+
+fn folder_name(dir: &Path) -> String {
+    dir.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| dir.display().to_string())
+}
+
+/// Copy a file or folder (from Finder, say) into `dir`. A name already taken
+/// gets a number, as Finder does: "Note 2.md".
+pub fn copy_into(source: &Path, dir: &Path) -> io::Result<PathBuf> {
+    let name = source
+        .file_name()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "This item can't be copied."))?;
+    if source.is_dir() && dir.starts_with(source) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "A folder can't be copied into itself.",
+        ));
+    }
+    let name = Path::new(name);
+    let stem = name.file_stem().unwrap_or_default().to_string_lossy();
+    let extension = name.extension().map(|e| format!(".{}", e.to_string_lossy()));
+    let mut target = dir.join(name);
+    let mut n = 2;
+    while fs::symlink_metadata(&target).is_ok() {
+        target = if source.is_dir() {
+            dir.join(format!("{} {n}", name.to_string_lossy()))
+        } else {
+            dir.join(format!("{stem} {n}{}", extension.as_deref().unwrap_or("")))
+        };
+        n += 1;
+    }
+    copy_recursive(source, &target)?;
+    Ok(target)
+}
+
+fn copy_recursive(source: &Path, target: &Path) -> io::Result<()> {
+    if source.is_dir() {
+        fs::create_dir(target)?;
+        for entry in fs::read_dir(source)? {
+            let entry = entry?;
+            copy_recursive(&entry.path(), &target.join(entry.file_name()))?;
+        }
+        Ok(())
+    } else {
+        fs::copy(source, target).map(|_| ())
+    }
+}
+
 /// Detect changes by another application before writing. Keep the original file
 /// intact until a complete replacement has been written beside it.
+/// What `changed_on_disk` found for one open file.
+pub struct DiskChange {
+    pub id: gpui_kit::EntityId,
+    /// The file's new stamp, and its text if that differs from enso's copy;
+    /// `None` if the file is gone or unreadable.
+    pub now: Option<((std::time::SystemTime, u64), Option<String>)>,
+}
+
+/// Compare open files with the disk. Each entry is a document's id, path,
+/// the stamp it was last checked at and the text enso last saved or loaded.
+/// Files whose modified time and size haven't moved are not read.
+pub fn changed_on_disk(
+    open: Vec<(gpui_kit::EntityId, PathBuf, Option<(std::time::SystemTime, u64)>, std::sync::Arc<String>)>,
+) -> Vec<DiskChange> {
+    open.into_iter()
+        .filter_map(|(id, path, stamp, saved)| {
+            let Ok(meta) = fs::metadata(&path) else {
+                return Some(DiskChange { id, now: None });
+            };
+            let now = (meta.modified().ok()?, meta.len());
+            if stamp == Some(now) {
+                return None;
+            }
+            let Ok(text) = read_text(&path) else {
+                return Some(DiskChange { id, now: None });
+            };
+            let text = (text != *saved).then_some(text);
+            Some(DiskChange { id, now: Some((now, text)) })
+        })
+        .collect()
+}
+
 pub fn save(path: &Path, expected: &str, content: &str) -> io::Result<()> {
     if read_text(path)? != expected {
         return Err(io::Error::other(
@@ -310,6 +416,29 @@ fn replace(path: &Path, content: &str) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn moving_and_copying_entries_never_replace_anything() {
+        let root = std::env::temp_dir().join(format!("enso-move-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("a/inner")).unwrap();
+        fs::create_dir_all(root.join("b")).unwrap();
+        fs::write(root.join("note.md"), "x").unwrap();
+        fs::write(root.join("b/note.md"), "taken").unwrap();
+        // Same name already there: refused, nothing lost.
+        assert!(move_into(&root.join("note.md"), &root.join("b")).is_err());
+        assert_eq!(fs::read_to_string(root.join("b/note.md")).unwrap(), "taken");
+        // A folder can't go inside itself.
+        assert!(move_into(&root.join("a"), &root.join("a/inner")).is_err());
+        let moved = move_into(&root.join("note.md"), &root.join("a")).unwrap();
+        assert_eq!(moved, root.join("a/note.md"));
+        // Copies take a number when the name is taken, folders included.
+        assert_eq!(copy_into(&moved, &root.join("b")).unwrap(), root.join("b/note 2.md"));
+        assert_eq!(copy_into(&root.join("a"), &root.join("b")).unwrap(), root.join("b/a"));
+        assert!(root.join("b/a/inner").is_dir() && root.join("b/a/note.md").is_file());
+        assert_eq!(copy_into(&root.join("a"), &root.join("b")).unwrap(), root.join("b/a 2"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
     use super::*;
 
     /// Moves a scratch file to the real Trash / Recycle Bin, so it is not run
