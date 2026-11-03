@@ -45,6 +45,7 @@ pub const BODY_SIZE: f32 = tokens::BODY_TEXT;
 pub const PAGE_TOP: f32 = tokens::PAGE_TOP;
 pub const PAGE_BOTTOM: f32 = tokens::PAGE_BOTTOM;
 const OVERDRAW: Pixels = px(600.);
+const EMPTY_LIMIT: usize = 64;
 const FOCUS_DIM: f32 = tokens::FOCUS_DIM;
 const FOCUS_FADE: Duration = tokens::FOCUS_FADE;
 
@@ -776,6 +777,43 @@ impl VisualView {
             }
         }
         out
+    }
+
+    fn empty_hint(&self, cx: &App) -> Option<AnyElement> {
+        if self.synced_text.len() > EMPTY_LIMIT || !self.synced_text.to_string().trim().is_empty() {
+            return None;
+        }
+        let theme = cx.theme();
+        let (head, _) = self.edge_padding(cx);
+        let shortcut = if cfg!(target_os = "macos") {
+            "⌘"
+        } else {
+            "Ctrl+"
+        };
+        Some(
+            div()
+                .absolute()
+                .top(px(PAGE_TOP) + head)
+                .left_0()
+                .right_0()
+                .flex()
+                .justify_center()
+                .child(
+                    div()
+                        .w(tokens::PAGE_WIDTH)
+                        .max_w_full()
+                        .px_4()
+                        .flex()
+                        .flex_col()
+                        .gap(tokens::SPACE_2)
+                        .text_color(theme.muted_foreground)
+                        .child(div().text_size(px(self.text_size)).child("Start writing"))
+                        .child(div().text_xs().child(format!(
+                            "Markdown shortcuts work as you type. {shortcut}E shows the source; {shortcut}, opens settings."
+                        ))),
+                )
+                .into_any_element(),
+        )
     }
 
     fn guide(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
@@ -1647,6 +1685,7 @@ impl Render for VisualView {
         }
         self.refresh_edge_padding(cx);
         let guide = self.guide(cx);
+        let empty = self.empty_hint(cx);
         let theme = cx.theme();
         let list = list(self.list.clone(), cx.processor(Self::render_row))
             .w_full()
@@ -1746,6 +1785,7 @@ impl Render for VisualView {
                 decorations: self.decorations(cx),
             })
             .children(guide)
+            .children(empty)
             .children(self.render_table_toolbar(window, cx))
             .children(self.render_image_dialog(cx))
             .children(loading)
