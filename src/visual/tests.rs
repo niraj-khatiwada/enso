@@ -884,3 +884,61 @@ fn the_typewriter_guide_drags_and_snaps_to_center(cx: &mut TestAppContext) {
         assert_eq!(super::prefs::WritingPrefs::get(cx).typewriter_guide, 0.5);
     });
 }
+
+#[gpui_kit::test]
+fn focus_follows_the_sentence_and_fades_between_them(cx: &mut TestAppContext) {
+    let doc = "First sentence here. Dr. Who arrives next. Last one\n\nAnother paragraph.\n";
+    let (handle, view) = open(cx, doc);
+    set_prefs(cx, |p| p.focus = super::prefs::FocusMode::Sentence);
+    let at = doc.find("arrives").unwrap();
+    cx.update(|cx| view.update(cx, |v, cx| v.place_caret(at, None, cx)));
+    draw(cx, handle);
+    let target = cx.update(|cx| {
+        view.read(cx)
+            .focus_target(super::prefs::FocusMode::Sentence)
+    });
+    let target = target.unwrap();
+    let text = cx.update(|cx| {
+        let v = view.read(cx);
+        let (bix, lix) = v.doc.leaf_by_key(target.key).unwrap();
+        v.doc.blocks[bix].leaves[lix].text[target.range.clone()].to_string()
+    });
+    assert_eq!(text, "Dr. Who arrives next.");
+    let before = cx.update(|cx| view.read(cx).focus_fade_active().cloned());
+    cx.simulate_input(handle, "x");
+    draw(cx, handle);
+    cx.update(|cx| {
+        let v = view.read(cx);
+        let after = v.focus_fade_active().cloned();
+        assert!(after.is_none() || after == before, "typing starts no fade");
+        let now = v.focus_target(super::prefs::FocusMode::Sentence).unwrap();
+        assert_eq!(
+            (now.block, now.range.start),
+            (target.block, target.range.start)
+        );
+    });
+    let next = cx.update(|cx| view.read(cx).caret) + "rrives next. L".len();
+    cx.update(|cx| view.update(cx, |v, cx| v.place_caret(next, None, cx)));
+    draw(cx, handle);
+    cx.update(|cx| assert!(view.read(cx).focus_fade_active().is_some(), "moving fades"));
+    cx.update(|cx| cx.set_reduce_motion(true));
+    let back = doc.find("First").unwrap();
+    cx.update(|cx| view.update(cx, |v, cx| v.place_caret(back, None, cx)));
+    draw(cx, handle);
+    cx.update(|cx| {
+        assert!(
+            view.read(cx).focus_fade_active().is_none(),
+            "reduced motion switches at once"
+        )
+    });
+    set_prefs(cx, |p| p.focus = super::prefs::FocusMode::Paragraph);
+    draw(cx, handle);
+    let range = cx.update(|cx| {
+        view.read(cx)
+            .focus_target(super::prefs::FocusMode::Paragraph)
+            .unwrap()
+            .range
+    });
+    assert_eq!(range.start, 0);
+    assert!(range.end > "First sentence here. Dr. Who arrives next. Last one".len() - 1);
+}

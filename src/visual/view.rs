@@ -12,6 +12,7 @@ use unicode_segmentation::UnicodeSegmentation as _;
 use super::caret::Caret;
 use super::document::{self, EditResult, Kind, VisualDocument};
 use super::perf::{Perf, ms};
+use super::prefs::FocusMode;
 use super::rows::Rows;
 
 actions!(
@@ -38,6 +39,61 @@ pub const OPEN_PREFIX_BYTES: usize = 12 * 1024;
 pub const BODY_SIZE: f32 = 17.;
 pub const PAGE_TOP: f32 = 28.;
 pub const PAGE_BOTTOM: f32 = 96.;
+const FOCUS_DIM: f32 = 0.62;
+const FOCUS_FADE: Duration = Duration::from_millis(160);
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct FocusTarget {
+    pub block: u64,
+    pub leaf: usize,
+    pub key: u64,
+    pub range: Range<usize>,
+}
+
+impl FocusTarget {
+    fn same_place(&self, other: &FocusTarget) -> bool {
+        self.block == other.block
+            && self.leaf == other.leaf
+            && self.range.start == other.range.start
+    }
+}
+
+fn complement(area: Bounds<Pixels>, holes: &[Bounds<Pixels>]) -> Vec<Bounds<Pixels>> {
+    let mut ys = vec![area.top(), area.bottom()];
+    for hole in holes {
+        ys.push(hole.top().clamp(area.top(), area.bottom()));
+        ys.push(hole.bottom().clamp(area.top(), area.bottom()));
+    }
+    ys.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    ys.dedup();
+    let mut out = Vec::new();
+    for band in ys.windows(2) {
+        let (top, bottom) = (band[0], band[1]);
+        if bottom <= top {
+            continue;
+        }
+        let mut covered: Vec<(Pixels, Pixels)> = holes
+            .iter()
+            .filter(|h| h.top() <= top && h.bottom() >= bottom)
+            .map(|h| (h.left().max(area.left()), h.right().min(area.right())))
+            .collect();
+        covered.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        let mut x = area.left();
+        for (left, right) in covered {
+            if left > x {
+                out.push(Bounds::new(point(x, top), size(left - x, bottom - top)));
+            }
+            x = x.max(right);
+        }
+        if x < area.right() {
+            out.push(Bounds::new(
+                point(x, top),
+                size(area.right() - x, bottom - top),
+            ));
+        }
+    }
+    out
+}
 
 pub const SETTLE_AFTER: Duration = Duration::from_millis(300);
 
@@ -88,6 +144,8 @@ pub struct VisualView {
     pending_reveal: Option<(usize, u8)>,
     pending_place: Option<(Pixels, u8)>,
     guide_drag: Option<f32>,
+    focus_target: Option<FocusTarget>,
+    focus_fade: Option<(FocusTarget, std::time::Instant)>,
     padded: (usize, Pixels, Pixels),
     pub focus: FocusHandle,
     pub perf: Rc<RefCell<Perf>>,
@@ -145,6 +203,8 @@ impl VisualView {
             pending_reveal: None,
             pending_place: None,
             guide_drag: None,
+            focus_target: None,
+            focus_fade: None,
             padded: (0, px(0.), px(0.)),
             focus: cx.focus_handle(),
             perf: Rc::new(RefCell::new(Perf::from_env())),
@@ -408,6 +468,147 @@ impl VisualView {
             self.pending_reveal = Some((row, 4));
         }
         cx.notify();
+    }
+
+    pub fn focus_target(&self, mode: FocusMode) -> Option<FocusTarget> {
+        let (bix, lix, index) = self.doc.locate(self.caret)?;
+        let block = &self.doc.blocks[bix];
+        let leaf = &block.leaves[lix];
+        let range = match mode {
+            FocusMode::Off => return None,
+            FocusMode::Paragraph => 0..leaf.len(),
+            FocusMode::Sentence => super::focus::sentence_at(&leaf.text, index),
+        };
+        Some(FocusTarget {
+            block: block.id,
+            leaf: lix,
+            key: leaf.key,
+            range,
+        })
+    }
+
+    pub fn focus_fade_active(&self) -> Option<&FocusTarget> {
+        self.focus_fade.as_ref().map(|(old, _)| old)
+    }
+
+    fn update_focus(&mut self, cx: &App) {
+        let mode = super::prefs::WritingPrefs::get(cx).focus;
+        let target = self.focus_target(mode);
+        let moved = match (&self.focus_target, &target) {
+            (Some(old), Some(new)) => !old.same_place(new),
+            _ => false,
+        };
+        if moved && !cx.reduce_motion() {
+            self.focus_fade = self
+                .focus_target
+                .clone()
+                .map(|old| (old, std::time::Instant::now()));
+        }
+        if self
+            .focus_fade
+            .as_ref()
+            .is_some_and(|(_, start)| start.elapsed() >= FOCUS_FADE)
+            || target.is_none()
+            || cx.reduce_motion()
+        {
+            self.focus_fade = None;
+        }
+        self.focus_target = target;
+    }
+
+    fn focus_lines(
+        &self,
+        target: &FocusTarget,
+        geometry: &HashMap<u64, LeafGeometry>,
+    ) -> Vec<Bounds<Pixels>> {
+        let Some(g) = geometry.get(&target.key) else {
+            return Vec::new();
+        };
+        let Some((bix, lix)) = self.doc.leaf_by_key(target.key) else {
+            return Vec::new();
+        };
+        let text = &self.doc.blocks[bix].leaves[lix].text;
+        let end = target.range.end.min(text.len());
+        let start = target.range.start.min(end);
+        let line_height = g.line_height();
+        let mut lines: Vec<(Pixels, Pixels, Pixels)> = Vec::new();
+        let boundaries = text[start..end]
+            .grapheme_indices(true)
+            .map(|(i, _)| start + i)
+            .chain(std::iter::once(end));
+        for i in boundaries {
+            let p = g.position_for_index(i);
+            match lines.iter_mut().find(|(y, _, _)| *y == p.y) {
+                Some(line) => {
+                    line.1 = line.1.min(p.x);
+                    line.2 = line.2.max(p.x);
+                }
+                None => lines.push((p.y, p.x, p.x)),
+            }
+        }
+        lines
+            .into_iter()
+            .map(|(y, left, right)| {
+                Bounds::new(
+                    point(left - px(2.), y),
+                    size(right - left + px(4.), line_height),
+                )
+            })
+            .collect()
+    }
+
+    fn paint_focus(&self, bounds: Bounds<Pixels>, window: &mut Window, cx: &App) {
+        let Some(target) = &self.focus_target else {
+            return;
+        };
+        let geometry = self.geometry.borrow();
+        let progress = self.focus_fade.as_ref().map_or(1., |(_, start)| {
+            (start.elapsed().as_secs_f32() / FOCUS_FADE.as_secs_f32()).min(1.)
+        });
+        let mut clear: Vec<(Bounds<Pixels>, f32)> = self
+            .focus_lines(target, &geometry)
+            .into_iter()
+            .map(|line| (line, FOCUS_DIM * (1. - progress)))
+            .collect();
+        if let Some((old, _)) = &self.focus_fade {
+            clear.extend(
+                self.focus_lines(old, &geometry)
+                    .into_iter()
+                    .map(|line| (line, FOCUS_DIM * progress)),
+            );
+        }
+        let veil = cx.theme().background;
+        let first = self.list.logical_scroll_top().item_ix;
+        window.with_content_mask(Some(ContentMask { bounds }), |window| {
+            for ix in first..self.rows.len() {
+                let Some(row) = self.list.bounds_for_item(ix) else {
+                    break;
+                };
+                if row.top() > bounds.bottom() {
+                    break;
+                }
+                let row = Bounds::new(
+                    point(row.left() - px(8.), row.top()),
+                    size(row.size.width + px(16.), row.size.height),
+                );
+                let inside: Vec<Bounds<Pixels>> = clear
+                    .iter()
+                    .map(|(line, _)| *line)
+                    .filter(|line| line.bottom() > row.top() && line.top() < row.bottom())
+                    .collect();
+                for gap in complement(row, &inside) {
+                    window.paint_quad(fill(gap, veil.opacity(FOCUS_DIM)));
+                }
+            }
+            for (line, alpha) in &clear {
+                if *alpha > 0.01 {
+                    window.paint_quad(fill(*line, veil.opacity(*alpha)));
+                }
+            }
+        });
+        if self.focus_fade.is_some() {
+            window.request_animation_frame();
+        }
     }
 
     pub fn guide_fraction(&self, cx: &App) -> Option<f32> {
@@ -1453,6 +1654,7 @@ impl Element for Surface {
                 view.pending_place = Some((y, tries - 1));
                 cx.notify();
             }
+            view.update_focus(cx);
             if let Some(down) = view.pending_vertical.take() {
                 if !view.try_vertical(down) {
                     view.pending_vertical = Some(down);
@@ -1474,6 +1676,7 @@ impl Element for Surface {
     ) {
         child.paint(window, cx);
         let view = self.view.read(cx);
+        view.paint_focus(bounds, window, cx);
         let focused = view.focus.is_focused(window);
         if focused
             && view.caret_blink.visible()

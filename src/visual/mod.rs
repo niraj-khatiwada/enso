@@ -2,6 +2,7 @@ mod build;
 pub mod caret;
 mod commands;
 pub mod document;
+mod focus;
 mod input;
 pub mod mapping;
 pub mod perf;
