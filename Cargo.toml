@@ -11,6 +11,7 @@ futures = "0.3"
 url = "2"
 gpui-test = { package = "gpui-pre", version = "=0.3.10", features = ["test-support"], optional = true }
 gpui-kit = "0.8.1"
+unicode-segmentation = "1.13"
 
 # Moving deleted files to the Trash: the trash crate on macOS and Linux;
 # Windows goes through the shell itself (see files::move_to_trash).
@@ -44,6 +45,7 @@ strip = true
 # Keep the supplied GPUI Kit version working with stable Rust.
 [patch.crates-io]
 gpui-pre-macos = { path = "vendor/gpui-pre-macos" }
+gpui-base = { git = "https://github.com/viai957/enso", rev = "f286ac475620064420f38a3fb5c1f5532219ec9c" }
 
 [features]
 ui-tests = ["dep:gpui-test"]

@@ -1,9 +1,12 @@
+use crate::tokens;
+use crate::visual::prefs::{BLINK_CELLS, CaretColor, FocusMode, WritingPrefs};
 use gpui_kit::assets::IconName;
 use gpui_kit::component::{
-    ActiveTheme, Theme, ThemeMode, ThemeRegistry, TitleBar,
+    ActiveTheme, Sizable, Theme, ThemeMode, ThemeRegistry, TitleBar,
     button::{Button, ButtonVariants},
     h_flex,
     switch::Switch,
+    tooltip::Tooltip,
     v_flex,
 };
 use gpui_kit::{prelude::FluentBuilder, *};
@@ -78,6 +81,31 @@ fn set_line_numbers(on: bool, cx: &mut App) -> io::Result<()> {
     Ok(())
 }
 
+fn writing_path() -> Option<PathBuf> {
+    dirs::config_dir().map(|p| crate::files::app_folder(p).join("writing"))
+}
+
+pub fn set_writing(cx: &mut App, change: impl FnOnce(&mut WritingPrefs)) -> io::Result<()> {
+    let mut prefs = WritingPrefs::get(cx);
+    change(&mut prefs);
+    cx.set_global(prefs);
+    save_writing(cx)
+}
+
+fn save_writing(cx: &App) -> io::Result<()> {
+    let Some(path) = writing_path() else {
+        return Ok(());
+    };
+    let text = WritingPrefs::get(cx).serialize();
+    if std::fs::read_to_string(&path).is_ok_and(|saved| saved == text) {
+        return Ok(());
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, text)
+}
+
 fn load(path: &Path) -> Appearance {
     std::fs::read_to_string(path)
         .map(|value| Appearance::parse(&value))
@@ -87,7 +115,14 @@ fn load(path: &Path) -> Appearance {
 pub fn init(cx: &mut App) {
     let path = path();
     let appearance = path.as_ref().map(|p| load(p)).unwrap_or_default();
-    let line_numbers = line_numbers_path().as_deref().is_some_and(load_line_numbers);
+    let line_numbers = line_numbers_path()
+        .as_deref()
+        .is_some_and(load_line_numbers);
+    let writing = writing_path()
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .map(|text| WritingPrefs::parse(&text))
+        .unwrap_or_default();
+    cx.set_global(writing);
     cx.set_global(Preferences {
         appearance,
         line_numbers,
@@ -100,6 +135,10 @@ pub fn init(cx: &mut App) {
     // the gutter color set above. Registered after the kit's own observer, so
     // this runs once its reload is done.
     cx.observe_global::<ThemeRegistry>(tune_theme).detach();
+    cx.observe_global::<WritingPrefs>(|cx| {
+        let _ = save_writing(cx);
+    })
+    .detach();
     cx.bind_keys([
         KeyBinding::new("cmd-w", CloseSettings, Some("EnsoSettings")),
         KeyBinding::new("ctrl-w", CloseSettings, Some("EnsoSettings")),
@@ -153,9 +192,9 @@ fn thin_scrollbars(cx: &mut App) {
         .scrollbar
         .styles()
         .clone()
-        .thumb(|thumb| thumb.width(px(3.)).inset(px(2.)))
-        .thumb_hover(|thumb| thumb.width(px(4.)).inset(px(2.)))
-        .thumb_active(|thumb| thumb.width(px(4.)).inset(px(2.)));
+        .thumb(|thumb| thumb.width(tokens::SCROLL_THUMB).inset(tokens::SPACE_1))
+        .thumb_hover(|thumb| thumb.width(tokens::SPACE_2).inset(tokens::SPACE_1))
+        .thumb_active(|thumb| thumb.width(tokens::SPACE_2).inset(tokens::SPACE_1));
     base.scrollbar = base.scrollbar.clone().with_styles(styles);
     cx.refresh_windows();
 }
@@ -225,7 +264,10 @@ pub fn open(cx: &mut App) {
         WindowOptions {
             titlebar: Some(if cfg!(target_os = "macos") {
                 TitlebarOptions {
-                    traffic_light_position: Some(point(px(12.), px(14.))),
+                    traffic_light_position: Some(point(
+                        tokens::SPACE_5,
+                        tokens::BAR / 2. - tokens::SPACE_4,
+                    )),
                     ..TitleBar::title_bar_options()
                 }
             } else {
@@ -237,10 +279,13 @@ pub fn open(cx: &mut App) {
             app_owns_titlebar_drag: cfg!(target_os = "macos"),
             window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
                 None,
-                size(px(760.), px(480.)),
+                size(px(tokens::SETTINGS_WINDOW.0), px(tokens::SETTINGS_WINDOW.1)),
                 cx,
             ))),
-            window_min_size: Some(size(px(680.), px(420.))),
+            window_min_size: Some(size(
+                px(tokens::SETTINGS_WINDOW_MIN.0),
+                px(tokens::SETTINGS_WINDOW_MIN.1),
+            )),
             ..Default::default()
         },
         cx,
@@ -254,6 +299,7 @@ pub fn open(cx: &mut App) {
                     category: Category::Appearance,
                     error: None,
                     _appearance: watch_system(window),
+                    _writing: cx.observe_global::<WritingPrefs>(|_, cx| cx.notify()),
                 }
             })
         },
@@ -266,25 +312,97 @@ pub fn open(cx: &mut App) {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Category {
     Appearance,
+    Writing,
+    Caret,
     Editor,
 }
 
 impl Category {
-    const ALL: [Category; 2] = [Category::Appearance, Category::Editor];
+    const ALL: [Category; 4] = [
+        Category::Appearance,
+        Category::Writing,
+        Category::Caret,
+        Category::Editor,
+    ];
 
     fn label(self) -> &'static str {
         match self {
             Self::Appearance => "Appearance",
-            Self::Editor => "Editor",
+            Self::Writing => "Writing",
+            Self::Caret => "Caret",
+            Self::Editor => "Source editor",
         }
     }
 
     fn icon(self) -> IconName {
         match self {
             Self::Appearance => IconName::Palette,
-            Self::Editor => IconName::Pencil,
+            Self::Writing => IconName::BookOpen,
+            Self::Caret => IconName::TextCursor,
+            Self::Editor => IconName::SquareTerminal,
         }
     }
+}
+
+const CARET_SWATCHES: [(u32, &str); 5] = [
+    (0x2f6fde, "Blue"),
+    (0x8a4fff, "Violet"),
+    (0xe0457b, "Pink"),
+    (0x1f9d55, "Green"),
+    (0xe8890c, "Orange"),
+];
+
+fn setting_row(
+    title: &'static str,
+    description: &'static str,
+    control: impl IntoElement,
+    theme: &Theme,
+) -> impl IntoElement {
+    h_flex()
+        .gap_4()
+        .items_center()
+        .justify_between()
+        .py_3()
+        .border_b_1()
+        .border_color(theme.border)
+        .child(
+            v_flex()
+                .gap_0p5()
+                .min_w_0()
+                .child(div().text_sm().font_weight(FontWeight::MEDIUM).child(title))
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .child(description),
+                ),
+        )
+        .child(control)
+}
+
+fn segmented<T: Copy + PartialEq + 'static>(
+    id: &'static str,
+    choices: Vec<(T, SharedString)>,
+    selected: T,
+    on_pick: impl Fn(T, &mut App) + Clone + 'static,
+    theme: &Theme,
+) -> impl IntoElement {
+    h_flex()
+        .p_0p5()
+        .gap_0p5()
+        .rounded_md()
+        .bg(theme.secondary.opacity(tokens::FADED))
+        .children(choices.into_iter().enumerate().map(|(i, (value, label))| {
+            let on_pick = on_pick.clone();
+            let active = value == selected;
+            Button::new((id, i))
+                .ghost()
+                .small()
+                .label(label.clone())
+                .accessibility_label(label)
+                .when(active, |b| b.bg(theme.background))
+                .on_click(move |_, _, cx| on_pick(value, cx))
+        }))
 }
 
 struct SettingsWindow {
@@ -292,6 +410,7 @@ struct SettingsWindow {
     category: Category,
     error: Option<String>,
     _appearance: Subscription,
+    _writing: Subscription,
 }
 
 fn preview(appearance: Appearance) -> impl IntoElement {
@@ -302,11 +421,11 @@ fn preview(appearance: Appearance) -> impl IntoElement {
     };
     h_flex()
         .w_full()
-        .h(px(66.))
+        .h(tokens::SETTING_PREVIEW)
         .rounded_md()
         .overflow_hidden()
         .border_1()
-        .border_color(rgb(0x888888).opacity(0.2))
+        .border_color(rgb(0x888888).opacity(tokens::SUBTLE))
         .children(halves.iter().map(|dark| {
             let background = if *dark { rgb(0x202124) } else { rgb(0xffffff) };
             let sidebar = if *dark { rgb(0x2e3034) } else { rgb(0xf0f1f3) };
@@ -315,20 +434,32 @@ fn preview(appearance: Appearance) -> impl IntoElement {
                 .flex_1()
                 .h_full()
                 .bg(background)
-                .child(div().w(px(18.)).h_full().bg(sidebar))
+                .child(div().w(tokens::PREVIEW_SIDEBAR).h_full().bg(sidebar))
                 .child(
                     v_flex()
                         .flex_1()
                         .p_2()
                         .gap_2()
-                        .child(div().w(relative(0.7)).h(px(4.)).rounded_sm().bg(ink))
-                        .child(div().w_full().h(px(3.)).rounded_sm().bg(ink.opacity(0.5)))
+                        .child(
+                            div()
+                                .w(relative(0.7))
+                                .h(tokens::SPACE_2)
+                                .rounded_sm()
+                                .bg(ink),
+                        )
+                        .child(
+                            div()
+                                .w_full()
+                                .h(tokens::SCROLL_THUMB)
+                                .rounded_sm()
+                                .bg(ink.opacity(tokens::FADED)),
+                        )
                         .child(
                             div()
                                 .w(relative(0.8))
-                                .h(px(3.))
+                                .h(tokens::SCROLL_THUMB)
                                 .rounded_sm()
-                                .bg(ink.opacity(0.5)),
+                                .bg(ink.opacity(tokens::FADED)),
                         ),
                 )
         }))
@@ -337,7 +468,12 @@ fn preview(appearance: Appearance) -> impl IntoElement {
 fn page_header(title: &'static str, description: &'static str, muted: Hsla) -> impl IntoElement {
     v_flex()
         .gap_1()
-        .child(div().text_xl().font_weight(FontWeight::SEMIBOLD).child(title))
+        .child(
+            div()
+                .text_xl()
+                .font_weight(FontWeight::SEMIBOLD)
+                .child(title),
+        )
         .child(div().text_sm().text_color(muted).child(description))
 }
 
@@ -355,7 +491,12 @@ impl SettingsWindow {
             .child(
                 v_flex()
                     .gap_3()
-                    .child(div().text_sm().font_weight(FontWeight::MEDIUM).child("Theme"))
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_weight(FontWeight::MEDIUM)
+                            .child("Theme"),
+                    )
                     .child(
                         h_flex().gap_3().children(
                             [
@@ -365,46 +506,254 @@ impl SettingsWindow {
                             ]
                             .into_iter()
                             .enumerate()
-                            .map(|(index, (appearance, label, icon))| {
-                                Button::new(("appearance", index))
-                                    .ghost()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .h(px(132.))
-                                    .p_3()
-                                    .border_1()
-                                    .border_color(if selected == appearance {
-                                        theme.primary
-                                    } else {
-                                        theme.border
-                                    })
-                                    .when(selected == appearance, |button| {
-                                        button.bg(theme.secondary)
-                                    })
-                                    .accessibility_label(format!("{label} theme"))
-                                    .child(
-                                        v_flex()
-                                            .w_full()
-                                            .gap_3()
-                                            .child(preview(appearance))
-                                            .child(
-                                                h_flex()
-                                                    .items_center()
-                                                    .justify_center()
-                                                    .gap_2()
-                                                    .child(icon)
-                                                    .child(div().text_sm().child(label)),
-                                            ),
-                                    )
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.error = choose(appearance, cx).err().map(|error| {
-                                            format!("Could not save appearance: {error}")
-                                        });
-                                        cx.notify();
-                                    }))
-                            }),
+                            .map(
+                                |(index, (appearance, label, icon))| {
+                                    Button::new(("appearance", index))
+                                        .ghost()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .h(tokens::SETTING_CARD)
+                                        .p_3()
+                                        .border_1()
+                                        .border_color(if selected == appearance {
+                                            theme.primary
+                                        } else {
+                                            theme.border
+                                        })
+                                        .when(selected == appearance, |button| {
+                                            button.bg(theme.secondary)
+                                        })
+                                        .accessibility_label(format!("{label} theme"))
+                                        .child(
+                                            v_flex()
+                                                .w_full()
+                                                .gap_3()
+                                                .child(preview(appearance))
+                                                .child(
+                                                    h_flex()
+                                                        .items_center()
+                                                        .justify_center()
+                                                        .gap_2()
+                                                        .child(icon)
+                                                        .child(div().text_sm().child(label)),
+                                                ),
+                                        )
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.error =
+                                                choose(appearance, cx).err().map(|error| {
+                                                    format!("Could not save appearance: {error}")
+                                                });
+                                            cx.notify();
+                                        }))
+                                },
+                            ),
                         ),
                     ),
+            )
+    }
+
+    fn writing_setter<T: 'static>(
+        &self,
+        cx: &mut Context<Self>,
+        change: fn(&mut WritingPrefs, T),
+    ) -> impl Fn(T, &mut App) + Clone + 'static {
+        let weak = cx.entity().downgrade();
+        move |value, cx| {
+            let error = set_writing(cx, |prefs| change(prefs, value))
+                .err()
+                .map(|error| format!("Could not save writing settings: {error}"));
+            let _ = weak.update(cx, |this, cx| {
+                this.error = error;
+                cx.notify();
+            });
+        }
+    }
+
+    fn writing_page(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme().clone();
+        let prefs = WritingPrefs::get(cx);
+        let typewriter = self.writing_setter(cx, |p, on: bool| p.typewriter = on);
+        let focus = self.writing_setter(cx, |p, mode: FocusMode| p.focus = mode);
+        let size = self.writing_setter(cx, |p, size: u32| p.text_size = size as f32);
+        let chrome = self.writing_setter(cx, |p, on: bool| p.hide_chrome = on);
+        v_flex()
+            .gap_6()
+            .child(page_header(
+                "Writing",
+                "How the page behaves while you write.",
+                theme.muted_foreground,
+            ))
+            .child(
+                v_flex()
+                    .child(setting_row(
+                        "Typewriter mode",
+                        "Keep the line you are writing at the same height. Drag the guide in the page to move it.",
+                        Switch::new("typewriter")
+                            .checked(prefs.typewriter)
+                            .accessibility_label("Typewriter mode")
+                            .on_change(move |on, _, cx| typewriter(*on, cx)),
+                        &theme,
+                    ))
+                    .child(setting_row(
+                        "Hide the interface while typing",
+                        "The sidebar, tabs and status bar fade while you write and return when you move the pointer or press Escape.",
+                        Switch::new("hide-chrome")
+                            .checked(prefs.hide_chrome)
+                            .accessibility_label("Hide the interface while typing")
+                            .on_change(move |on, _, cx| chrome(*on, cx)),
+                        &theme,
+                    ))
+                    .child(setting_row(
+                        "Text size",
+                        "The size of body text in the page. Cmd+= and Cmd+- change it while you write.",
+                        segmented(
+                            "text-size",
+                            vec![
+                                (15u32, "Small".into()),
+                                (17, "Medium".into()),
+                                (19, "Large".into()),
+                                (22, "Larger".into()),
+                            ],
+                            prefs.text_size.round() as u32,
+                            size,
+                            &theme,
+                        ),
+                        &theme,
+                    ))
+                    .child(setting_row(
+                        "Focus",
+                        "Dim everything but the sentence or paragraph you are writing.",
+                        segmented(
+                            "focus",
+                            FocusMode::ALL
+                                .into_iter()
+                                .map(|m| (m, m.label().into()))
+                                .collect(),
+                            prefs.focus,
+                            focus,
+                            &theme,
+                        ),
+                        &theme,
+                    )),
+            )
+    }
+
+    fn caret_page(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme().clone();
+        let prefs = WritingPrefs::get(cx);
+        let color = self.writing_setter(cx, |p, c: CaretColor| p.caret_color = c);
+        let width = self.writing_setter(cx, |p, w: u32| p.caret_width = w as f32);
+        let blink = self.writing_setter(cx, |p, on: bool| p.caret_blink = on);
+        let rate = self.writing_setter(cx, |p, ms: u32| p.blink_period_ms = ms);
+        let cell = self.writing_setter(cx, |p, i: u32| {
+            let flipped = p.blink_pattern ^ (1 << i);
+            if flipped != 0 {
+                p.blink_pattern = flipped;
+            }
+        });
+        let swatch = |id: usize, value: CaretColor, fill: Hsla, label: &'static str| {
+            let color = color.clone();
+            let active = prefs.caret_color == value;
+            div()
+                .id(("caret-color", id))
+                .size(tokens::SWATCH)
+                .rounded_full()
+                .bg(fill)
+                .border_2()
+                .border_color(if active {
+                    theme.foreground
+                } else {
+                    theme.border
+                })
+                .cursor_pointer()
+                .tooltip(move |window, cx| Tooltip::new(label).build(window, cx))
+                .on_click(move |_, _, cx| color(value, cx))
+        };
+        let mut swatches = vec![
+            swatch(0, CaretColor::Theme, theme.caret, "Theme"),
+            swatch(1, CaretColor::Accent, theme.primary, "Accent"),
+        ];
+        for (i, (value, label)) in CARET_SWATCHES.into_iter().enumerate() {
+            swatches.push(swatch(
+                2 + i,
+                CaretColor::Custom(value),
+                rgb(value).into(),
+                label,
+            ));
+        }
+        let pattern = h_flex().gap_0p5().children((0..BLINK_CELLS).map(|i| {
+            let cell = cell.clone();
+            let on = prefs.blink_pattern & (1 << i) != 0;
+            div()
+                .id(("blink-cell", i as usize))
+                .w(tokens::ICON_SM)
+                .h(tokens::CONTROL_SM)
+                .rounded_sm()
+                .border_1()
+                .border_color(theme.border)
+                .when(on, |c| c.bg(theme.foreground.opacity(tokens::ACTIVE)))
+                .when(!prefs.caret_blink, |c| c.opacity(tokens::DISABLED))
+                .cursor_pointer()
+                .on_click(move |_, _, cx| cell(i, cx))
+        }));
+        v_flex()
+            .gap_6()
+            .child(page_header(
+                "Caret",
+                "The caret in the page. The source editor keeps its own.",
+                theme.muted_foreground,
+            ))
+            .child(
+                v_flex()
+                    .child(setting_row(
+                        "Color",
+                        "The theme's caret, its accent, or a color of your own.",
+                        h_flex().gap_2().children(swatches),
+                        &theme,
+                    ))
+                    .child(setting_row(
+                        "Thickness",
+                        "Caret width in pixels.",
+                        segmented(
+                            "caret-width",
+                            (1..=4u32).map(|w| (w, format!("{w} px").into())).collect(),
+                            prefs.caret_width.round() as u32,
+                            width,
+                            &theme,
+                        ),
+                        &theme,
+                    ))
+                    .child(setting_row(
+                        "Blink",
+                        "A steady caret, or one that blinks.",
+                        Switch::new("caret-blink")
+                            .checked(prefs.caret_blink)
+                            .accessibility_label("Caret blink")
+                            .on_change(move |on, _, cx| blink(*on, cx)),
+                        &theme,
+                    ))
+                    .child(setting_row(
+                        "Blink rate",
+                        "How long one blink takes.",
+                        segmented(
+                            "blink-rate",
+                            vec![
+                                (1400u32, "Slow".into()),
+                                (1060, "Medium".into()),
+                                (700, "Fast".into()),
+                            ],
+                            prefs.blink_period_ms,
+                            rate,
+                            &theme,
+                        ),
+                        &theme,
+                    ))
+                    .child(setting_row(
+                        "Blink pattern",
+                        "One blink in twelve steps: filled steps show the caret.",
+                        pattern,
+                        &theme,
+                    )),
             )
     }
 
@@ -430,22 +779,24 @@ impl SettingsWindow {
                     .child(
                         v_flex()
                             .gap_0p5()
-                            .child(div().text_sm().font_weight(FontWeight::MEDIUM).child("Line numbers"))
                             .child(
                                 div()
-                                    .text_xs()
-                                    .text_color(theme.muted_foreground)
-                                    .child("Show line numbers beside the text in Edit and Split views."),
-                            ),
+                                    .text_sm()
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .child("Line numbers"),
+                            )
+                            .child(div().text_xs().text_color(theme.muted_foreground).child(
+                                "Show line numbers beside the text in Edit and Split views.",
+                            )),
                     )
                     .child(
                         Switch::new("line-numbers")
                             .checked(line_numbers)
                             .accessibility_label("Line numbers")
                             .on_change(move |on, _, cx| {
-                                let error = set_line_numbers(*on, cx)
-                                    .err()
-                                    .map(|error| format!("Could not save editor settings: {error}"));
+                                let error = set_line_numbers(*on, cx).err().map(|error| {
+                                    format!("Could not save editor settings: {error}")
+                                });
                                 let _ = weak.update(cx, |this, cx| {
                                     this.error = error;
                                     cx.notify();
@@ -462,6 +813,8 @@ impl Render for SettingsWindow {
         let category = self.category;
         let page = match category {
             Category::Appearance => self.appearance_page(cx).into_any_element(),
+            Category::Writing => self.writing_page(cx).into_any_element(),
+            Category::Caret => self.caret_page(cx).into_any_element(),
             Category::Editor => self.editor_page(cx).into_any_element(),
         };
         v_flex()
@@ -474,7 +827,7 @@ impl Render for SettingsWindow {
             .on_action(|_: &CloseSettings, window, _| window.remove_window())
             .when(cfg!(target_os = "macos"), |view| {
                 view.child(
-                    TitleBar::new().h(px(44.)).bg(theme.background).child(
+                    TitleBar::new().h(tokens::BAR).bg(theme.background).child(
                         h_flex()
                             .h_full()
                             .items_center()
@@ -489,7 +842,7 @@ impl Render for SettingsWindow {
                     .items_start()
                     .child(
                         v_flex()
-                            .w(px(180.))
+                            .w(tokens::NAV_WIDTH)
                             .h_full()
                             .flex_shrink_0()
                             .p_3()
@@ -501,7 +854,7 @@ impl Render for SettingsWindow {
                                 let active = item == category;
                                 h_flex()
                                     .id(("settings-category", i))
-                                    .h(px(30.))
+                                    .h(tokens::CONTROL)
                                     .px_2()
                                     .gap_2()
                                     .items_center()
@@ -509,12 +862,13 @@ impl Render for SettingsWindow {
                                     .cursor_pointer()
                                     .text_sm()
                                     .when(active, |row| {
-                                        row.bg(theme.secondary.opacity(0.5))
+                                        row.bg(theme.secondary.opacity(tokens::ACTIVE))
                                             .font_weight(FontWeight::MEDIUM)
                                     })
                                     .when(!active, |row| {
-                                        row.text_color(theme.muted_foreground)
-                                            .hover(|row| row.bg(theme.secondary.opacity(0.35)))
+                                        row.text_color(theme.muted_foreground).hover(|row| {
+                                            row.bg(theme.secondary.opacity(tokens::HOVER))
+                                        })
                                     })
                                     .child(item.icon())
                                     .child(item.label())
@@ -527,8 +881,11 @@ impl Render for SettingsWindow {
                     )
                     .child(
                         v_flex()
+                            .id("settings-page")
                             .flex_1()
                             .min_w_0()
+                            .h_full()
+                            .overflow_y_scroll()
                             .p_8()
                             .gap_6()
                             .child(page)

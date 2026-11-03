@@ -1,0 +1,19 @@
+mod build;
+pub mod caret;
+mod commands;
+pub mod document;
+mod focus;
+mod front_matter;
+pub mod image;
+mod image_ui;
+mod input;
+pub mod mapping;
+pub mod perf;
+pub mod prefs;
+pub mod rows;
+mod table_edit;
+mod table_ui;
+#[cfg(all(test, feature = "ui-tests"))]
+mod tests;
+mod toolbar;
+pub mod view;

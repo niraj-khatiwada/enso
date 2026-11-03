@@ -7,47 +7,105 @@
 
 <h1 align="center">enso</h1>
 
-<p align="center">A native, reading-first Markdown workspace built in Rust with GPUI Kit. No webview or Tauri.</p>
+<p align="center">A native Markdown studio for writing. Edit right in the typeset page, keep plain <code>.md</code> files on disk. Built in Rust with GPUI Kit, with no web view.</p>
 
-## Run
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/visual-dark.png">
+    <img src="assets/screenshots/visual-light.png" alt="A note open in enso's visual editor" width="880">
+  </picture>
+</p>
 
-Install stable Rust (1.95 or later). GPUI Kit comes from crates.io (`gpui-kit = "0.8.1"`), so a plain clone builds on its own.
+## Write in the page
 
-```sh
-cargo run
-cargo run -- /absolute/path/to/note.md
-cargo run -- /absolute/path/to/folder
-```
+Open any Markdown file and you see it typeset: headings, emphasis, lists, task lists, quotes, tables, code blocks, links and images. Click anywhere and type. There's no preview pane: the page you read is the page you edit, and the Markdown behind it changes only where you typed.
 
-On macOS, `make` lists the build targets. `make build.macos` produces the release: an optimized `target/enso.app` with its Quick Look extension (Space-bar previews of Markdown in Finder), ad-hoc signed, and `target/enso-<version>-<arch>.dmg`. `make app` stops at the app, `make app.debug` makes a quick unoptimized one, and `make install` copies it to `/Applications` and registers it and its Quick Look preview. The bundle uses `assets/enso.icns`; `assets/enso.png` also supplies the Dock icon during `cargo run`.
+- **Selection that feels native:** drag across blocks with edge autoscroll, double-click for a word, triple-click for a paragraph, Shift-click or Shift-arrows to extend.
+- **Copy as Markdown:** the clipboard gets the exact source behind your selection, so pasting into another Markdown file round-trips.
+- **Formatting shortcuts:** bold, italic, strikethrough, code, links, headings, lists, task lists, quotes and code blocks. Each applies to the selection or the word at the caret, and pressing it again removes it.
+- **Lists that continue:** Enter starts the next bullet, task or number; Enter on an empty item ends the list. Tab and Shift-Tab nest and un-nest.
+- **Links and footnotes:** `[text][id]` resolves through its definition anywhere in the file, and editing the definition updates every link that uses it. ⌘-click (Ctrl-click) or ⌥Enter follows a link, and jumps from a footnote to its note and back.
+- **One undo history:** undo and redo work the same in every view, and restore where you were.
 
-The initial build downloads and compiles GPUI's native dependencies. Subsequent builds are incremental. Development builds optimize GPUI Base, Ropey, and the text index to avoid slow million-line editor initialization under `cargo run`; the first rebuild after a profile change takes longer.
+<p align="center"><img src="assets/screenshots/select-light.png" alt="A paragraph selected in the visual editor" width="880"></p>
 
-## First version
+## Source when you want it
 
-On the first launch without a file/folder argument, enso creates and opens an editable `Get Started.md` in its local application data folder (`~/Library/Application Support/enso` on macOS, `%LOCALAPPDATA%/enso` on Windows, and `$XDG_DATA_HOME/enso` or `~/.local/share/enso` on Linux). It auto-saves like any document. A separate first-launch marker prevents repeated opening or recreation, and existing sample edits are preserved. Explicit file/folder arguments take priority.
+⌘E switches between the page and syntax-highlighted Markdown. ⌘\\ puts them side by side, and pressing it again returns to the view you came from. The caret stays on the same character across views and stays at the same height on screen, so you never lose your place. In side by side, typing on either side updates the other immediately.
 
-- Native dialogs for opening individual UTF-8 text files or folders.
-- Lazy folder browsing, nested directory expansion, and manual refresh.
-- New files in the workspace root. Without a folder, choose the file location when creating a note.
-- Document tabs retain edits while switching files or folders. Hover a tab to smoothly expand its pill and fade in the close icon, with no reserved close-button space at rest; Ctrl W (or Cmd W on macOS) closes the current file after saving pending edits.
-- Draggable dividers resize the sidebar and the editor/preview split. The sidebar animates open/closed while preserving its resized width and respecting reduced-motion settings. Toolbar actions use icons with tooltips.
-- macOS uses a compact custom titlebar with native traffic lights, enso branding, and a sidebar collapse/expand button. File tabs share the macOS titlebar, including their animated hover close buttons; there is no separate tab row. Windows and Linux keep their native titlebars.
-- Read and Split reveal the section containing the editor cursor when switching views. In Split, editor clicks and cursor movement also move the preview to the corresponding passage.
-- A compact 20 px status bar shows a word count; counting runs on background snapshots and debounces while typing.
-- Markdown files above 256 KiB use a virtual section reader: only visible sections are parsed and laid out, with source editing initialized on demand outside the render pass. Large-file editing disables syntax highlighting, code folding, auto-close, and soft wrapping.
-- Markdown reading, source editing, and live split preview using GPUI Kit's renderer.
-- Plain text files open directly in the editor.
-- Automatic saving after 500 ms of idle time, serialized background writes, external-change detection, and pending-save flushing when quitting. Cmd/Ctrl S saves immediately.
-- Relative local images resolve against the document folder. Web links open in the browser; relative file links reveal the target in the system file manager.
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/side-dark.png">
+    <img src="assets/screenshots/side-light.png" alt="Source and visual views side by side" width="880">
+  </picture>
+</p>
 
-Use Cmd on macOS and Ctrl on Windows/Linux: O opens a file, Shift O opens a folder, N creates a file, W closes the current file after saving pending edits, S saves, E toggles Edit/Read, backslash toggles Split (press again to return to the previous view), and Q quits. Ctrl+E and Ctrl+backslash also work on macOS; Split no longer requires Shift.
+<p align="center"><img src="assets/screenshots/source-light.png" alt="The Markdown source view" width="880"></p>
 
-## Releases
+## Writing modes
 
-`.github/workflows/release.yml` builds release packages on GitHub Actions: a macOS disk image for Apple silicon (with the Quick Look extension), Windows zips for x64 and ARM64, and Linux tarballs for x64 and ARM64. Run it by hand from the Actions tab (Release -> Run workflow): it puts the packages in a draft GitHub Release for the version in `Cargo.toml`, to check and publish from the Releases page. Running it again for the same version replaces the draft's files.
+**Typewriter mode** keeps the line you are writing at one height on the screen, so your eyes stay put while the page moves. A dashed guide marks the line; drag it up or down and it settles back to the centre when you release near it. ⌘⇧T turns it on and off.
 
-The macOS app is ad-hoc signed, not notarized, so Gatekeeper asks on first open. On Linux, unpack the tarball (`tar -xzf enso-<version>-linux-<arch>.tar.gz`) and run `./install.sh` (or `sh install.sh`) to add enso to the app launcher.
+<p align="center"><img src="assets/screenshots/typewriter-light.png" alt="Typewriter mode with the writing line on its guide" width="880"></p>
+
+**Focus** dims everything except the sentence or paragraph you are writing, and fades softly as you move between them. Sentences end where you expect, even after abbreviations like "Dr." or "e.g." and in Devanagari after the danda (।). ⌘⇧D cycles through off, sentence and paragraph.
+
+<p align="center"><img src="assets/screenshots/focus-light.png" alt="Sentence focus dimming the rest of the page" width="880"></p>
+
+While you type, the sidebar, tabs and status bar fade away and return as soon as you move the pointer or press Escape. The text column never moves.
+
+## Images
+
+Images sit in the page at their natural size, up to the width of the column. Click one to select it: drag the handle to resize it, align it left, centre or float it right, or open the image dialog to change its file, description and width. ⌘⇧I inserts a new image from a file or a URL, and pasting a screenshot saves it next to your notes.
+
+enso writes a plain Markdown image whenever it can, and an HTML `<img>` tag only when a size or alignment needs one. The dialog tells you which it will write.
+
+<p align="center"><img src="assets/screenshots/image-light.png" alt="A selected image with its toolbar and resize handle" width="880"></p>
+
+<p align="center"><img src="assets/screenshots/image-dialog-light.png" alt="The image dialog" width="880"></p>
+
+## Tables
+
+Click into a table and edit cells directly, including bold, links and code. Tab and Shift-Tab move between cells, and Tab on the last cell starts a new row. A small toolbar adds and removes rows and columns and tidies the column padding in the Markdown, all without moving the table.
+
+<p align="center"><img src="assets/screenshots/table-light.png" alt="Editing a table with its toolbar" width="880"></p>
+
+## Front matter
+
+YAML and TOML front matter opens in its own panel above the page, with syntax highlighting. Edit it there and the header of your file changes with it; fold the panel away when you don't need it.
+
+<p align="center"><img src="assets/screenshots/frontmatter-light.png" alt="The front matter panel above the page" width="880"></p>
+
+## Make it yours
+
+Choose the caret's colour, thickness, blink rate and blink pattern, the size of the text in the page, and how the page behaves while you write. Light and dark themes follow the system, or pick one yourself.
+
+<p align="center">
+  <img src="assets/screenshots/settings-writing-light.png" alt="Writing settings" width="430">
+  <img src="assets/screenshots/settings-caret-light.png" alt="Caret settings" width="430">
+</p>
+
+## Your files, untouched
+
+- Documents are plain `.md` files. Opening a file and closing it without edits never writes it, byte for byte, including line endings, whitespace, list markers and emphasis style.
+- A visual edit changes only the bytes of the blocks you touched. CRLF files stay CRLF.
+- Saves happen automatically after 500 ms of quiet, are written in the background one at a time, and are flushed when you quit. ⌘S saves at once.
+- If a file changes on disk while you have unsaved edits, enso keeps your text and tells you instead of overwriting either version.
+- No account, no analytics, no network access except loading images your documents reference.
+
+## Fast on long documents
+
+Typing is built to fit inside a 120 Hz frame on documents of hundreds of kilobytes: edits reparse only the block they touch, and long lists and tables re-render only the rows that changed. Opening a long file shows the first screen at once and parses the rest in the background. Files over 256 KiB open in a section reader that lays out only what is on screen, and their source opens on demand.
+
+## A workspace for notes
+
+<p align="center"><img src="assets/screenshots/workspace-light.png" alt="A workspace folder open in enso" width="880"></p>
+
+- Open a folder as a workspace: browse it lazily, create, rename and delete files and folders (deletes go to the Trash or Recycle Bin).
+- Tabs keep their edits while you switch between files and folders. Several windows can be open at once.
+- Paste a screenshot or an image file and enso saves it into the workspace and links it.
+- Relative images and links resolve against the document's folder. Web links open in your browser.
+- On macOS, Quick Look previews Markdown files from Finder with the Space bar.
 
 ## Keyboard shortcuts
 
@@ -57,56 +115,73 @@ The macOS app is ad-hoc signed, not notarized, so Gatekeeper asks on first open.
 |---|---|
 | ⌘O / ⌘⇧O | Open file / open folder as a workspace |
 | ⌘N / Ctrl⇧N | New file / new folder in the selected folder |
-| Enter (F2 on Windows/Linux) | Rename the selected file or folder (or double-click its name) |
-| ⌘⌫ (Delete on Windows/Linux) | Delete the selected file or folder (to the Trash / Recycle Bin; only a permanent delete asks first) |
-| ⌘S | Save now (saving is also automatic) |
+| Enter (F2 on Windows/Linux) | Rename the selected file or folder |
+| ⌘⌫ (Delete on Windows/Linux) | Move the selected file or folder to the Trash |
+| ⌘S | Save now |
 | ⌘W | Close the current file |
-| ⌘E | Switch between Read and Edit |
-| ⌘\\ | Split view |
+| ⌘E | Switch between the page and the source |
+| ⌘\\ | Side by side; press again to return |
 | ⌘, | Settings |
 | ⌘Q | Quit |
 
-In the Markdown editor:
-
-| Formatting | |
+| Writing | |
 |---|---|
-| ⌘B | Bold `**text**` |
-| ⌘I | Italic `*text*` |
-| ⌘⇧X | Strikethrough `~~text~~` |
-| ⌘⇧C | Inline code `` `text` `` |
-| ⌘K | Link `[text](url)` |
-| ⌘1 – ⌘6 | Heading level 1–6 |
-| ⌘0 | Back to body text |
-| ⌘⇧8 | Bullet list |
-| ⌘⇧7 | Numbered list |
-| ⌘⇧L | Task list `- [ ]` |
-| ⌘Enter | Tick / untick a task |
+| ⌘B / ⌘I | Bold / italic |
+| ⌘⇧X | Strikethrough |
+| ⌘⇧C | Inline code |
+| ⌘K | Link |
+| ⌘1 – ⌘6, ⌘0 | Heading level 1–6, back to body text |
+| ⌘⇧8 / ⌘⇧7 / ⌘⇧L | Bullet, numbered or task list |
+| ⌘Enter | Tick or untick a task |
 | ⌘⇧. | Quote |
 | ⌘⌥C | Code block |
+| Tab / ⇧Tab | Nest / un-nest a list item |
+| ⌘A, ⌘C, ⌘X, ⌘V | Select all, copy, cut and paste Markdown |
+| ⌘Z / ⌘⇧Z | Undo / redo |
+| ⌥Enter | Follow the link or footnote at the caret |
+| ⌘⇧I | Insert or edit an image |
+| Tab / ⇧Tab in a table | Next / previous cell |
+| ⌘⌥↑ / ⌘⌥↓ | Insert a table row above / below |
+| ⌘⌥← / ⌘⌥→ | Insert a table column left / right |
+| ⌘⌥⌫ / ⌘⌥⇧⌫ | Delete the table row / column |
+| ⌘⌥T | Tidy the table's column padding |
+| ⌘⇧T | Typewriter mode |
+| ⌘⇧D | Focus: off, sentence, paragraph |
+| ⌘= / ⌘- | Larger / smaller text |
+| Escape | Bring back the sidebar and tabs |
 
-Each applies to the selection, or to the word or line at the cursor; using it again removes the format. In lists, task lists and quotes, Enter continues with the next item (an empty item ends the list, or steps a nested one out a level), and Tab / Shift-Tab nest and un-nest items. The editor's own shortcuts still apply: ⌘Z / ⌘⇧Z undo and redo, ⌘F find, ⌘⇧F replace, ⌘] / ⌘[ indent and outdent lines, ⌥⌘↑ / ⌥⌘↓ add cursors.
+The source editor also has ⌘F find, ⌘⇧F replace, ⌘] / ⌘[ to indent and outdent lines, and ⌥⌘↑ / ⌥⌘↓ to add cursors.
+
+## Build
+
+Install Rust with rustup; `rust-toolchain.toml` pins the version.
+
+```sh
+cargo run
+cargo run -- /absolute/path/to/note.md
+cargo run -- /absolute/path/to/folder
+```
+
+On macOS, `make` lists the build targets. `make build.macos` produces `target/enso.app` with its Quick Look extension, ad-hoc signed, and a disk image. `make install` copies the app to `/Applications`. `make bench` runs the editor benchmarks.
+
+On the first launch without arguments, enso opens an editable `Get Started.md` from its application data folder.
+
+`.github/workflows/release.yml` builds release packages from the Actions tab: a macOS disk image for Apple silicon, Windows zips for x64 and ARM64, and Linux tarballs for x64 and ARM64. On Linux, unpack the tarball and run `./install.sh` to add enso to the app launcher.
 
 ## Platforms
 
-One codebase targets macOS, Windows, and Linux using GPUI Kit's native backends. This initial version is developed on macOS; Windows and Linux runtime verification remains to be done. Linux needs GPUI's native build dependencies (including a C/C++ toolchain, pkg-config, fontconfig, Wayland/X11 development libraries, and a working Vulkan driver). Follow the platform prerequisites in the supplied GPUI Kit repository. Distribution installers and OS file associations are future work.
+One codebase for macOS, Windows and Linux on GPUI Kit's native backends. Linux needs GPUI's native build dependencies: a C/C++ toolchain, pkg-config, fontconfig, Wayland and X11 development libraries, and a working Vulkan driver.
 
-`vendor/gpui-pre-macos` is the Apache-2.0 upstream 0.3.10 crate with three `Option::map_or_default` calls replaced by stable `map_or` equivalents. This avoids an upstream stable-Rust compilation error without modifying the GPUI Kit checkout. See its `ENSO-PATCH.md`.
+GPUI Base is built from a pinned fork (`gpui-base-patched` in this repository) that exposes the editor host hooks the visual editor uses. `vendor/gpui-pre-macos` is the upstream 0.3.10 crate with three `Option::map_or_default` calls replaced by stable equivalents.
 
-## Verification
+## Tests
 
 ```sh
 cargo fmt --check
 cargo check --locked
 cargo test --locked
-cargo test --features ui-tests repeated_shortcuts
+cargo test --locked --features ui-tests
+./scripts/check-tokens.sh
 ```
 
-The view-switch regression test uses the GPUI core harness to repeatedly leave a deeply scrolled editor, return to reading, toggle Split, and verify focus and source integrity. Read and Edit use separate element identities; only Split owns resizable panel state.
-
-The reader tests verify lossless section indexing, bounded parser input, huge Unicode lines, and code-fence continuations. To profile a local file, run `ENSO_BENCH_FILE=/path/to/file.md cargo test profile_large_file -- --ignored --nocapture`.
-
-The file lifecycle test covers Unicode text, saving, conflict detection, duplicate creation, path traversal rejection, and binary-file rejection.
-
-## Current scope
-
-Text input is UTF-8; binary and other encodings show an error. Workspace symlinks are skipped to avoid cycles. Changes auto-save to the original file. Workspace state is retained only while enso is running. Closing the last file leaves the window open. Save failures keep the file open. Reading, section indexing, and disk writes run on background workers. The large-file reader retains the complete source and indexes UTF-8 byte ranges without parsing a full-document AST. It prefers paragraph boundaries and carries fenced code blocks across sections. Very long paragraphs, lists, tables, and reference definitions spanning sections can render differently from a whole-document parse; cross-section text selection is not yet supported. No file watcher, search across notes, plugins, or vault database yet.
+Sizes, spacing, opacities and motion come from `src/tokens.rs`; the check above fails on new literal values anywhere else.
