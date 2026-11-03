@@ -9,6 +9,7 @@ use unicode_segmentation::UnicodeSegmentation as _;
 
 use crate::markdown_edit::{self, Block, Inline};
 
+use super::prefs::{FocusMode, WritingPrefs};
 use super::view::{CONTEXT, VisualView};
 
 actions!(
@@ -43,7 +44,9 @@ actions!(
         Quote,
         CodeBlock,
         IndentListItem,
-        OutdentListItem
+        OutdentListItem,
+        ToggleTypewriter,
+        CycleFocusMode
     ]
 );
 
@@ -89,6 +92,8 @@ pub fn init(cx: &mut App) {
         KeyBinding::new(key!("alt-c"), CodeBlock, c),
         KeyBinding::new("tab", IndentListItem, c),
         KeyBinding::new("shift-tab", OutdentListItem, c),
+        KeyBinding::new(key!("shift-t"), ToggleTypewriter, c),
+        KeyBinding::new(key!("shift-d"), CycleFocusMode, c),
     ]);
     #[cfg(target_os = "macos")]
     cx.bind_keys([
@@ -223,8 +228,22 @@ pub fn listeners(root: Stateful<Div>, cx: &mut Context<VisualView>) -> Stateful<
     ));
     let root = on!(root, IndentListItem, |this, w, cx| this
         .indent(false, w, cx));
-    on!(root, OutdentListItem, |this, w, cx| this
-        .indent(true, w, cx))
+    let root = on!(root, OutdentListItem, |this, w, cx| this
+        .indent(true, w, cx));
+    let root = on!(root, ToggleTypewriter, |this, _w, cx| {
+        let mut prefs = WritingPrefs::get(cx);
+        prefs.typewriter = !prefs.typewriter;
+        cx.set_global(prefs);
+    });
+    on!(root, CycleFocusMode, |this, _w, cx| {
+        let mut prefs = WritingPrefs::get(cx);
+        prefs.focus = match prefs.focus {
+            FocusMode::Off => FocusMode::Sentence,
+            FocusMode::Sentence => FocusMode::Paragraph,
+            FocusMode::Paragraph => FocusMode::Off,
+        };
+        cx.set_global(prefs);
+    })
 }
 
 impl VisualView {

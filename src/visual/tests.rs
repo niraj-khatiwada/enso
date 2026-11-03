@@ -750,3 +750,137 @@ fn edits_above_the_viewport_keep_the_view_anchored(cx: &mut TestAppContext) {
     let after = leaf_top(cx, &view, moved).expect("still in view");
     assert_eq!(after, before);
 }
+
+fn set_prefs(cx: &mut TestAppContext, change: impl FnOnce(&mut super::prefs::WritingPrefs)) {
+    cx.update(|cx| {
+        let mut prefs = super::prefs::WritingPrefs::get(cx);
+        change(&mut prefs);
+        cx.set_global(prefs);
+    });
+}
+
+fn mouse(
+    cx: &mut TestAppContext,
+    handle: AnyWindowHandle,
+    position: gpui_kit::Point<gpui_kit::Pixels>,
+    phase: u8,
+) {
+    use gpui_kit::InputEvent as _;
+    cx.update_window(handle, |_, window, cx| {
+        let event = match phase {
+            0 => gpui_kit::MouseDownEvent {
+                button: gpui_kit::MouseButton::Left,
+                position,
+                modifiers: Default::default(),
+                click_count: 1,
+                first_mouse: false,
+            }
+            .to_platform_input(),
+            1 => gpui_kit::MouseMoveEvent {
+                position,
+                pressed_button: Some(gpui_kit::MouseButton::Left),
+                modifiers: Default::default(),
+            }
+            .to_platform_input(),
+            _ => gpui_kit::MouseUpEvent {
+                button: gpui_kit::MouseButton::Left,
+                position,
+                modifiers: Default::default(),
+                click_count: 1,
+            }
+            .to_platform_input(),
+        };
+        window.dispatch_event(event, cx);
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn typewriter_holds_the_caret_line_at_the_guide(cx: &mut TestAppContext) {
+    let doc: String = (0..80)
+        .map(|i| format!("Line {i} of the draft.\n\n"))
+        .collect();
+    let (handle, view) = open(cx, &doc);
+    set_prefs(cx, |p| {
+        p.typewriter = true;
+        p.typewriter_guide = 0.5;
+    });
+    draw(cx, handle);
+    draw(cx, handle);
+    let at = doc.find("Line 40 ").unwrap() + 4;
+    cx.update(|cx| view.update(cx, |v, cx| v.place_caret(at, None, cx)));
+    cx.simulate_keystrokes(handle, "end");
+    let mut ys = vec![];
+    for _ in 0..6 {
+        cx.simulate_keystrokes(handle, "enter");
+        cx.simulate_input(handle, "More");
+        draw(cx, handle);
+        draw(cx, handle);
+        let (y, guide) = cx.update(|cx| {
+            let v = view.read(cx);
+            (v.caret_viewport_y().unwrap(), v.guide_y(cx).unwrap())
+        });
+        assert!((y - guide).abs() <= px(1.), "caret {y:?} guide {guide:?}");
+        ys.push(y);
+    }
+    assert!(
+        ys.windows(2).all(|w| (w[0] - w[1]).abs() <= px(1.)),
+        "{ys:?}"
+    );
+    let first = doc.find("Line 0 ").unwrap();
+    cx.update(|cx| view.update(cx, |v, cx| v.place_caret(first, None, cx)));
+    cx.simulate_keystrokes(handle, "right");
+    draw(cx, handle);
+    draw(cx, handle);
+    let (y, guide) = cx.update(|cx| {
+        let v = view.read(cx);
+        (v.caret_viewport_y().unwrap(), v.guide_y(cx).unwrap())
+    });
+    assert!(
+        (y - guide).abs() <= px(BODY_LINE),
+        "the first line reaches the guide: {y:?} {guide:?}"
+    );
+}
+
+const BODY_LINE: f32 = 40.;
+
+#[gpui_kit::test]
+fn the_typewriter_guide_drags_and_snaps_to_center(cx: &mut TestAppContext) {
+    let doc: String = (0..40).map(|i| format!("Line {i}.\n\n")).collect();
+    let (handle, view) = open(cx, &doc);
+    set_prefs(cx, |p| {
+        p.typewriter = true;
+        p.typewriter_guide = 0.5;
+    });
+    draw(cx, handle);
+    draw(cx, handle);
+    let (viewport, guide) = cx.update(|cx| {
+        let v = view.read(cx);
+        (v.list.viewport_bounds(), v.guide_line_y(cx).unwrap())
+    });
+    let x = viewport.center().x;
+    let start = point(x, viewport.top() + guide);
+    mouse(cx, handle, start, 0);
+    let line = cx.update(|cx| view.read(cx).caret_position().unwrap().1);
+    let lower = point(x, viewport.top() + viewport.size.height * 0.7 + line);
+    mouse(cx, handle, lower, 1);
+    draw(cx, handle);
+    cx.update(|cx| {
+        assert!((view.read(cx).guide_fraction(cx).unwrap() - 0.7).abs() < 0.01);
+    });
+    mouse(cx, handle, lower, 2);
+    draw(cx, handle);
+    cx.update(|cx| {
+        let prefs = super::prefs::WritingPrefs::get(cx);
+        assert!((prefs.typewriter_guide - 0.7).abs() < 0.01);
+    });
+    let guide = cx.update(|cx| view.read(cx).guide_line_y(cx).unwrap());
+    mouse(cx, handle, point(x, viewport.top() + guide), 0);
+    let near = point(x, viewport.top() + viewport.size.height * 0.515 + line);
+    mouse(cx, handle, near, 1);
+    mouse(cx, handle, near, 2);
+    draw(cx, handle);
+    cx.update(|cx| {
+        assert_eq!(super::prefs::WritingPrefs::get(cx).typewriter_guide, 0.5);
+    });
+}

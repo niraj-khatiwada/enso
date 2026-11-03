@@ -87,15 +87,22 @@ fn writing_path() -> Option<PathBuf> {
 pub fn set_writing(cx: &mut App, change: impl FnOnce(&mut WritingPrefs)) -> io::Result<()> {
     let mut prefs = WritingPrefs::get(cx);
     change(&mut prefs);
-    let text = prefs.serialize();
     cx.set_global(prefs);
-    if let Some(path) = writing_path() {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::write(path, text)?;
+    save_writing(cx)
+}
+
+fn save_writing(cx: &App) -> io::Result<()> {
+    let Some(path) = writing_path() else {
+        return Ok(());
+    };
+    let text = WritingPrefs::get(cx).serialize();
+    if std::fs::read_to_string(&path).is_ok_and(|saved| saved == text) {
+        return Ok(());
     }
-    Ok(())
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, text)
 }
 
 fn load(path: &Path) -> Appearance {
@@ -127,6 +134,10 @@ pub fn init(cx: &mut App) {
     // the gutter color set above. Registered after the kit's own observer, so
     // this runs once its reload is done.
     cx.observe_global::<ThemeRegistry>(tune_theme).detach();
+    cx.observe_global::<WritingPrefs>(|cx| {
+        let _ = save_writing(cx);
+    })
+    .detach();
     cx.bind_keys([
         KeyBinding::new("cmd-w", CloseSettings, Some("EnsoSettings")),
         KeyBinding::new("ctrl-w", CloseSettings, Some("EnsoSettings")),
@@ -281,6 +292,7 @@ pub fn open(cx: &mut App) {
                     category: Category::Appearance,
                     error: None,
                     _appearance: watch_system(window),
+                    _writing: cx.observe_global::<WritingPrefs>(|_, cx| cx.notify()),
                 }
             })
         },
@@ -391,6 +403,7 @@ struct SettingsWindow {
     category: Category,
     error: Option<String>,
     _appearance: Subscription,
+    _writing: Subscription,
 }
 
 fn preview(appearance: Appearance) -> impl IntoElement {

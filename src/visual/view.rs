@@ -37,6 +37,7 @@ pub const OPEN_PREFIX_BYTES: usize = 12 * 1024;
 
 pub const BODY_SIZE: f32 = 17.;
 pub const PAGE_TOP: f32 = 28.;
+pub const PAGE_BOTTOM: f32 = 96.;
 
 pub const SETTLE_AFTER: Duration = Duration::from_millis(300);
 
@@ -86,6 +87,8 @@ pub struct VisualView {
     pending_vertical: Option<bool>,
     pending_reveal: Option<(usize, u8)>,
     pending_place: Option<(Pixels, u8)>,
+    guide_drag: Option<f32>,
+    padded: (usize, Pixels, Pixels),
     pub focus: FocusHandle,
     pub perf: Rc<RefCell<Perf>>,
     pub caret_blink: Caret,
@@ -141,6 +144,8 @@ impl VisualView {
             pending_vertical: None,
             pending_reveal: None,
             pending_place: None,
+            guide_drag: None,
+            padded: (0, px(0.), px(0.)),
             focus: cx.focus_handle(),
             perf: Rc::new(RefCell::new(Perf::from_env())),
             caret_blink: Caret::new(cx),
@@ -392,12 +397,144 @@ impl VisualView {
 
     fn after_caret_change(&mut self, cx: &mut Context<Self>) {
         self.caret_blink.reset(cx);
-        if let Some(row) = self.caret_row()
+        if let Some(y) = self.guide_y(cx) {
+            self.pending_reveal = None;
+            if !self.place_caret_step(y) {
+                self.pending_place = Some((y, 4));
+            }
+        } else if let Some(row) = self.caret_row()
             && !self.reveal_caret_step(row)
         {
             self.pending_reveal = Some((row, 4));
         }
         cx.notify();
+    }
+
+    pub fn guide_fraction(&self, cx: &App) -> Option<f32> {
+        let prefs = super::prefs::WritingPrefs::get(cx);
+        prefs
+            .typewriter
+            .then(|| self.guide_drag.unwrap_or(prefs.typewriter_guide))
+    }
+
+    pub fn guide_y(&self, cx: &App) -> Option<Pixels> {
+        let fraction = self.guide_fraction(cx)?;
+        let height = self.list.viewport_bounds().size.height;
+        (height > px(0.)).then(|| height * fraction)
+    }
+
+    pub fn guide_line_y(&self, cx: &App) -> Option<Pixels> {
+        let line = self
+            .caret_position()
+            .map_or(px(BODY_SIZE * 1.6), |(_, line_height, _)| line_height);
+        Some(self.guide_y(cx)? + line)
+    }
+
+    fn edge_padding(&self, cx: &App) -> (Pixels, Pixels) {
+        let height = self.list.viewport_bounds().size.height;
+        match self.guide_fraction(cx) {
+            Some(fraction) if height > px(0.) => (
+                (height * fraction - px(BODY_SIZE * 2.)).max(px(0.)),
+                (height * (1. - fraction)).max(px(PAGE_BOTTOM)),
+            ),
+            _ => (px(0.), px(PAGE_BOTTOM)),
+        }
+    }
+
+    fn refresh_edge_padding(&mut self, cx: &App) {
+        let count = self.rows.len();
+        if count == 0 {
+            return;
+        }
+        let (head, tail) = self.edge_padding(cx);
+        let wanted = (count - 1, head, tail);
+        if wanted == self.padded {
+            return;
+        }
+        let (old_last, old_head, _) = self.padded;
+        self.padded = wanted;
+        let mut stale = vec![count - 1];
+        if old_head != head {
+            stale.push(0);
+        }
+        if old_last < count && old_last != count - 1 {
+            stale.push(old_last);
+        }
+        stale.sort_unstable();
+        stale.dedup();
+        for ix in stale {
+            self.splice_list(ix..ix + 1, 1);
+        }
+    }
+
+    fn drag_guide(&mut self, y: Pixels, cx: &mut Context<Self>) {
+        let viewport = self.list.viewport_bounds();
+        if viewport.size.height <= px(0.) {
+            return;
+        }
+        let line = self
+            .caret_position()
+            .map_or(px(BODY_SIZE * 1.6), |(_, line_height, _)| line_height);
+        let mut fraction = ((y - line - viewport.top()) / viewport.size.height).clamp(0.15, 0.85);
+        if (fraction - 0.5).abs() < 0.03 {
+            fraction = 0.5;
+        }
+        self.guide_drag = Some(fraction);
+        if let Some(y) = self.guide_y(cx) {
+            self.place_caret_step(y);
+            self.pending_place = Some((y, 2));
+        }
+        cx.notify();
+    }
+
+    fn release_guide(&mut self, cx: &mut Context<Self>) {
+        if let Some(fraction) = self.guide_drag.take() {
+            let mut prefs = super::prefs::WritingPrefs::get(cx);
+            prefs.typewriter_guide = fraction;
+            cx.set_global(prefs);
+        }
+    }
+
+    fn guide(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let y = self.guide_line_y(cx)?;
+        let theme = cx.theme();
+        let color = theme.muted_foreground;
+        let active = self.guide_drag.is_some();
+        let dashes = (0..56).map(move |_| div().w(px(6.)).h(px(1.)).flex_shrink_0().bg(color));
+        Some(
+            div()
+                .id("typewriter-guide")
+                .absolute()
+                .top(px(PAGE_TOP) + y - px(6.))
+                .left_0()
+                .right_0()
+                .h(px(13.))
+                .flex()
+                .justify_center()
+                .cursor_row_resize()
+                .opacity(if active { 0.7 } else { 0.18 })
+                .hover(|guide| guide.opacity(0.55))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                        cx.stop_propagation();
+                        this.guide_drag = this.guide_fraction(cx);
+                        cx.notify();
+                    }),
+                )
+                .child(
+                    div()
+                        .w(px(680.))
+                        .max_w_full()
+                        .px_4()
+                        .h_full()
+                        .flex()
+                        .items_center()
+                        .overflow_hidden()
+                        .child(div().flex().gap(px(6.)).children(dashes)),
+                )
+                .into_any_element(),
+        )
     }
 
     fn backspace(&mut self, _: &Backspace, window: &mut Window, cx: &mut Context<Self>) {
@@ -649,6 +786,12 @@ impl VisualView {
     fn place_caret_step(&mut self, y: Pixels) -> bool {
         let viewport = self.list.viewport_bounds();
         let Some((top, _, _)) = self.caret_position() else {
+            if let Some(row) = self.caret_row() {
+                self.list.scroll_to(ListOffset {
+                    item_ix: row,
+                    offset_in_item: px(0.),
+                });
+            }
             return false;
         };
         let delta = top.y - (viewport.top() + y);
@@ -838,6 +981,14 @@ impl VisualView {
     }
 
     fn on_mouse_move(&mut self, event: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if self.guide_drag.is_some() {
+            if event.pressed_button == Some(MouseButton::Left) {
+                self.drag_guide(event.position.y, cx);
+            } else {
+                self.release_guide(cx);
+            }
+            return;
+        }
         if !self.dragging || event.pressed_button != Some(MouseButton::Left) {
             self.dragging = false;
             return;
@@ -862,8 +1013,9 @@ impl VisualView {
         }
     }
 
-    fn on_mouse_up(&mut self, _: &MouseUpEvent, _: &mut Window, _: &mut Context<Self>) {
+    fn on_mouse_up(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
         self.dragging = false;
+        self.release_guide(cx);
     }
 
     fn table_widths(
@@ -933,10 +1085,15 @@ impl VisualView {
             .collect();
         let flow =
             FlowPosition::at(&refs, bix - from, bix + 1 == self.doc.blocks.len()).first(bix == 0);
+        let (last, head, tail) = self.padded;
+        let pad_top = if ix == 0 { head } else { px(0.) };
+        let pad_bottom = if ix == last { tail } else { px(0.) };
         let Some(part) = row.part else {
             let block = &self.doc.blocks[bix];
             return div()
                 .w_full()
+                .pt(pad_top)
+                .pb(pad_bottom)
                 .child(block.node.render_with_id(
                     ElementId::Integer(block.id),
                     flow,
@@ -1002,6 +1159,8 @@ impl VisualView {
         div()
             .w_full()
             .when(continues_list, |row| row.pt(px(BODY_SIZE * 0.25)))
+            .when(ix == 0, |row| row.pt(pad_top))
+            .pb(pad_bottom)
             .child(node.render_with_id(
                 ElementId::Integer((id << 20) | part.start as u64),
                 flow,
@@ -1153,6 +1312,8 @@ impl Render for VisualView {
         if self.doc.definitions() != self.render_defs {
             self.refresh_render_cx(cx);
         }
+        self.refresh_edge_padding(cx);
+        let guide = self.guide(cx);
         let theme = cx.theme();
         let list = list(self.list.clone(), cx.processor(Self::render_row))
             .w_full()
@@ -1218,6 +1379,7 @@ impl Render for VisualView {
                 child: Some(page.into_any_element()),
                 decorations: self.decorations(cx),
             })
+            .children(guide)
             .children(loading)
             .children(self.perf_overlay(cx))
     }
