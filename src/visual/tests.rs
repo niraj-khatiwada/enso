@@ -942,3 +942,61 @@ fn focus_follows_the_sentence_and_fades_between_them(cx: &mut TestAppContext) {
     assert_eq!(range.start, 0);
     assert!(range.end > "First sentence here. Dr. Who arrives next. Last one".len() - 1);
 }
+
+#[gpui_kit::test]
+fn image_blocks_resize_align_and_delete_in_place(cx: &mut TestAppContext) {
+    let doc = "Before.\n\n![Ridge](ridge.png)\n\n<p align=\"center\"><img src=\"lake.png\" alt=\"Lake\" width=\"300\"></p>\n\nAfter.\n";
+    let (handle, view) = open(cx, doc);
+    let images = cx.update(|cx| {
+        view.read(cx)
+            .doc
+            .blocks
+            .iter()
+            .filter_map(|b| match &b.kind {
+                super::document::Kind::Image(image) => Some((b.id, image.clone())),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(images.len(), 2, "{images:?}");
+    assert_eq!(images[0].1.url, "ridge.png");
+    assert_eq!(images[1].1.width, Some(300));
+    assert_eq!(images[1].1.align, super::image::ImageAlign::Center);
+    let first = images[0].0;
+    cx.update_window(handle, |_, window, cx| {
+        view.update(cx, |v, cx| {
+            v.select_image(Some(first), cx);
+            v.image_resize = Some(super::image_ui::ImageResize {
+                block: first,
+                start_x: px(0.),
+                start_width: px(200.),
+                width: px(200.),
+                centered: false,
+            });
+            v.image_resize_move(px(40.), cx);
+            v.image_resize_end(window, cx);
+        })
+    })
+    .unwrap();
+    draw(cx, handle);
+    let resized = doc.replace(
+        "![Ridge](ridge.png)",
+        "<img src=\"ridge.png\" alt=\"Ridge\" width=\"240\">",
+    );
+    assert_eq!(source(cx, &view), resized);
+    cx.update_window(handle, |_, window, cx| {
+        view.update(cx, |v, cx| {
+            v.set_image_align(super::image::ImageAlign::Right, window, cx)
+        })
+    })
+    .unwrap();
+    draw(cx, handle);
+    let aligned = resized.replace("width=\"240\">", "width=\"240\" align=\"right\">");
+    assert_eq!(source(cx, &view), aligned);
+    cx.simulate_keystrokes(handle, "backspace");
+    draw(cx, handle);
+    let text = source(cx, &view);
+    assert!(!text.contains("ridge.png"), "{text}");
+    assert!(text.starts_with("Before.\n\n<p align"), "{text}");
+    assert_synced(cx, &view, "after removing an image");
+}

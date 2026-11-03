@@ -28,7 +28,9 @@ actions!(
         Delete,
         Enter,
         Undo,
-        Redo
+        Redo,
+        InsertImage,
+        Cancel
     ]
 );
 
@@ -116,6 +118,16 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("backspace", Backspace, Some(CONTEXT)),
         KeyBinding::new("delete", Delete, Some(CONTEXT)),
         KeyBinding::new("enter", Enter, Some(CONTEXT)),
+        KeyBinding::new("escape", Cancel, Some(CONTEXT)),
+        KeyBinding::new(
+            if cfg!(target_os = "macos") {
+                "cmd-shift-i"
+            } else {
+                "ctrl-shift-i"
+            },
+            InsertImage,
+            Some(CONTEXT),
+        ),
         KeyBinding::new(undo, Undo, Some(CONTEXT)),
         KeyBinding::new(redo, Redo, Some(CONTEXT)),
         KeyBinding::new(redo_alt, Redo, Some(CONTEXT)),
@@ -144,6 +156,10 @@ pub struct VisualView {
     pending_reveal: Option<(usize, u8)>,
     pending_place: Option<(Pixels, u8)>,
     guide_drag: Option<f32>,
+    pub(super) selected_image: Option<u64>,
+    pub(super) image_resize: Option<super::image_ui::ImageResize>,
+    pub(super) image_bounds: Rc<RefCell<HashMap<u64, Bounds<Pixels>>>>,
+    pub(super) image_dialog: Option<super::image_ui::ImageDialog>,
     focus_target: Option<FocusTarget>,
     focus_fade: Option<(FocusTarget, std::time::Instant)>,
     padded: (usize, Pixels, Pixels),
@@ -151,7 +167,7 @@ pub struct VisualView {
     pub perf: Rc<RefCell<Perf>>,
     pub caret_blink: Caret,
     render_cx: RenderContext,
-    base: Option<std::path::PathBuf>,
+    pub(super) base: Option<std::path::PathBuf>,
     render_defs: String,
     synced_text: Rope,
     synced_revision: u64,
@@ -203,6 +219,10 @@ impl VisualView {
             pending_reveal: None,
             pending_place: None,
             guide_drag: None,
+            selected_image: None,
+            image_resize: None,
+            image_bounds: Rc::default(),
+            image_dialog: None,
             focus_target: None,
             focus_fade: None,
             padded: (0, px(0.), px(0.)),
@@ -433,6 +453,7 @@ impl VisualView {
     }
 
     fn begin_move(&mut self, extend: bool, forward: bool) -> Option<usize> {
+        self.selected_image = None;
         if extend {
             self.anchor.get_or_insert(self.caret);
             return None;
@@ -740,6 +761,9 @@ impl VisualView {
 
     fn backspace(&mut self, _: &Backspace, window: &mut Window, cx: &mut Context<Self>) {
         self.perf.borrow_mut().input();
+        if self.delete_selected_image(window, cx) {
+            return;
+        }
         let selection = self.selection();
         if !selection.is_empty() {
             self.edit(selection, "", window, cx);
@@ -770,6 +794,9 @@ impl VisualView {
 
     fn delete(&mut self, _: &Delete, window: &mut Window, cx: &mut Context<Self>) {
         self.perf.borrow_mut().input();
+        if self.delete_selected_image(window, cx) {
+            return;
+        }
         let selection = self.selection();
         if !selection.is_empty() {
             self.edit(selection, "", window, cx);
@@ -1160,6 +1187,7 @@ impl VisualView {
     ) {
         self.perf.borrow_mut().input();
         window.focus(&self.focus, cx);
+        self.selected_image = None;
         if let Some(src) = self.source_for_point(event.position) {
             if event.modifiers.shift {
                 self.anchor.get_or_insert(self.caret);
@@ -1182,6 +1210,12 @@ impl VisualView {
     }
 
     fn on_mouse_move(&mut self, event: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if self.image_resize.is_some() {
+            if event.pressed_button == Some(MouseButton::Left) {
+                self.image_resize_move(event.position.x, cx);
+            }
+            return;
+        }
         if self.guide_drag.is_some() {
             if event.pressed_button == Some(MouseButton::Left) {
                 self.drag_guide(event.position.y, cx);
@@ -1214,8 +1248,9 @@ impl VisualView {
         }
     }
 
-    fn on_mouse_up(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+    fn on_mouse_up(&mut self, _: &MouseUpEvent, window: &mut Window, cx: &mut Context<Self>) {
         self.dragging = false;
+        self.image_resize_end(window, cx);
         self.release_guide(cx);
     }
 
@@ -1289,6 +1324,10 @@ impl VisualView {
         let (last, head, tail) = self.padded;
         let pad_top = if ix == 0 { head } else { px(0.) };
         let pad_bottom = if ix == last { tail } else { px(0.) };
+        if let Kind::Image(image) = &self.doc.blocks[bix].kind {
+            let (id, image) = (self.doc.blocks[bix].id, image.clone());
+            return self.render_image_block(id, &image, pad_top, pad_bottom, cx);
+        }
         let Some(part) = row.part else {
             let block = &self.doc.blocks[bix];
             return div()
@@ -1572,6 +1611,18 @@ impl Render for VisualView {
             .on_action(cx.listener(Self::backspace))
             .on_action(cx.listener(Self::delete))
             .on_action(cx.listener(Self::enter))
+            .on_action(
+                cx.listener(|this, _: &InsertImage, window, cx| {
+                    this.insert_image_dialog(window, cx)
+                }),
+            )
+            .on_action(cx.listener(|this, _: &Cancel, window, cx| {
+                if this.image_dialog.is_some() {
+                    this.close_image_dialog(window, cx);
+                } else {
+                    this.select_image(None, cx);
+                }
+            }))
             .on_action(cx.listener(|this, _: &Undo, window, cx| this.replay(true, window, cx)))
             .on_action(cx.listener(|this, _: &Redo, window, cx| this.replay(false, window, cx)));
         super::commands::listeners(root, cx)
@@ -1581,6 +1632,7 @@ impl Render for VisualView {
                 decorations: self.decorations(cx),
             })
             .children(guide)
+            .children(self.render_image_dialog(cx))
             .children(loading)
             .children(self.perf_overlay(cx))
     }
@@ -1679,6 +1731,7 @@ impl Element for Surface {
         view.paint_focus(bounds, window, cx);
         let focused = view.focus.is_focused(window);
         if focused
+            && view.selected_image.is_none()
             && view.caret_blink.visible()
             && let Some((top, line_height, caret_height)) = view.caret_position()
         {

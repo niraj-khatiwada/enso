@@ -40,6 +40,7 @@ pub enum Kind {
         rows: Vec<Row>,
         aligns: Vec<ColumnAlign>,
     },
+    Image(super::image::ImageBlock),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -451,7 +452,7 @@ impl VisualDocument {
                 }
                 Kind::List { .. } => self.edit_list(first, rope, &old, new_len),
                 Kind::Table { .. } => self.edit_table_row(first, rope, &old, new_len),
-                Kind::Other => None,
+                Kind::Other | Kind::Image(_) => None,
             };
             if let Some(result) = result {
                 for block in &mut self.blocks[first + 1..] {

@@ -114,6 +114,43 @@ impl<'a> Builder<'a> {
     pub fn block(&mut self, node: BlockNode) -> BlockNode {
         let span = span_of(&node);
         match node {
+            BlockNode::Paragraph(p)
+                if self.depth == 0
+                    && let Some(image) = span
+                        .as_ref()
+                        .and_then(|span| self.source.get(span.clone()))
+                        .and_then(|text| super::image::lone_image(&p, text)) =>
+            {
+                self.sig.add((
+                    "img",
+                    &image.url,
+                    &image.alt,
+                    &image.title,
+                    image.width,
+                    image.align as u8,
+                ));
+                self.kind = Kind::Image(image);
+                BlockNode::Paragraph(p)
+            }
+            BlockNode::Root { children, span: s }
+                if self.depth == 0
+                    && let [BlockNode::Paragraph(p)] = children.as_slice()
+                    && let Some(image) = span
+                        .as_ref()
+                        .and_then(|span| self.source.get(span.clone()))
+                        .and_then(|text| super::image::lone_image(p, text)) =>
+            {
+                self.sig.add((
+                    "img",
+                    &image.url,
+                    &image.alt,
+                    &image.title,
+                    image.width,
+                    image.align as u8,
+                ));
+                self.kind = Kind::Image(image);
+                BlockNode::Root { children, span: s }
+            }
             BlockNode::Paragraph(p) => {
                 self.sig.add("p");
                 let empty = span.as_ref().map_or(0, |s| self.rel(s.end));
