@@ -24,7 +24,7 @@ Open any Markdown file and you see it typeset: headings, emphasis, lists, task l
 - **Copy as Markdown:** the clipboard gets the exact source behind your selection, so pasting into another Markdown file round-trips.
 - **Formatting shortcuts:** bold, italic, strikethrough, code, links, headings, lists, task lists, quotes and code blocks. Each applies to the selection or the word at the caret, and pressing it again removes it.
 - **Lists that continue:** Enter starts the next bullet, task or number; Enter on an empty item ends the list. Tab and Shift-Tab nest and un-nest.
-- **Reference links:** `[text][id]` resolves through its definition anywhere in the file, and editing the definition updates every link that uses it. ⌘-click (Ctrl-click) follows a link.
+- **Links and footnotes:** `[text][id]` resolves through its definition anywhere in the file, and editing the definition updates every link that uses it. ⌘-click (Ctrl-click) or ⌥Enter follows a link, and jumps from a footnote to its note and back.
 - **One undo history:** undo and redo work the same in every view, and restore where you were.
 
 <p align="center"><img src="assets/screenshots/select-light.png" alt="A paragraph selected in the visual editor" width="880"></p>
@@ -41,6 +41,49 @@ Open any Markdown file and you see it typeset: headings, emphasis, lists, task l
 </p>
 
 <p align="center"><img src="assets/screenshots/source-light.png" alt="The Markdown source view" width="880"></p>
+
+## Writing modes
+
+**Typewriter mode** keeps the line you are writing at one height on the screen, so your eyes stay put while the page moves. A dashed guide marks the line; drag it up or down and it settles back to the centre when you release near it. ⌘⇧T turns it on and off.
+
+<p align="center"><img src="assets/screenshots/typewriter-light.png" alt="Typewriter mode with the writing line on its guide" width="880"></p>
+
+**Focus** dims everything except the sentence or paragraph you are writing, and fades softly as you move between them. Sentences end where you expect, even after abbreviations like "Dr." or "e.g." and in Devanagari after the danda (।). ⌘⇧D cycles through off, sentence and paragraph.
+
+<p align="center"><img src="assets/screenshots/focus-light.png" alt="Sentence focus dimming the rest of the page" width="880"></p>
+
+While you type, the sidebar, tabs and status bar fade away and return as soon as you move the pointer or press Escape. The text column never moves.
+
+## Images
+
+Images sit in the page at their natural size, up to the width of the column. Click one to select it: drag the handle to resize it, align it left, centre or float it right, or open the image dialog to change its file, description and width. ⌘⇧I inserts a new image from a file or a URL, and pasting a screenshot saves it next to your notes.
+
+enso writes a plain Markdown image whenever it can, and an HTML `<img>` tag only when a size or alignment needs one. The dialog tells you which it will write.
+
+<p align="center"><img src="assets/screenshots/image-light.png" alt="A selected image with its toolbar and resize handle" width="880"></p>
+
+<p align="center"><img src="assets/screenshots/image-dialog-light.png" alt="The image dialog" width="880"></p>
+
+## Tables
+
+Click into a table and edit cells directly, including bold, links and code. Tab and Shift-Tab move between cells, and Tab on the last cell starts a new row. A small toolbar adds and removes rows and columns and tidies the column padding in the Markdown, all without moving the table.
+
+<p align="center"><img src="assets/screenshots/table-light.png" alt="Editing a table with its toolbar" width="880"></p>
+
+## Front matter
+
+YAML and TOML front matter opens in its own panel above the page, with syntax highlighting. Edit it there and the header of your file changes with it; fold the panel away when you don't need it.
+
+<p align="center"><img src="assets/screenshots/frontmatter-light.png" alt="The front matter panel above the page" width="880"></p>
+
+## Make it yours
+
+Choose the caret's colour, thickness, blink rate and blink pattern, the size of the text in the page, and how the page behaves while you write. Light and dark themes follow the system, or pick one yourself.
+
+<p align="center">
+  <img src="assets/screenshots/settings-writing-light.png" alt="Writing settings" width="430">
+  <img src="assets/screenshots/settings-caret-light.png" alt="Caret settings" width="430">
+</p>
 
 ## Your files, untouched
 
@@ -60,10 +103,9 @@ Typing is built to fit inside a 120 Hz frame on documents of hundreds of kilobyt
 
 - Open a folder as a workspace: browse it lazily, create, rename and delete files and folders (deletes go to the Trash or Recycle Bin).
 - Tabs keep their edits while you switch between files and folders. Several windows can be open at once.
-- Paste a screenshot or an image file into the source and enso saves it into the workspace and links it.
+- Paste a screenshot or an image file and enso saves it into the workspace and links it.
 - Relative images and links resolve against the document's folder. Web links open in your browser.
 - On macOS, Quick Look previews Markdown files from Finder with the Space bar.
-- Light and dark themes follow the system, or choose one in Settings.
 
 ## Keyboard shortcuts
 
@@ -96,6 +138,17 @@ Typing is built to fit inside a 120 Hz frame on documents of hundreds of kilobyt
 | Tab / ⇧Tab | Nest / un-nest a list item |
 | ⌘A, ⌘C, ⌘X, ⌘V | Select all, copy, cut and paste Markdown |
 | ⌘Z / ⌘⇧Z | Undo / redo |
+| ⌥Enter | Follow the link or footnote at the caret |
+| ⌘⇧I | Insert or edit an image |
+| Tab / ⇧Tab in a table | Next / previous cell |
+| ⌘⌥↑ / ⌘⌥↓ | Insert a table row above / below |
+| ⌘⌥← / ⌘⌥→ | Insert a table column left / right |
+| ⌘⌥⌫ / ⌘⌥⇧⌫ | Delete the table row / column |
+| ⌘⌥T | Tidy the table's column padding |
+| ⌘⇧T | Typewriter mode |
+| ⌘⇧D | Focus: off, sentence, paragraph |
+| ⌘= / ⌘- | Larger / smaller text |
+| Escape | Bring back the sidebar and tabs |
 
 The source editor also has ⌘F find, ⌘⇧F replace, ⌘] / ⌘[ to indent and outdent lines, and ⌥⌘↑ / ⌥⌘↓ to add cursors.
 
@@ -128,4 +181,7 @@ cargo fmt --check
 cargo check --locked
 cargo test --locked
 cargo test --locked --features ui-tests
+./scripts/check-tokens.sh
 ```
+
+Sizes, spacing, opacities and motion come from `src/tokens.rs`; the check above fails on new literal values anywhere else.
