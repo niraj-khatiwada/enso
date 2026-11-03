@@ -10,6 +10,7 @@ use gpui_kit::*;
 
 use super::document::Kind;
 use super::image::{ImageAlign, ImageBlock};
+use super::toolbar;
 use super::view::{BODY_SIZE, VisualView};
 use crate::tokens;
 use gpui_kit::assets::IconName;
@@ -474,16 +475,6 @@ impl VisualView {
     }
 
     fn image_toolbar(&self, align: ImageAlign, cx: &mut Context<Self>) -> AnyElement {
-        let theme = cx.theme().clone();
-        let button = |id: &'static str, icon: IconName, tip: &'static str, active: bool| {
-            Button::new(id)
-                .ghost()
-                .xsmall()
-                .icon(icon)
-                .tooltip(tip)
-                .accessibility_label(tip)
-                .when(active, |b| b.selected(true))
-        };
         let aligns = [
             (
                 "image-left",
@@ -504,41 +495,26 @@ impl VisualView {
                 ImageAlign::Right,
             ),
         ];
-        div()
+        toolbar::floating_toolbar("image-toolbar", cx)
             .absolute()
             .top_2()
             .right_2()
-            .flex()
-            .items_center()
-            .gap_0p5()
-            .p_0p5()
-            .rounded_md()
-            .bg(theme.popover)
-            .border_1()
-            .border_color(theme.border)
-            .shadow_md()
             .children(aligns.into_iter().map(|(id, icon, tip, value)| {
                 let target = if align == value {
                     ImageAlign::Inline
                 } else {
                     value
                 };
-                button(id, icon, tip, align == value).on_click(cx.listener(
+                toolbar::tool(id, icon, tip, align == value).on_click(cx.listener(
                     move |this, _, window, cx| {
                         cx.stop_propagation();
                         this.set_image_align(target, window, cx);
                     },
                 ))
             }))
+            .child(toolbar::divider(cx))
             .child(
-                div()
-                    .w(tokens::HAIRLINE)
-                    .h(tokens::ICON)
-                    .mx_0p5()
-                    .bg(theme.border),
-            )
-            .child(
-                button("image-edit", IconName::SquarePen, "Edit image…", false).on_click(
+                toolbar::tool("image-edit", IconName::SquarePen, "Edit image…", false).on_click(
                     cx.listener(|this, _, window, cx| {
                         cx.stop_propagation();
                         this.insert_image_dialog(window, cx);
@@ -546,14 +522,13 @@ impl VisualView {
                 ),
             )
             .child(
-                button("image-delete", IconName::Trash, "Remove image", false).on_click(
+                toolbar::tool("image-delete", IconName::Trash, "Remove image", false).on_click(
                     cx.listener(|this, _, window, cx| {
                         cx.stop_propagation();
                         this.delete_selected_image(window, cx);
                     }),
                 ),
             )
-            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .into_any_element()
     }
 

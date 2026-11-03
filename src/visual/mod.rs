@@ -15,4 +15,5 @@ mod table_edit;
 mod table_ui;
 #[cfg(all(test, feature = "ui-tests"))]
 mod tests;
+mod toolbar;
 pub mod view;

@@ -1,12 +1,9 @@
 use gpui_kit::assets::IconName;
-use gpui_kit::component::{
-    ActiveTheme as _, Sizable as _,
-    button::{Button, ButtonVariants as _},
-};
 use gpui_kit::*;
 
 use super::document::Kind;
 use super::table_edit;
+use super::toolbar;
 use super::view::{PAGE_TOP, VisualView};
 use crate::tokens;
 
@@ -178,19 +175,12 @@ impl VisualView {
             .map(|b| b.top())
             .unwrap_or(viewport.top());
         let top = (table_top - viewport.top()).max(px(0.)) + px(PAGE_TOP) - tokens::FLOAT_OFFSET;
-        let theme = cx.theme().clone();
         let button = |id: &'static str, icon: IconName, tip: &'static str, op: TableOp| {
-            Button::new(id)
-                .ghost()
-                .xsmall()
-                .icon(icon)
-                .tooltip(tip)
-                .accessibility_label(tip)
-                .on_click(cx.listener(move |this, _, window, cx| {
-                    cx.stop_propagation();
-                    this.table_op(op, window, cx);
-                    window.focus(&this.focus, cx);
-                }))
+            toolbar::tool(id, icon, tip, false).on_click(cx.listener(move |this, _, window, cx| {
+                cx.stop_propagation();
+                this.table_op(op, window, cx);
+                window.focus(&this.focus, cx);
+            }))
         };
         Some(
             div()
@@ -208,18 +198,7 @@ impl VisualView {
                         .flex()
                         .justify_end()
                         .child(
-                            div()
-                                .id("table-toolbar")
-                                .flex()
-                                .items_center()
-                                .gap_0p5()
-                                .p_0p5()
-                                .rounded_md()
-                                .bg(theme.popover)
-                                .border_1()
-                                .border_color(theme.border)
-                                .shadow_md()
-                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                            toolbar::floating_toolbar("table-toolbar", cx)
                                 .child(button(
                                     "table-row-above",
                                     IconName::BetweenHorizontalStart,
@@ -244,13 +223,7 @@ impl VisualView {
                                     "Insert column right",
                                     TableOp::ColumnRight,
                                 ))
-                                .child(
-                                    div()
-                                        .w(tokens::HAIRLINE)
-                                        .h(tokens::ICON)
-                                        .mx_0p5()
-                                        .bg(theme.border),
-                                )
+                                .child(toolbar::divider(cx))
                                 .child(button(
                                     "table-del-row",
                                     IconName::TableRowsSplit,
@@ -263,13 +236,7 @@ impl VisualView {
                                     "Delete column",
                                     TableOp::DeleteColumn,
                                 ))
-                                .child(
-                                    div()
-                                        .w(tokens::HAIRLINE)
-                                        .h(tokens::ICON)
-                                        .mx_0p5()
-                                        .bg(theme.border),
-                                )
+                                .child(toolbar::divider(cx))
                                 .child(button(
                                     "table-tidy",
                                     IconName::Sparkles,
