@@ -9,7 +9,7 @@ mod stats;
 mod workspaces;
 
 use gpui_kit::assets::IconName;
-use gpui_kit::base::{Transition, transition};
+use gpui_kit::base::{ResizeHandleContext, ResizeHandleState, Transition, transition};
 #[cfg(all(test, feature = "ui-tests"))]
 extern crate gpui_kit as gpui;
 use gpui_kit::component::{
@@ -20,7 +20,9 @@ use gpui_kit::component::{
     menu::{ContextMenuExt, PopupMenuItem},
     tooltip::Tooltip,
     popover::Popover,
-    resizable::{HandleEdge, h_resizable, resizable_panel, resize_handle},
+    resizable::{
+        HandleEdge, h_resizable, resizable_panel, resize_handle, resize_handle_appearance,
+    },
     text::{RenderedText, TextView, TextViewState},
     v_flex,
 };
@@ -354,6 +356,8 @@ impl Enso {
                     doc.editor
                         .update(cx, |editor, cx| editor.set_line_number(on, window, cx));
                 }
+                // The split view's side order is a preference too.
+                cx.notify();
             });
         Self {
             focus,
@@ -2339,19 +2343,29 @@ impl Render for Enso {
             // resizable state, so switching modes never reuses panel zero for
             // a different kind of document view or its cached draw state.
             body = match (editor_pane, reading_pane) {
-                (Some(editor), Some(reader)) => body.child(
-                    h_resizable(("document-split", document.editor.entity_id()))
-                        .child(
-                            resizable_panel()
-                                .size_range(px(180.)..Pixels::MAX)
-                                .child(editor),
-                        )
-                        .child(
-                            resizable_panel()
-                                .size_range(px(180.)..Pixels::MAX)
-                                .child(reader),
-                        ),
-                ),
+                (Some(editor), Some(reader)) => {
+                    let (first, second) = if settings::reader_first(cx) {
+                        (reader, editor)
+                    } else {
+                        (editor, reader)
+                    };
+                    body.child(
+                        h_resizable(("document-split", document.editor.entity_id()))
+                            .with_handle_appearance(std::rc::Rc::new(|handle, window, cx| {
+                                Some(split_handle(handle, window, cx))
+                            }))
+                            .child(
+                                resizable_panel()
+                                    .size_range(px(180.)..Pixels::MAX)
+                                    .child(first),
+                            )
+                            .child(
+                                resizable_panel()
+                                    .size_range(px(180.)..Pixels::MAX)
+                                    .child(second),
+                            ),
+                    )
+                }
                 (Some(editor), None) => body.child(editor),
                 (None, Some(reader)) => body.child(reader),
                 (None, None) => body,
@@ -2684,6 +2698,54 @@ fn bind_view_keys(cx: &mut App) {
             ]);
         }
     }
+}
+
+/// The split view's divider: the kit's line and pill, plus a button that swaps
+/// the editor and reader sides. The button shows while the pointer is on the
+/// divider or on the button itself; a press that moves still drags the divider.
+fn split_handle(handle: &ResizeHandleContext, window: &mut Window, cx: &mut App) -> AnyElement {
+    const SIZE: f32 = 24.;
+    let line = resize_handle_appearance()(handle, window, cx);
+    let shown = matches!(
+        handle.state(),
+        ResizeHandleState::Hovered | ResizeHandleState::Pressed
+    );
+    let theme = cx.theme();
+    let hover_color = theme.foreground;
+    let button = div()
+        .id("split-swap")
+        .absolute()
+        .top(relative(0.5))
+        .mt(px(-SIZE / 2.))
+        .left(px(0.5 - SIZE / 2.))
+        .size(px(SIZE))
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded_full()
+        .border_1()
+        .border_color(theme.border)
+        .bg(theme.background)
+        .text_color(theme.muted_foreground)
+        .cursor_pointer()
+        .opacity(if shown { 1. } else { 0. })
+        .hover(move |button| button.opacity(1.).text_color(hover_color))
+        .child(Icon::new(IconName::ArrowLeftRight).size(px(13.)))
+        .tooltip(|window, cx| Tooltip::new("Swap editor and reader").build(window, cx))
+        .on_click(|_, _, cx| {
+            let swapped = !settings::reader_first(cx);
+            if let Err(error) = settings::set_reader_first(swapped, cx) {
+                eprintln!("enso: could not save the split order: {error}");
+            }
+        });
+    div()
+        .flex_none()
+        .relative()
+        .w(px(1.))
+        .h_full()
+        .children(line)
+        .child(button)
+        .into_any_element()
 }
 
 /// Markdown shortcuts, live only in a Markdown document's editor (its

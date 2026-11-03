@@ -40,6 +40,8 @@ pub struct Preferences {
     pub appearance: Appearance,
     /// Show line numbers beside the editor's text.
     pub line_numbers: bool,
+    /// Split view puts the reader on the left and the editor on the right.
+    pub reader_first: bool,
     window: Option<AnyWindowHandle>,
     path: Option<PathBuf>,
 }
@@ -53,6 +55,35 @@ fn path() -> Option<PathBuf> {
 fn line_numbers_path() -> Option<PathBuf> {
     dirs::config_dir().map(|p| crate::files::app_folder(p).join("line-numbers"))
 }
+fn split_order_path() -> Option<PathBuf> {
+    dirs::config_dir().map(|p| crate::files::app_folder(p).join("split-order"))
+}
+fn load_reader_first(path: &Path) -> bool {
+    std::fs::read_to_string(path).is_ok_and(|value| value.trim() == "reader-first")
+}
+
+/// Whether split view shows the reader on the left; the editor leads unless
+/// the user swapped them.
+pub fn reader_first(cx: &App) -> bool {
+    cx.try_global::<Preferences>()
+        .is_some_and(|p| p.reader_first)
+}
+
+/// Swap the split view's sides in every window, and remember it.
+pub fn set_reader_first(on: bool, cx: &mut App) -> io::Result<()> {
+    if !cx.has_global::<Preferences>() {
+        init(cx);
+    }
+    cx.update_global::<Preferences, _>(|prefs, _| prefs.reader_first = on);
+    if let Some(path) = split_order_path() {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(path, if on { "reader-first" } else { "editor-first" })?;
+    }
+    Ok(())
+}
+
 fn load_line_numbers(path: &Path) -> bool {
     std::fs::read_to_string(path).is_ok_and(|value| value.trim() == "on")
 }
@@ -88,9 +119,11 @@ pub fn init(cx: &mut App) {
     let path = path();
     let appearance = path.as_ref().map(|p| load(p)).unwrap_or_default();
     let line_numbers = line_numbers_path().as_deref().is_some_and(load_line_numbers);
+    let reader_first = split_order_path().as_deref().is_some_and(load_reader_first);
     cx.set_global(Preferences {
         appearance,
         line_numbers,
+        reader_first,
         window: None,
         path,
     });
