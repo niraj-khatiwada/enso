@@ -87,7 +87,9 @@ fn load(path: &Path) -> Appearance {
 pub fn init(cx: &mut App) {
     let path = path();
     let appearance = path.as_ref().map(|p| load(p)).unwrap_or_default();
-    let line_numbers = line_numbers_path().as_deref().is_some_and(load_line_numbers);
+    let line_numbers = line_numbers_path()
+        .as_deref()
+        .is_some_and(load_line_numbers);
     cx.set_global(Preferences {
         appearance,
         line_numbers,
@@ -337,7 +339,12 @@ fn preview(appearance: Appearance) -> impl IntoElement {
 fn page_header(title: &'static str, description: &'static str, muted: Hsla) -> impl IntoElement {
     v_flex()
         .gap_1()
-        .child(div().text_xl().font_weight(FontWeight::SEMIBOLD).child(title))
+        .child(
+            div()
+                .text_xl()
+                .font_weight(FontWeight::SEMIBOLD)
+                .child(title),
+        )
         .child(div().text_sm().text_color(muted).child(description))
 }
 
@@ -355,7 +362,12 @@ impl SettingsWindow {
             .child(
                 v_flex()
                     .gap_3()
-                    .child(div().text_sm().font_weight(FontWeight::MEDIUM).child("Theme"))
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_weight(FontWeight::MEDIUM)
+                            .child("Theme"),
+                    )
                     .child(
                         h_flex().gap_3().children(
                             [
@@ -365,44 +377,47 @@ impl SettingsWindow {
                             ]
                             .into_iter()
                             .enumerate()
-                            .map(|(index, (appearance, label, icon))| {
-                                Button::new(("appearance", index))
-                                    .ghost()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .h(px(132.))
-                                    .p_3()
-                                    .border_1()
-                                    .border_color(if selected == appearance {
-                                        theme.primary
-                                    } else {
-                                        theme.border
-                                    })
-                                    .when(selected == appearance, |button| {
-                                        button.bg(theme.secondary)
-                                    })
-                                    .accessibility_label(format!("{label} theme"))
-                                    .child(
-                                        v_flex()
-                                            .w_full()
-                                            .gap_3()
-                                            .child(preview(appearance))
-                                            .child(
-                                                h_flex()
-                                                    .items_center()
-                                                    .justify_center()
-                                                    .gap_2()
-                                                    .child(icon)
-                                                    .child(div().text_sm().child(label)),
-                                            ),
-                                    )
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.error = choose(appearance, cx).err().map(|error| {
-                                            format!("Could not save appearance: {error}")
-                                        });
-                                        cx.notify();
-                                    }))
-                            }),
+                            .map(
+                                |(index, (appearance, label, icon))| {
+                                    Button::new(("appearance", index))
+                                        .ghost()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .h(px(132.))
+                                        .p_3()
+                                        .border_1()
+                                        .border_color(if selected == appearance {
+                                            theme.primary
+                                        } else {
+                                            theme.border
+                                        })
+                                        .when(selected == appearance, |button| {
+                                            button.bg(theme.secondary)
+                                        })
+                                        .accessibility_label(format!("{label} theme"))
+                                        .child(
+                                            v_flex()
+                                                .w_full()
+                                                .gap_3()
+                                                .child(preview(appearance))
+                                                .child(
+                                                    h_flex()
+                                                        .items_center()
+                                                        .justify_center()
+                                                        .gap_2()
+                                                        .child(icon)
+                                                        .child(div().text_sm().child(label)),
+                                                ),
+                                        )
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.error =
+                                                choose(appearance, cx).err().map(|error| {
+                                                    format!("Could not save appearance: {error}")
+                                                });
+                                            cx.notify();
+                                        }))
+                                },
+                            ),
                         ),
                     ),
             )
@@ -430,22 +445,24 @@ impl SettingsWindow {
                     .child(
                         v_flex()
                             .gap_0p5()
-                            .child(div().text_sm().font_weight(FontWeight::MEDIUM).child("Line numbers"))
                             .child(
                                 div()
-                                    .text_xs()
-                                    .text_color(theme.muted_foreground)
-                                    .child("Show line numbers beside the text in Edit and Split views."),
-                            ),
+                                    .text_sm()
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .child("Line numbers"),
+                            )
+                            .child(div().text_xs().text_color(theme.muted_foreground).child(
+                                "Show line numbers beside the text in Edit and Split views.",
+                            )),
                     )
                     .child(
                         Switch::new("line-numbers")
                             .checked(line_numbers)
                             .accessibility_label("Line numbers")
                             .on_change(move |on, _, cx| {
-                                let error = set_line_numbers(*on, cx)
-                                    .err()
-                                    .map(|error| format!("Could not save editor settings: {error}"));
+                                let error = set_line_numbers(*on, cx).err().map(|error| {
+                                    format!("Could not save editor settings: {error}")
+                                });
                                 let _ = weak.update(cx, |this, cx| {
                                     this.error = error;
                                     cx.notify();

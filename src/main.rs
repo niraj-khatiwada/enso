@@ -18,10 +18,10 @@ use gpui_kit::component::{
     h_flex,
     input::{Editor, EditorState, Input, InputEvent, InputState},
     menu::{ContextMenuExt, PopupMenuItem},
-    tooltip::Tooltip,
     popover::Popover,
     resizable::{HandleEdge, h_resizable, resizable_panel, resize_handle},
     text::{RenderedText, TextView, TextViewState},
+    tooltip::Tooltip,
     v_flex,
 };
 use gpui_kit::{prelude::FluentBuilder, *};
@@ -192,7 +192,9 @@ fn quit_all(cx: &mut App) {
     }
     for (handle, view) in views {
         let _ = handle.update(cx, |_, window, cx| {
-            view.update(cx, |view, cx| view.request_close(CloseTarget::App, window, cx))
+            view.update(cx, |view, cx| {
+                view.request_close(CloseTarget::App, window, cx)
+            })
         });
     }
 }
@@ -477,7 +479,8 @@ impl Enso {
             // Large files read through `large_reader`; their editor may not be
             // filled yet, and the preview stays empty either way.
             if text.len() < reader::LARGE_DOCUMENT_BYTES {
-                doc.preview.update(cx, |preview, cx| preview.set_text(&text, cx));
+                doc.preview
+                    .update(cx, |preview, cx| preview.set_text(&text, cx));
                 doc.preview_loaded = true;
             }
         }
@@ -486,7 +489,8 @@ impl Enso {
         for &i in recent.iter().skip(KEEP) {
             let doc = &mut self.documents[i];
             if doc.preview_loaded {
-                doc.preview.update(cx, |preview, cx| preview.set_text("", cx));
+                doc.preview
+                    .update(cx, |preview, cx| preview.set_text("", cx));
                 doc.preview_loaded = false;
             }
         }
@@ -935,7 +939,11 @@ impl Enso {
             Some(path) => path.parent()?.to_path_buf(),
             None => root.clone(),
         };
-        Some(if dir.starts_with(root) { dir } else { root.clone() })
+        Some(if dir.starts_with(root) {
+            dir
+        } else {
+            root.clone()
+        })
     }
 
     fn start_naming(&mut self, folder: bool, window: &mut Window, cx: &mut Context<Self>) {
@@ -1115,13 +1123,13 @@ impl Enso {
                         attr(&alt)
                     ));
                 }
-                Err(error) => {
-                    self.message(format!("Could not save the image: {error}"), true, cx)
-                }
+                Err(error) => self.message(format!("Could not save the image: {error}"), true, cx),
             }
         }
         if !links.is_empty() {
-            editor.update(cx, |editor, cx| editor.replace(links.join("\n"), window, cx));
+            editor.update(cx, |editor, cx| {
+                editor.replace(links.join("\n"), window, cx)
+            });
         }
     }
 
@@ -1172,7 +1180,11 @@ impl Enso {
         if self.renaming.as_ref().is_some_and(|p| p.starts_with(path)) {
             self.renaming = None;
         }
-        if self.naming.as_ref().is_some_and(|n| n.dir.starts_with(path)) {
+        if self
+            .naming
+            .as_ref()
+            .is_some_and(|n| n.dir.starts_with(path))
+        {
             self.naming = None;
         }
         if let Some(parent) = path.parent() {
@@ -1216,9 +1228,13 @@ impl Enso {
         match files::rename(&old, &name) {
             Ok(new) if new != old => {
                 let moved = |path: &PathBuf| {
-                    path.strip_prefix(&old)
-                        .ok()
-                        .map(|rest| if rest.as_os_str().is_empty() { new.clone() } else { new.join(rest) })
+                    path.strip_prefix(&old).ok().map(|rest| {
+                        if rest.as_os_str().is_empty() {
+                            new.clone()
+                        } else {
+                            new.join(rest)
+                        }
+                    })
                 };
                 if let Some(path) = self.selected.as_ref().and_then(|p| moved(p)) {
                     self.selected = Some(path);
@@ -1239,7 +1255,12 @@ impl Enso {
                     .parent()
                     .map(PathBuf::from)
                     .into_iter()
-                    .chain(self.expanded.iter().filter(|p| p.starts_with(&new)).cloned())
+                    .chain(
+                        self.expanded
+                            .iter()
+                            .filter(|p| p.starts_with(&new))
+                            .cloned(),
+                    )
                     .collect();
                 for path in reload {
                     self.load_folder(path, cx);
@@ -1433,7 +1454,11 @@ impl Enso {
     }
 
     fn tree_rows(&self, path: &PathBuf, threads: &mut Vec<bool>, rows: &mut Vec<TreeRow>) {
-        let entries = self.folders.get(path).map(Vec::as_slice).unwrap_or_default();
+        let entries = self
+            .folders
+            .get(path)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
         // A new entry is named in place, at the top of the folder it goes in.
         if let Some(NewEntry { dir, folder }) = &self.naming
             && dir == path
@@ -1550,94 +1575,102 @@ impl Render for Enso {
             // One pill: name and close button share the hover and active fill.
             // The wrapper keeps a press on a tab from starting a title-bar
             // window drag (after the tab's own handlers have seen it).
-            tabs = tabs.child(div().flex_shrink_0().on_mouse_down(MouseButton::Left, |_, _, cx| {
-                cx.stop_propagation()
-            }).child(
-                h_flex()
-                    .id(("file-tab", editor_id))
+            tabs = tabs.child(
+                div()
                     .flex_shrink_0()
-                    .h(px(28.))
-                    .pl_2p5()
-                    .pr_1()
-                    .gap_0p5()
-                    .items_center()
-                    .rounded_md()
-                    .cursor_pointer()
-                    .text_sm()
-                    .on_hover(cx.listener(move |this, hovered, _, cx| {
-                        let next = if *hovered {
-                            Some(editor_id)
-                        } else if this.hovered_tab == Some(editor_id) {
-                            None
-                        } else {
-                            this.hovered_tab
-                        };
-                        if this.hovered_tab != next {
-                            this.hovered_tab = next;
-                            cx.notify();
-                        }
-                    }))
-                    .when(active, |tab| tab.bg(theme.secondary))
-                    .when(!active, |tab| {
-                        tab.text_color(theme.muted_foreground)
-                            .hover(|tab| tab.bg(theme.secondary.opacity(0.6)))
-                    })
-                    // Long names end in "…" at a fixed width; the full name is in
-                    // the tooltip, and the unsaved dot stays outside the cut.
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .child(
-                        div()
-                            .max_w(px(TAB_TITLE_WIDTH))
-                            .min_w_0()
-                            .truncate()
-                            .child(document.title()),
-                    )
-                    .when(document.dirty(cx), |tab| tab.child("•"))
-                    .tooltip({
-                        let title = document.title();
-                        move |window, cx| Tooltip::new(title.clone()).build(window, cx)
-                    })
-                    // Built only while shown: a hidden button per tab made every
-                    // frame cost more with each open file.
-                    .when(reveal > 0.001, |tab| tab.child(
                         h_flex()
-                            .w(px(20. * reveal))
-                            .h(px(20.))
+                            .id(("file-tab", editor_id))
                             .flex_shrink_0()
-                            .overflow_hidden()
+                            .h(px(28.))
+                            .pl_2p5()
+                            .pr_1()
+                            .gap_0p5()
+                            .items_center()
+                            .rounded_md()
+                            .cursor_pointer()
+                            .text_sm()
+                            .on_hover(cx.listener(move |this, hovered, _, cx| {
+                                let next = if *hovered {
+                                    Some(editor_id)
+                                } else if this.hovered_tab == Some(editor_id) {
+                                    None
+                                } else {
+                                    this.hovered_tab
+                                };
+                                if this.hovered_tab != next {
+                                    this.hovered_tab = next;
+                                    cx.notify();
+                                }
+                            }))
+                            .when(active, |tab| tab.bg(theme.secondary))
+                            .when(!active, |tab| {
+                                tab.text_color(theme.muted_foreground)
+                                    .hover(|tab| tab.bg(theme.secondary.opacity(0.6)))
+                            })
+                            // Long names end in "…" at a fixed width; the full name is in
+                            // the tooltip, and the unsaved dot stays outside the cut.
                             .child(
-                                Button::new(("close-tab", editor_id))
-                                    .ghost()
-                                    .xsmall()
-                                    .icon(IconName::X)
-                                    .tooltip("Close file")
-                                    .accessibility_label(format!("Close {}", document.title()))
-                                    .w(px(20.))
-                                    .h(px(20.))
-                                    .flex_shrink_0()
-                                    .opacity(reveal)
-                                    .disabled(!hovered)
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        // Not also a click on the tab around it.
-                                        cx.stop_propagation();
-                                        if let Some(index) = this
-                                            .documents
-                                            .iter()
-                                            .position(|doc| doc.editor.entity_id() == editor_id)
-                                        {
-                                            this.close_document(index, cx);
-                                        }
-                                    })),
-                            ),
-                    ))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.active = this
-                            .documents
-                            .iter()
-                            .position(|doc| doc.editor.entity_id() == editor_id);
-                        this.selected = None;
-                        cx.notify();
-                    })),
-            ));
+                                div()
+                                    .max_w(px(TAB_TITLE_WIDTH))
+                                    .min_w_0()
+                                    .truncate()
+                                    .child(document.title()),
+                            )
+                            .when(document.dirty(cx), |tab| tab.child("•"))
+                            .tooltip({
+                                let title = document.title();
+                                move |window, cx| Tooltip::new(title.clone()).build(window, cx)
+                            })
+                            // Built only while shown: a hidden button per tab made every
+                            // frame cost more with each open file.
+                            .when(reveal > 0.001, |tab| {
+                                tab.child(
+                                    h_flex()
+                                        .w(px(20. * reveal))
+                                        .h(px(20.))
+                                        .flex_shrink_0()
+                                        .overflow_hidden()
+                                        .child(
+                                            Button::new(("close-tab", editor_id))
+                                                .ghost()
+                                                .xsmall()
+                                                .icon(IconName::X)
+                                                .tooltip("Close file")
+                                                .accessibility_label(format!(
+                                                    "Close {}",
+                                                    document.title()
+                                                ))
+                                                .w(px(20.))
+                                                .h(px(20.))
+                                                .flex_shrink_0()
+                                                .opacity(reveal)
+                                                .disabled(!hovered)
+                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                    // Not also a click on the tab around it.
+                                                    cx.stop_propagation();
+                                                    if let Some(index) =
+                                                        this.documents.iter().position(|doc| {
+                                                            doc.editor.entity_id() == editor_id
+                                                        })
+                                                    {
+                                                        this.close_document(index, cx);
+                                                    }
+                                                })),
+                                        ),
+                                )
+                            })
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.active = this
+                                    .documents
+                                    .iter()
+                                    .position(|doc| doc.editor.entity_id() == editor_id);
+                                this.selected = None;
+                                cx.notify();
+                            })),
+                    ),
+            );
         }
         let highlighted = self.selected.clone().or_else(|| active_path.clone());
         let switcher = {
@@ -1688,9 +1721,10 @@ impl Render for Enso {
                                         .size_3p5()
                                         .flex_shrink_0()
                                         .text_color(theme.muted_foreground)
-                                        .when(!(self.switcher_hovered || self.switcher_open), |icon| {
-                                            icon.opacity(0.)
-                                        }),
+                                        .when(
+                                            !(self.switcher_hovered || self.switcher_open),
+                                            |icon| icon.opacity(0.),
+                                        ),
                                 ),
                         )
                         .accessibility_label("Switch workspace")
@@ -1779,10 +1813,11 @@ impl Render for Enso {
                                                     .on_click(move |_, _, cx| {
                                                         cx.stop_propagation();
                                                         cx.reveal_path(&reveal_path);
-                                                        let _ = reveal_weak.update(cx, |this, cx| {
-                                                            this.switcher_open = false;
-                                                            cx.notify();
-                                                        });
+                                                        let _ =
+                                                            reveal_weak.update(cx, |this, cx| {
+                                                                this.switcher_open = false;
+                                                                cx.notify();
+                                                            });
                                                     }),
                                             )
                                             // The current workspace is already in this window.
@@ -1797,11 +1832,12 @@ impl Render for Enso {
                                                         .on_click(move |_, window, cx| {
                                                             cx.stop_propagation();
                                                             let path = open_path.clone();
-                                                            let _ = open_weak.update(cx, |this, cx| {
-                                                                this.switch_workspace(
-                                                                    path, true, window, cx,
-                                                                )
-                                                            });
+                                                            let _ =
+                                                                open_weak.update(cx, |this, cx| {
+                                                                    this.switch_workspace(
+                                                                        path, true, window, cx,
+                                                                    )
+                                                                });
                                                         }),
                                                 )
                                             }),
@@ -2239,14 +2275,15 @@ impl Render for Enso {
                                                 ClipboardEntry::Image(image) => {
                                                     images.push(PastedImage::Data(image.clone()))
                                                 }
-                                                ClipboardEntry::ExternalPaths(paths) => images.extend(
-                                                    paths
-                                                        .paths()
-                                                        .iter()
-                                                        .filter(|p| files::is_image(p))
-                                                        .cloned()
-                                                        .map(PastedImage::File),
-                                                ),
+                                                ClipboardEntry::ExternalPaths(paths) => images
+                                                    .extend(
+                                                        paths
+                                                            .paths()
+                                                            .iter()
+                                                            .filter(|p| files::is_image(p))
+                                                            .cloned()
+                                                            .map(PastedImage::File),
+                                                    ),
                                                 _ => {}
                                             }
                                         }
@@ -2476,35 +2513,39 @@ impl Render for Enso {
                 .border_color(gpui_kit::transparent_black())
                 // Laid out on top of the bar rather than in it, so a full tab
                 // strip scrolls within the window instead of widening the bar.
-                .child(div().absolute().inset_0().child(
-                    h_flex()
-                        .size_full()
-                        .min_w_0()
-                        .items_center()
-                        .gap_2()
-                        .pr_2()
-                        .child(
-                            // The title bar starts a window move on any press
-                            // that then moves; keep presses on the toggle to
-                            // itself so a slightly shaky click still toggles.
-                            div()
-                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                                .child(
-                                    Button::new("toggle-sidebar")
-                                        .ghost()
-                                        .small()
-                                        .icon(IconName::PanelLeft)
-                                        .tooltip(toggle_label)
-                                        .accessibility_label(toggle_label)
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            this.sidebar_open = !this.sidebar_open;
-                                            cx.notify();
-                                        })),
-                                ),
-                        )
-                        .child(div().flex_shrink_0().w(px(header_offset)))
-                        .child(document_header),
-                ));
+                .child(
+                    div().absolute().inset_0().child(
+                        h_flex()
+                            .size_full()
+                            .min_w_0()
+                            .items_center()
+                            .gap_2()
+                            .pr_2()
+                            .child(
+                                // The title bar starts a window move on any press
+                                // that then moves; keep presses on the toggle to
+                                // itself so a slightly shaky click still toggles.
+                                div()
+                                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                        cx.stop_propagation()
+                                    })
+                                    .child(
+                                        Button::new("toggle-sidebar")
+                                            .ghost()
+                                            .small()
+                                            .icon(IconName::PanelLeft)
+                                            .tooltip(toggle_label)
+                                            .accessibility_label(toggle_label)
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.sidebar_open = !this.sidebar_open;
+                                                cx.notify();
+                                            })),
+                                    ),
+                            )
+                            .child(div().flex_shrink_0().w(px(header_offset)))
+                            .child(document_header),
+                    ),
+                );
             (Some(titlebar.into_any_element()), None)
         } else {
             (None, Some(document_header.into_any_element()))
@@ -2955,120 +2996,123 @@ fn main() {
         let _ = opened_tx.unbounded_send(urls);
     });
     app.run(move |cx| {
-            gpui_kit::init(cx);
-            app_icon::init();
-            settings::init(cx);
-            workspaces::init(cx);
-            cx.on_action(|_: &OpenSettings, cx| settings::open(cx));
-            cx.bind_keys([
-                KeyBinding::new("cmd-,", OpenSettings, None),
-                KeyBinding::new("ctrl-,", OpenSettings, None),
-            ]);
-            macro_rules! shortcut {
-                ($key:literal, $action:expr) => {
-                    KeyBinding::new(
-                        if cfg!(target_os = "macos") {
-                            concat!("cmd-", $key)
-                        } else {
-                            concat!("ctrl-", $key)
-                        },
-                        $action,
-                        Some("Enso"),
-                    )
-                };
-            }
-            cx.bind_keys([
-                shortcut!("o", OpenFile),
-                shortcut!("shift-o", OpenFolder),
-                shortcut!("n", NewFile),
-                shortcut!("s", Save),
-                shortcut!("e", ToggleView),
-                shortcut!("q", Quit),
-            ]);
-            // Act on the selected tree row. Bound on the window, not in text
-            // fields, so they never take over these keys while typing.
-            cx.bind_keys(if cfg!(target_os = "macos") {
-                [
-                    KeyBinding::new("cmd-backspace", DeleteSelected, Some("Enso")),
-                    KeyBinding::new("enter", RenameSelected, Some("Enso")),
-                ]
-            } else {
-                [
-                    KeyBinding::new("delete", DeleteSelected, Some("Enso")),
-                    KeyBinding::new("f2", RenameSelected, Some("Enso")),
-                ]
-            });
-            cx.bind_keys([
-                KeyBinding::new("ctrl-shift-n", NewFolder, Some("Enso")),
-                #[cfg(target_os = "macos")]
-                KeyBinding::new("cmd-shift-n", NewFolder, Some("Enso")),
-            ]);
-            bind_view_keys(cx);
-            bind_markdown_keys(cx);
-            cx.set_menus(vec![
-                Menu {
-                    name: "enso".into(),
-                    items: vec![
-                        MenuItem::action("Settings…", OpenSettings),
-                        MenuItem::separator(),
-                        MenuItem::action("Quit enso", Quit),
-                    ],
-                    disabled: false,
-                },
-                Menu {
-                    name: "File".into(),
-                    items: vec![
-                        MenuItem::action("Open File…", OpenFile),
-                        MenuItem::action("Open Folder…", OpenFolder),
-                        MenuItem::action("New File", NewFile),
-                        MenuItem::action("New Folder", NewFolder),
-                        MenuItem::action("Close File", CloseFile),
-                        #[cfg(not(target_os = "macos"))]
-                        MenuItem::action("Settings…", OpenSettings),
-                        MenuItem::separator(),
-                        MenuItem::action("Save", Save),
-                    ],
-                    disabled: false,
-                },
-            ]);
-            cx.on_action(|_: &Quit, cx| cx.defer(quit_all));
-            cx.on_window_closed(|cx, _| {
-                let windows = cx.windows();
-                cx.default_global::<OpenWindows>()
-                    .0
-                    .retain(|(handle, _)| windows.contains(handle));
-                if open_views(cx).is_empty() {
-                    cx.quit();
-                }
-            })
-            .detach();
-            if let Some(path) = initial {
-                let path = std::fs::canonicalize(&path).unwrap_or(path);
-                open_enso_window(cx, move |app, window, cx| app.open_path(path, window, cx));
-            } else {
-                match workspaces::last(cx) {
-                    Some(last) if last.exists() => open_workspace_window(Some(last.path), cx),
-                    Some(last) => open_enso_window(cx, move |app, _, cx| {
-                        app.message(
-                            format!("Your last workspace “{}” is no longer available.", last.name()),
-                            true,
-                            cx,
-                        )
-                    }),
-                    None => open_enso_window(cx, |app, window, cx| {
-                        app.open_first_launch_sample(window, cx)
-                    }),
-                }
-            }
-            cx.spawn(async move |cx| {
-                use futures::StreamExt as _;
-                while let Some(urls) = opened_rx.next().await {
-                    cx.update(|cx| open_urls(urls, cx));
-                }
-            })
-            .detach();
-            cx.activate(true);
+        gpui_kit::init(cx);
+        app_icon::init();
+        settings::init(cx);
+        workspaces::init(cx);
+        cx.on_action(|_: &OpenSettings, cx| settings::open(cx));
+        cx.bind_keys([
+            KeyBinding::new("cmd-,", OpenSettings, None),
+            KeyBinding::new("ctrl-,", OpenSettings, None),
+        ]);
+        macro_rules! shortcut {
+            ($key:literal, $action:expr) => {
+                KeyBinding::new(
+                    if cfg!(target_os = "macos") {
+                        concat!("cmd-", $key)
+                    } else {
+                        concat!("ctrl-", $key)
+                    },
+                    $action,
+                    Some("Enso"),
+                )
+            };
+        }
+        cx.bind_keys([
+            shortcut!("o", OpenFile),
+            shortcut!("shift-o", OpenFolder),
+            shortcut!("n", NewFile),
+            shortcut!("s", Save),
+            shortcut!("e", ToggleView),
+            shortcut!("q", Quit),
+        ]);
+        // Act on the selected tree row. Bound on the window, not in text
+        // fields, so they never take over these keys while typing.
+        cx.bind_keys(if cfg!(target_os = "macos") {
+            [
+                KeyBinding::new("cmd-backspace", DeleteSelected, Some("Enso")),
+                KeyBinding::new("enter", RenameSelected, Some("Enso")),
+            ]
+        } else {
+            [
+                KeyBinding::new("delete", DeleteSelected, Some("Enso")),
+                KeyBinding::new("f2", RenameSelected, Some("Enso")),
+            ]
         });
+        cx.bind_keys([
+            KeyBinding::new("ctrl-shift-n", NewFolder, Some("Enso")),
+            #[cfg(target_os = "macos")]
+            KeyBinding::new("cmd-shift-n", NewFolder, Some("Enso")),
+        ]);
+        bind_view_keys(cx);
+        bind_markdown_keys(cx);
+        cx.set_menus(vec![
+            Menu {
+                name: "enso".into(),
+                items: vec![
+                    MenuItem::action("Settings…", OpenSettings),
+                    MenuItem::separator(),
+                    MenuItem::action("Quit enso", Quit),
+                ],
+                disabled: false,
+            },
+            Menu {
+                name: "File".into(),
+                items: vec![
+                    MenuItem::action("Open File…", OpenFile),
+                    MenuItem::action("Open Folder…", OpenFolder),
+                    MenuItem::action("New File", NewFile),
+                    MenuItem::action("New Folder", NewFolder),
+                    MenuItem::action("Close File", CloseFile),
+                    #[cfg(not(target_os = "macos"))]
+                    MenuItem::action("Settings…", OpenSettings),
+                    MenuItem::separator(),
+                    MenuItem::action("Save", Save),
+                ],
+                disabled: false,
+            },
+        ]);
+        cx.on_action(|_: &Quit, cx| cx.defer(quit_all));
+        cx.on_window_closed(|cx, _| {
+            let windows = cx.windows();
+            cx.default_global::<OpenWindows>()
+                .0
+                .retain(|(handle, _)| windows.contains(handle));
+            if open_views(cx).is_empty() {
+                cx.quit();
+            }
+        })
+        .detach();
+        if let Some(path) = initial {
+            let path = std::fs::canonicalize(&path).unwrap_or(path);
+            open_enso_window(cx, move |app, window, cx| app.open_path(path, window, cx));
+        } else {
+            match workspaces::last(cx) {
+                Some(last) if last.exists() => open_workspace_window(Some(last.path), cx),
+                Some(last) => open_enso_window(cx, move |app, _, cx| {
+                    app.message(
+                        format!(
+                            "Your last workspace “{}” is no longer available.",
+                            last.name()
+                        ),
+                        true,
+                        cx,
+                    )
+                }),
+                None => open_enso_window(cx, |app, window, cx| {
+                    app.open_first_launch_sample(window, cx)
+                }),
+            }
+        }
+        cx.spawn(async move |cx| {
+            use futures::StreamExt as _;
+            while let Some(urls) = opened_rx.next().await {
+                cx.update(|cx| open_urls(urls, cx));
+            }
+        })
+        .detach();
+        cx.activate(true);
+    });
 }
 
 #[cfg(all(test, feature = "ui-tests"))]
@@ -3139,10 +3183,12 @@ mod transition_tests {
             .unwrap()
         });
         let view_tab = |cx: &mut TestAppContext, i: usize| {
-            cx.update(|cx| view.update(cx, |view, cx| {
-                view.active = Some(i);
-                cx.notify();
-            }));
+            cx.update(|cx| {
+                view.update(cx, |view, cx| {
+                    view.active = Some(i);
+                    cx.notify();
+                })
+            });
             draw(cx, handle);
         };
         let loaded = |cx: &mut TestAppContext| {
@@ -3269,7 +3315,11 @@ mod transition_tests {
             .unwrap();
         };
         let text = |cx: &mut TestAppContext| cx.update(|cx| editor.read(cx).value().to_string());
-        let primary = if cfg!(target_os = "macos") { "cmd" } else { "ctrl" };
+        let primary = if cfg!(target_os = "macos") {
+            "cmd"
+        } else {
+            "ctrl"
+        };
 
         // Enter continues the list, Tab nests the new item, a second Enter on
         // the empty item steps it back out.
