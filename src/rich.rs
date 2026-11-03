@@ -196,6 +196,15 @@ pub fn decorate(
     view.plugin(inline)
         .markdown_block_parser(|node, context| {
             let source = context.node_source(node)?;
+            if let Node::Code(code) = node {
+                if crate::diagram::is_mermaid(code.lang.as_deref()) {
+                    return Some(
+                        MarkdownNode::new("enso-mermaid", MermaidBlock { source: code.value.clone() })
+                            .text(code.value.clone())
+                            .markdown(source.to_owned()),
+                    );
+                }
+            }
             if let Some(tasks) = parse_tasks(node, context) {
                 return Some(
                     MarkdownNode::new("enso-tasks", tasks)
@@ -209,6 +218,10 @@ pub fn decorate(
                     .text(picture.alt)
                     .markdown(source.to_owned()),
             )
+        })
+        .markdown_block_renderer("enso-mermaid", |node, _, cx| {
+            let block = node.data::<MermaidBlock>().unwrap();
+            render_mermaid(&block.source, cx)
         })
         .markdown_block_renderer("enso-image", move |node, window, cx| {
             render_picture(
@@ -319,6 +332,98 @@ pub fn decorate(
                 .into_any_element()
         })
 }
+/// A ```mermaid fence, shown as its diagram.
+#[derive(Clone)]
+struct MermaidBlock {
+    source: String,
+}
+
+/// A diagram on a soft panel the width of the text, centred; wide ones scale
+/// down to fit. A diagram with a mistake shows the mistake and its source.
+fn render_mermaid(source: &str, cx: &mut App) -> AnyElement {
+    let theme = cx.theme().clone();
+    let dark = theme.mode.is_dark();
+    match crate::diagram::render(source, dark) {
+        Ok(drawn) => {
+            let [r, g, b, _] = crate::diagram::background(dark);
+            div()
+                .w_full()
+                .my_1()
+                .p_4()
+                .rounded(px(10.))
+                .bg(rgb(u32::from_be_bytes([0, r, g, b])))
+                .border_1()
+                .border_color(theme.border.opacity(0.6))
+                .flex()
+                .justify_center()
+                .child(
+                    img(diagram_image(&drawn.svg))
+                        .w(px(drawn.width))
+                        .h(px(drawn.height))
+                        .max_w_full()
+                        .object_fit(ObjectFit::Contain),
+                )
+                .into_any_element()
+        }
+        Err(problem) => v_flex()
+            .w_full()
+            .my_1()
+            .p_3()
+            .gap_2()
+            .rounded(px(10.))
+            .border_1()
+            .border_color(theme.danger.opacity(0.4))
+            .bg(theme.danger.opacity(0.06))
+            .child(
+                h_flex()
+                    .gap_2()
+                    .items_center()
+                    .text_sm()
+                    .text_color(theme.danger)
+                    .child(Icon::new(IconName::TriangleAlert).size_4())
+                    .child(if problem.line > 0 {
+                        format!("Diagram error on line {}: {}", problem.line, problem.message)
+                    } else {
+                        format!("Diagram error: {}", problem.message)
+                    }),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .font_family(theme.mono_font_family.clone())
+                    .text_color(theme.muted_foreground)
+                    .child(source.trim_end().to_string()),
+            )
+            .into_any_element(),
+    }
+}
+
+/// The SVG as an image GPUI can draw, made once per drawing: the image's id
+/// is a hash of its bytes, which isn't worth recomputing every frame.
+fn diagram_image(svg: &std::sync::Arc<str>) -> std::sync::Arc<gpui_kit::Image> {
+    thread_local! {
+        static IMAGES: std::cell::RefCell<HashMap<usize, (std::sync::Arc<str>, std::sync::Arc<gpui_kit::Image>)>> =
+            Default::default();
+    }
+    let key = std::sync::Arc::as_ptr(svg) as *const u8 as usize;
+    IMAGES.with(|images| {
+        let mut images = images.borrow_mut();
+        if let Some((_, image)) = images.get(&key) {
+            return image.clone();
+        }
+        if images.len() > 64 {
+            images.clear();
+        }
+        let image = std::sync::Arc::new(gpui_kit::Image::from_bytes(
+            gpui_kit::ImageFormat::Svg,
+            svg.as_bytes().to_vec(),
+        ));
+        // Holding the SVG keeps its address from being reused by another.
+        images.insert(key, (svg.clone(), image.clone()));
+        image
+    })
+}
+
 #[derive(Clone)]
 struct TaskItem {
     checked: Option<bool>,

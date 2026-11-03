@@ -25,6 +25,12 @@ rustybuzz = "0.20.1"
 fontdb = "0.23"
 memmap2 = "0.9"
 unicode-linebreak = "0.1.5"
+# ```mermaid fences drawn as SVG: a pure-Rust port of Obsidian's Pele, no
+# browser or JavaScript engine.
+bezel-mermaid = "0.2.24"
+# Pictures of diagrams for PDFs and the clipboard: the SVG renderer GPUI
+# already builds, at its version and features.
+resvg = { version = "0.46", default-features = false, features = ["text", "system-fonts"] }
 
 # Moving deleted files to the Trash: the trash crate on macOS and Linux;
 # Windows goes through the shell itself (see files::move_to_trash).

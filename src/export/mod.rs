@@ -419,3 +419,4 @@ fn set_clipboard_html(html: &str, plain: &str) -> Result<(), String> {
         .set_html(html, Some(plain))
         .map_err(|e| e.to_string())
 }
+
