@@ -48,7 +48,9 @@ pub fn render(source: &str, dark: bool) -> Result<Diagram, Problem> {
     let options = mermaid::Options {
         // Labels are measured with Arial's advances (`Metrics`), so they're
         // drawn in Arial (or a metric twin) to fit their boxes.
-        font_family: Some("Arial, Helvetica, \"Liberation Sans\", sans-serif".into()),
+        // Unquoted: the list goes inside a `style` attribute, where a quote
+        // would end it early (and leave the text in a serif fallback).
+        font_family: Some("Arial, Helvetica, Liberation Sans, sans-serif".into()),
         font_size: 14.,
         max_width: Some(MAX_WIDTH),
         colors: Some(if dark { DARK } else { LIGHT }),
@@ -83,7 +85,12 @@ pub fn png(diagram: &Diagram, scale: f32) -> Option<Vec<u8>> {
         db.load_system_fonts();
         Arc::new(db)
     });
-    let options = resvg::usvg::Options { fontdb: fonts.clone(), ..Default::default() };
+    let options = resvg::usvg::Options {
+        fontdb: fonts.clone(),
+        // Not the serif usvg falls back to: the labels were measured in Arial.
+        font_family: "Arial".into(),
+        ..Default::default()
+    };
     let tree = resvg::usvg::Tree::from_str(&diagram.svg, &options).ok()?;
     let size = tree.size();
     let (w, h) = ((size.width() * scale).ceil() as u32, (size.height() * scale).ceil() as u32);
@@ -153,6 +160,8 @@ mod tests {
         assert!(drawn.svg.starts_with("<svg") && drawn.width > 0. && drawn.height > 0.);
         // No CSS variables left: the palette is written in.
         assert!(!drawn.svg.contains("var(--"), "{}", &drawn.svg[..200.min(drawn.svg.len())]);
+        // The font list survives intact inside its `style` attribute.
+        assert!(drawn.svg.contains("font-family:Arial, Helvetica, Liberation Sans, sans-serif"));
         let problem = render("flowchart LR\n  A --> ", false).err().unwrap();
         assert!(!problem.message.is_empty());
         assert!(is_mermaid(Some("Mermaid")) && !is_mermaid(Some("rust")) && !is_mermaid(None));

@@ -260,6 +260,11 @@ impl<'a> Layout<'a> {
                 };
                 self.blocks(&q.children, &inner);
             }
+            Node::Code(code) if crate::diagram::is_mermaid(code.lang.as_deref()) => {
+                if !self.diagram(&code.value, frame) {
+                    self.code_block(&code.value, frame);
+                }
+            }
             Node::Code(code) => self.code_block(&code.value, frame),
             Node::Math(math) => self.code_block(&math.value, frame),
             Node::List(list) => self.list(list, frame, 0),
@@ -982,6 +987,28 @@ impl<'a> Layout<'a> {
             Alignment::Right => frame.x + frame.width - w,
         };
         self.items.push(Item::Image { x, width: w, height: h, image });
+    }
+
+    /// A Mermaid diagram as a picture three times its size (sharp in print),
+    /// centred and no wider than the column. False if it couldn't be drawn.
+    fn diagram(&mut self, source: &str, frame: &Frame) -> bool {
+        let Ok(drawn) = crate::diagram::render(source, false) else {
+            return false;
+        };
+        let Some(image) = crate::diagram::png(&drawn, 3.)
+            .and_then(|png| krilla::image::Image::from_png(krilla::Data::from(png), true).ok())
+        else {
+            return false;
+        };
+        // CSS pixels to points.
+        let mut w = (drawn.width * 0.75).min(frame.width);
+        let mut h = w * drawn.height / drawn.width.max(1.);
+        if h > self.max_image_height {
+            w *= self.max_image_height / h;
+            h = self.max_image_height;
+        }
+        self.items.push(Item::Image { x: frame.x + (frame.width - w) / 2., width: w, height: h, image });
+        true
     }
 
     /// Footnotes, numbered as referred to, after a short rule at the end.
