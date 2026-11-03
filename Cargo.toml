@@ -11,6 +11,14 @@ futures = "0.3"
 url = "2"
 gpui-test = { package = "gpui-pre", version = "=0.3.10", features = ["test-support"], optional = true }
 gpui-kit = "0.8.1"
+unicode-segmentation = "1.13"
+typst = "0.15.1"
+typst-render = "0.15.1"
+mitex = "0.2.4"
+typst-assets = { version = "0.15.1", features = ["fonts"] }
+typst-layout = "0.15.1"
+image = { version = "0.25", default-features = false, features = ["png"] }
+smallvec = "1"
 
 # Moving deleted files to the Trash: the trash crate on macOS and Linux;
 # Windows goes through the shell itself (see files::move_to_trash).
@@ -27,7 +35,7 @@ windows-sys = { version = "0.61", features = ["Win32_UI_Shell", "Win32_Foundatio
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
 objc2-app-kit = { version = "0.3", default-features = false, features = ["NSApplication", "NSImage"] }
-objc2-foundation = { version = "0.3", default-features = false, features = ["NSData"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["NSData", "NSString", "NSUserDefaults"] }
 
 [profile.dev]
 debug = 0
@@ -44,6 +52,7 @@ strip = true
 # Keep the supplied GPUI Kit version working with stable Rust.
 [patch.crates-io]
 gpui-pre-macos = { path = "vendor/gpui-pre-macos" }
+gpui-base = { git = "https://github.com/viai957/enso", rev = "f286ac475620064420f38a3fb5c1f5532219ec9c" }
 
 [features]
 ui-tests = ["dep:gpui-test"]

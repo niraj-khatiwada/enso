@@ -5,7 +5,12 @@ mod markdown_edit;
 mod onboarding;
 mod reader;
 mod settings;
+mod shell_perf;
 mod stats;
+mod text_rendering;
+#[allow(dead_code)]
+mod tokens;
+mod visual;
 mod workspaces;
 
 use gpui_kit::assets::IconName;
@@ -18,10 +23,9 @@ use gpui_kit::component::{
     h_flex,
     input::{Editor, EditorState, Input, InputEvent, InputState},
     menu::{ContextMenuExt, PopupMenuItem},
-    tooltip::Tooltip,
     popover::Popover,
     resizable::{HandleEdge, h_resizable, resizable_panel, resize_handle},
-    text::{RenderedText, TextView, TextViewState},
+    tooltip::Tooltip,
     v_flex,
 };
 use gpui_kit::{prelude::FluentBuilder, *};
@@ -79,18 +83,15 @@ actions!(
 
 #[derive(Clone, Copy, PartialEq)]
 enum Mode {
-    Read,
-    Edit,
-    Split,
+    Visual,
+    Source,
+    SideBySide,
 }
 
 struct Document {
     path: Option<PathBuf>,
     editor: Entity<EditorState>,
-    preview: Entity<TextViewState>,
-    /// Whether `preview` holds this document's rendered Markdown. Only the few
-    /// most recently viewed documents keep it; see `Enso::warm_documents`.
-    preview_loaded: bool,
+    visual: Option<Entity<visual::view::VisualView>>,
     /// When this document was last the active one (`Enso::view_clock`).
     last_viewed: u64,
     saved: Arc<String>,
@@ -100,7 +101,6 @@ struct Document {
     stats: String,
     _stats_task: Option<Task<()>>,
     last_reader_cursor: Option<usize>,
-    last_preview_text: Option<RenderedText>,
     _preview_task: Option<Task<()>>,
     _autosave_timer: Option<Task<()>>,
     revision: u64,
@@ -124,6 +124,38 @@ impl Document {
 
 #[derive(Clone)]
 struct SidebarResize;
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Part {
+    Sidebar,
+    Header,
+    Status,
+}
+
+struct ShellPart {
+    app: WeakEntity<Enso>,
+    part: Part,
+    _observe: Subscription,
+    #[cfg(test)]
+    renders: usize,
+}
+
+impl Render for ShellPart {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let part = self.part;
+        #[cfg(test)]
+        {
+            self.renders += 1;
+        }
+        self.app
+            .update(cx, |app, cx| match part {
+                Part::Sidebar => app.render_sidebar_part(window, cx),
+                Part::Header => app.render_header_part(window, cx),
+                Part::Status => app.render_status_part(cx),
+            })
+            .unwrap_or_else(|_| div().into_any_element())
+    }
+}
 
 /// An image pasted into a note: raw data (a screenshot) or a file copied in a
 /// file manager.
@@ -192,7 +224,9 @@ fn quit_all(cx: &mut App) {
     }
     for (handle, view) in views {
         let _ = handle.update(cx, |_, window, cx| {
-            view.update(cx, |view, cx| view.request_close(CloseTarget::App, window, cx))
+            view.update(cx, |view, cx| {
+                view.request_close(CloseTarget::App, window, cx)
+            })
         });
     }
 }
@@ -279,6 +313,8 @@ struct Enso {
     expanded: HashSet<PathBuf>,
     mode: Mode,
     previous_mode: Mode,
+    pending_source_place: Option<(EntityId, usize, Pixels, u8)>,
+    chrome_hidden: bool,
     status: String,
     error: bool,
     /// Whether the last error is still on the status bar; it hides itself.
@@ -304,6 +340,7 @@ struct Enso {
     /// Counts document switches, to tell which documents were viewed last.
     view_clock: u64,
     warmed_doc: Option<EntityId>,
+    parts: Vec<(Part, Entity<ShellPart>)>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -362,8 +399,10 @@ impl Enso {
             root: None,
             folders: HashMap::new(),
             expanded: HashSet::new(),
-            mode: Mode::Read,
-            previous_mode: Mode::Read,
+            mode: Mode::Visual,
+            previous_mode: Mode::Visual,
+            pending_source_place: None,
+            chrome_hidden: false,
             status: "A little space for your thoughts.".into(),
             error: false,
             error_shown: false,
@@ -378,13 +417,14 @@ impl Enso {
             rename_input,
             closing: None,
             sidebar_open: true,
-            sidebar_width: px(248.),
+            sidebar_width: tokens::SIDEBAR_WIDTH,
             focus_after_close: false,
             hovered_tab: None,
             tab_scroll: ScrollHandle::new(),
             scrolled_to_tab: None,
             view_clock: 0,
             warmed_doc: None,
+            parts: Vec::new(),
             _subscriptions: vec![
                 subscription,
                 rename_subscription,
@@ -428,42 +468,196 @@ impl Enso {
         if !self.documents[index].markdown {
             return;
         }
-        if mode != Mode::Read && !self.documents[index].editor_loaded {
+        let reads_large = self.documents[index].large_reader.is_some();
+        if (mode != Mode::Visual || !reads_large) && !self.documents[index].editor_loaded {
             let source = self.documents[index].saved.clone();
             self.documents[index].editor.update(cx, |editor, cx| {
                 editor.set_value(source.as_str(), window, cx)
             });
             self.documents[index].editor_loaded = true;
         }
-        if mode == Mode::Split && self.mode != Mode::Split {
+        if mode == Mode::SideBySide && self.mode != Mode::SideBySide {
             self.previous_mode = self.mode;
         }
+        let from = self.mode;
+        let handoff = self.caret_handoff(index, from, window, cx);
         self.mode = mode;
         // Hidden reader entities can retain a frame measured in a different
         // pane. Invalidate layout when bringing them back without reparsing
         // the complete document or resetting their own scroll position.
-        if mode != Mode::Edit {
-            if let Some(reader) = &self.documents[index].large_reader {
-                reader.update(cx, |reader, cx| reader.refresh_layout(cx));
-            } else {
-                self.documents[index]
-                    .preview
-                    .update(cx, |preview, cx| preview.invalidate_inline_layout(cx));
-            }
+        if mode != Mode::Source
+            && let Some(reader) = &self.documents[index].large_reader
+        {
+            reader.update(cx, |reader, cx| reader.refresh_layout(cx));
+        }
+        let visual = self.ensure_visual(index, window, cx);
+        if let Some((range, y)) = handoff {
+            self.apply_handoff(index, (from, mode), range, y, cx);
+        } else if mode != Mode::Source {
             self.reveal_editor_cursor(index, cx);
         }
-        let focus = if mode == Mode::Read {
-            self.focus.clone()
-        } else {
-            self.documents[index].editor.focus_handle(cx)
+        let focus = match (mode, visual) {
+            (Mode::Source, _) => self.documents[index].editor.focus_handle(cx),
+            (Mode::Visual, Some(visual)) => visual.read(cx).focus.clone(),
+            (Mode::Visual, None) => self.focus.clone(),
+            (Mode::SideBySide, visual) => match (from, visual) {
+                (Mode::Visual, Some(visual)) => visual.read(cx).focus.clone(),
+                _ => self.documents[index].editor.focus_handle(cx),
+            },
         };
         window.defer(cx, move |window, cx| focus.focus(window, cx));
         cx.notify();
     }
 
-    /// Keep the rendered preview only for the documents viewed most recently:
-    /// parse the active one's if it has none, and drop the rest's. Background
-    /// tabs then cost a file's text, not a parsed and laid-out document.
+    fn ensure_visual(
+        &mut self,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<Entity<visual::view::VisualView>> {
+        let doc = &mut self.documents[index];
+        if !doc.markdown || doc.large_reader.is_some() || !doc.editor_loaded {
+            return None;
+        }
+        if let Some(visual) = &doc.visual {
+            return Some(visual.clone());
+        }
+        let base = doc
+            .path
+            .as_ref()
+            .and_then(|p| p.parent())
+            .map(PathBuf::from);
+        let editor = doc.editor.clone();
+        let weak = cx.entity().downgrade();
+        let paste_editor = editor.clone();
+        let visual = cx.new(|cx| {
+            let mut view = visual::view::VisualView::new(editor, window, cx);
+            view.set_base(base, cx);
+            view.paste_images = Some(std::rc::Rc::new(
+                move |item: &ClipboardItem, cx: &mut App| {
+                    let images = pasted_images(item);
+                    if images.is_empty() {
+                        return None;
+                    }
+                    weak.update(cx, |this, cx| {
+                        this.save_pasted_images(images, &paste_editor, cx)
+                    })
+                    .ok()
+                },
+            ));
+            view
+        });
+        doc.visual = Some(visual.clone());
+        Some(visual)
+    }
+
+    fn caret_handoff(
+        &self,
+        index: usize,
+        from: Mode,
+        window: &Window,
+        cx: &App,
+    ) -> Option<(std::ops::Range<usize>, Option<Pixels>)> {
+        let doc = &self.documents[index];
+        let visual = doc.visual.as_ref();
+        let visual_focused = visual.is_some_and(|v| v.read(cx).focus.is_focused(window));
+        let use_visual = from == Mode::Visual || (from == Mode::SideBySide && visual_focused);
+        if use_visual {
+            let view = visual?.read(cx);
+            let mut range = view.selection();
+            if view.anchor.is_some_and(|a| a > view.caret) {
+                range = range.end..range.start;
+            }
+            return Some((range, view.caret_viewport_y()));
+        }
+        if !doc.editor_loaded {
+            return None;
+        }
+        let editor = doc.editor.read(cx);
+        let range = editor.selected_range();
+        let cursor = editor.cursor();
+        let caret = cursor..cursor;
+        let y = editor.range_to_bounds(&caret).and_then(|caret| {
+            let viewport = editor.input_bounds();
+            (caret.top() >= viewport.top() && caret.bottom() <= viewport.bottom())
+                .then(|| caret.top() - viewport.top())
+        });
+        let range = if cursor == range.start && !range.is_empty() {
+            range.end..range.start
+        } else {
+            range
+        };
+        Some((range, y))
+    }
+
+    fn apply_handoff(
+        &mut self,
+        index: usize,
+        (from, to): (Mode, Mode),
+        range: std::ops::Range<usize>,
+        y: Option<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        let doc = &self.documents[index];
+        let (anchor, caret) = (range.start, range.end);
+        if to != Mode::Source
+            && from != Mode::Visual
+            && let Some(visual) = &doc.visual
+        {
+            visual.update(cx, |view, cx| {
+                view.place_caret(caret, y, cx);
+                if anchor != caret {
+                    view.anchor = Some(view.doc.snap(anchor));
+                }
+            });
+        }
+        if to == Mode::Visual && doc.large_reader.is_some() {
+            let reader = doc.large_reader.clone();
+            if let Some(reader) = reader {
+                reader.update(cx, |reader, cx| reader.reveal_source(caret, cx));
+            }
+        }
+        if to != Mode::Visual && from != Mode::Source && doc.editor_loaded {
+            let editor = doc.editor.clone();
+            editor.update(cx, |editor, cx| {
+                editor.set_selected_range(anchor.min(caret)..anchor.max(caret), cx)
+            });
+            if let Some(y) = y {
+                self.pending_source_place = Some((editor.entity_id(), caret, y, 4));
+            }
+        }
+    }
+
+    fn place_source_caret(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some((editor_id, caret, y, tries)) = self.pending_source_place.take() else {
+            return true;
+        };
+        let Some(doc) = self
+            .documents
+            .iter()
+            .find(|d| d.editor.entity_id() == editor_id)
+        else {
+            return true;
+        };
+        let done = doc.editor.update(cx, |state, cx| {
+            let viewport = state.input_bounds();
+            let Some(bounds) = state.range_to_bounds(&(caret..caret)) else {
+                return false;
+            };
+            let delta = bounds.top() - viewport.top() - y;
+            if delta.abs() < tokens::HAIRLINE {
+                return true;
+            }
+            let offset = state.scroll_offset();
+            state.set_scroll_offset(point(offset.x, offset.y - delta), cx);
+            false
+        });
+        if !done && tries > 0 {
+            self.pending_source_place = Some((editor_id, caret, y, tries - 1));
+        }
+        done
+    }
+
     fn warm_documents(&mut self, cx: &mut Context<Self>) {
         const KEEP: usize = 3;
         let Some(active) = self.active else {
@@ -471,25 +665,12 @@ impl Enso {
         };
         self.view_clock += 1;
         self.documents[active].last_viewed = self.view_clock;
-        let doc = &mut self.documents[active];
-        if doc.markdown && doc.large_reader.is_none() && !doc.preview_loaded {
-            let text = doc.editor.read(cx).value();
-            // Large files read through `large_reader`; their editor may not be
-            // filled yet, and the preview stays empty either way.
-            if text.len() < reader::LARGE_DOCUMENT_BYTES {
-                doc.preview.update(cx, |preview, cx| preview.set_text(&text, cx));
-                doc.preview_loaded = true;
-            }
-        }
         let mut recent: Vec<_> = (0..self.documents.len()).collect();
         recent.sort_by_key(|&i| std::cmp::Reverse(self.documents[i].last_viewed));
         for &i in recent.iter().skip(KEEP) {
-            let doc = &mut self.documents[i];
-            if doc.preview_loaded {
-                doc.preview.update(cx, |preview, cx| preview.set_text("", cx));
-                doc.preview_loaded = false;
-            }
+            self.documents[i].visual = None;
         }
+        let _ = cx;
     }
 
     fn reveal_editor_cursor(&mut self, index: usize, cx: &mut Context<Self>) {
@@ -501,40 +682,12 @@ impl Enso {
         doc.last_reader_cursor = Some(cursor);
         if let Some(reader) = &doc.large_reader {
             reader.update(cx, |reader, cx| reader.reveal_source(cursor, cx));
-        } else {
-            let rendered = doc.preview.read(cx).rendered_text();
-            doc.last_preview_text = Some(rendered.clone());
-            let source = rendered.source();
-            let mut cursor = cursor.min(source.len());
-            while !source.is_char_boundary(cursor) {
-                cursor -= 1;
-            }
-            let start = source[..cursor].rfind('\n').map_or(0, |offset| offset + 1);
-            // If the caret is on an empty/markup-only line, try the next
-            // rendered line so the preview still follows the surrounding text.
-            let mut offset = start;
-            let mut target = None;
-            for line in source[start..].split_inclusive('\n') {
-                let end = offset + line.len();
-                if let Some(range) = rendered.range_for_source(offset..end) {
-                    target = Some(range);
-                    break;
+        } else if let Some(visual) = &doc.visual {
+            visual.update(cx, |view, cx| {
+                if view.caret != cursor {
+                    view.place_caret(cursor, None, cx);
                 }
-                offset = end;
-            }
-            // A trailing blank line has no rendered span; show the nearest
-            // preceding passage rather than leaving the preview elsewhere.
-            let mut end = start.saturating_sub(1);
-            while target.is_none() && end > 0 {
-                let begin = source[..end].rfind('\n').map_or(0, |offset| offset + 1);
-                target = rendered.range_for_source(begin..end);
-                end = begin.saturating_sub(1);
-            }
-            if let Some(range) = target {
-                doc.preview.update(cx, |preview, cx| {
-                    let _ = preview.reveal_range(range, cx);
-                });
-            }
+            });
         }
     }
 
@@ -658,10 +811,6 @@ impl Enso {
         });
         let wrap = source.len() < reader::NO_WRAP_BYTES;
         editor.update(cx, |editor, cx| editor.set_soft_wrap(wrap, window, cx));
-        // Parsed when the document is first shown, not on open: opening many
-        // files at once only reads them (see `warm_documents`).
-        let preview = cx.new(|cx| TextViewState::markdown("", cx));
-        let preview_ref = preview.clone();
         let subscription = cx.subscribe(
             &editor,
             move |this: &mut Self,
@@ -669,18 +818,16 @@ impl Enso {
                   event: &InputEvent,
                   cx: &mut Context<Self>| {
                 if matches!(event, InputEvent::Change) {
+                    let mut became_dirty = false;
                     if let Some(doc) = this
                         .documents
                         .iter_mut()
                         .find(|d| d.editor.entity_id() == editor.entity_id())
                     {
+                        became_dirty = !doc.dirty;
                         doc.dirty = true;
                         doc.revision += 1;
-                        if markdown
-                            && (large
-                                || doc.large_reader.is_some()
-                                || editor.read(cx).text().len() >= reader::LARGE_DOCUMENT_BYTES)
-                        {
+                        if markdown && (large || doc.large_reader.is_some()) {
                             let editor = editor.clone();
                             let editor_id = editor.entity_id();
                             doc._preview_task = Some(cx.spawn(async move |this, cx| {
@@ -721,15 +868,6 @@ impl Enso {
                                 });
                             }));
                         }
-                        if markdown
-                            && !large
-                            && doc.preview_loaded
-                            && doc.large_reader.is_none()
-                            && editor.read(cx).text().len() < reader::LARGE_DOCUMENT_BYTES
-                        {
-                            let value = editor.read(cx).value();
-                            preview_ref.update(cx, |view, cx| view.set_text(&value, cx));
-                        }
                     }
                     let editor_id = editor.entity_id();
                     if let Some(index) = this
@@ -740,34 +878,33 @@ impl Enso {
                         this.schedule_save(index, cx);
                         this.schedule_word_count(index, false, cx);
                     }
-                    cx.notify();
+                    let hide = visual::prefs::WritingPrefs::get(cx).hide_chrome;
+                    if hide && !this.chrome_hidden {
+                        this.chrome_hidden = true;
+                        cx.notify();
+                    } else if became_dirty {
+                        cx.notify();
+                    }
                 }
             },
         );
-        let cursor_subscription = cx.observe(&editor, |this, editor, cx| {
-            if this.mode != Mode::Split {
+        let cursor_subscription = cx.observe_in(&editor, window, |this, editor, window, cx| {
+            if this.mode != Mode::SideBySide {
                 return;
             }
             let Some(index) = this.active else {
                 return;
             };
             let doc = &this.documents[index];
+            if doc
+                .visual
+                .as_ref()
+                .is_some_and(|v| v.read(cx).focus.is_focused(window))
+            {
+                return;
+            }
             if doc.editor.entity_id() == editor.entity_id()
                 && doc.last_reader_cursor != Some(editor.read(cx).cursor())
-            {
-                this.reveal_editor_cursor(index, cx);
-            }
-        });
-        let preview_subscription = cx.observe(&preview, |this, preview, cx| {
-            if this.mode != Mode::Split {
-                return;
-            }
-            let Some(index) = this.active else {
-                return;
-            };
-            let doc = &this.documents[index];
-            if doc.preview.entity_id() == preview.entity_id()
-                && doc.last_preview_text.as_ref() != Some(&preview.read(cx).rendered_text())
             {
                 this.reveal_editor_cursor(index, cx);
             }
@@ -781,22 +918,20 @@ impl Enso {
             stats,
             _stats_task: None,
             last_reader_cursor: None,
-            last_preview_text: None,
             _preview_task: None,
             _autosave_timer: None,
             revision: 0,
             saving: false,
             close_after_save: false,
             editor,
-            preview,
-            preview_loaded: false,
+            visual: None,
             last_viewed: 0,
             markdown,
-            _subscriptions: vec![subscription, cursor_subscription, preview_subscription],
+            _subscriptions: vec![subscription, cursor_subscription],
         });
         self.active = Some(self.documents.len() - 1);
         self.schedule_word_count(self.documents.len() - 1, true, cx);
-        self.mode = if markdown { Mode::Read } else { Mode::Edit };
+        self.mode = if markdown { Mode::Visual } else { Mode::Source };
         self.message("Ready", false, cx);
     }
 
@@ -935,7 +1070,11 @@ impl Enso {
             Some(path) => path.parent()?.to_path_buf(),
             None => root.clone(),
         };
-        Some(if dir.starts_with(root) { dir } else { root.clone() })
+        Some(if dir.starts_with(root) {
+            dir
+        } else {
+            root.clone()
+        })
     }
 
     fn start_naming(&mut self, folder: bool, window: &mut Window, cx: &mut Context<Self>) {
@@ -1011,10 +1150,7 @@ impl Enso {
                     Ok(Ok(Some(path))) => match files::save_as(&path, "") {
                         Ok(()) => {
                             this.add_document(Some(path), String::new(), None, window, cx);
-                            this.mode = Mode::Edit;
-                            if let Some(i) = this.active {
-                                this.documents[i].editor.focus_handle(cx).focus(window, cx);
-                            }
+                            this.set_mode(Mode::Visual, window, cx);
                         }
                         Err(error) => this.message(error.to_string(), true, cx),
                     },
@@ -1044,10 +1180,7 @@ impl Enso {
                     self.focus.focus(window, cx);
                 } else {
                     self.add_document(Some(path), String::new(), None, window, cx);
-                    self.mode = Mode::Edit;
-                    if let Some(i) = self.active {
-                        self.documents[i].editor.focus_handle(cx).focus(window, cx);
-                    }
+                    self.set_mode(Mode::Visual, window, cx);
                 }
                 cx.notify();
             }
@@ -1069,6 +1202,36 @@ impl Enso {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let attr = |value: &str| {
+            value
+                .replace('&', "&amp;")
+                .replace('"', "&quot;")
+                .replace('<', "&lt;")
+        };
+        let links: Vec<String> = self
+            .save_pasted_images(images, &editor, cx)
+            .into_iter()
+            .map(|(link, alt)| {
+                format!(
+                    "<img src=\"{}\" alt=\"{}\" width=\"100%\" />",
+                    attr(&link),
+                    attr(&alt)
+                )
+            })
+            .collect();
+        if !links.is_empty() {
+            editor.update(cx, |editor, cx| {
+                editor.replace(links.join("\n"), window, cx)
+            });
+        }
+    }
+
+    fn save_pasted_images(
+        &mut self,
+        images: Vec<PastedImage>,
+        editor: &Entity<EditorState>,
+        cx: &mut Context<Self>,
+    ) -> Vec<(String, String)> {
         let Some(doc_path) = self
             .documents
             .iter()
@@ -1076,10 +1239,10 @@ impl Enso {
             .and_then(|doc| doc.path.clone())
         else {
             self.message("Save this note before pasting images into it.", true, cx);
-            return;
+            return Vec::new();
         };
         let Some(doc_dir) = doc_path.parent().map(PathBuf::from) else {
-            return;
+            return Vec::new();
         };
         let root = self
             .root
@@ -1100,29 +1263,12 @@ impl Enso {
                         .file_stem()
                         .map(|s| s.to_string_lossy().into_owned())
                         .unwrap_or_else(|| "image".into());
-                    // An <img> tag rather than ![](): Markdown images cannot be
-                    // sized, and this one starts at the reading column's width.
-                    let attr = |value: &str| {
-                        value
-                            .replace('&', "&amp;")
-                            .replace('"', "&quot;")
-                            .replace('<', "&lt;")
-                    };
-                    let link = files::relative_link(&doc_dir, &saved);
-                    links.push(format!(
-                        "<img src=\"{}\" alt=\"{}\" width=\"100%\" />",
-                        attr(&link),
-                        attr(&alt)
-                    ));
+                    links.push((files::relative_link(&doc_dir, &saved), alt));
                 }
-                Err(error) => {
-                    self.message(format!("Could not save the image: {error}"), true, cx)
-                }
+                Err(error) => self.message(format!("Could not save the image: {error}"), true, cx),
             }
         }
-        if !links.is_empty() {
-            editor.update(cx, |editor, cx| editor.replace(links.join("\n"), window, cx));
-        }
+        links
     }
 
     /// The tree row last clicked, if it is still inside the open workspace.
@@ -1172,7 +1318,11 @@ impl Enso {
         if self.renaming.as_ref().is_some_and(|p| p.starts_with(path)) {
             self.renaming = None;
         }
-        if self.naming.as_ref().is_some_and(|n| n.dir.starts_with(path)) {
+        if self
+            .naming
+            .as_ref()
+            .is_some_and(|n| n.dir.starts_with(path))
+        {
             self.naming = None;
         }
         if let Some(parent) = path.parent() {
@@ -1216,9 +1366,13 @@ impl Enso {
         match files::rename(&old, &name) {
             Ok(new) if new != old => {
                 let moved = |path: &PathBuf| {
-                    path.strip_prefix(&old)
-                        .ok()
-                        .map(|rest| if rest.as_os_str().is_empty() { new.clone() } else { new.join(rest) })
+                    path.strip_prefix(&old).ok().map(|rest| {
+                        if rest.as_os_str().is_empty() {
+                            new.clone()
+                        } else {
+                            new.join(rest)
+                        }
+                    })
                 };
                 if let Some(path) = self.selected.as_ref().and_then(|p| moved(p)) {
                     self.selected = Some(path);
@@ -1239,7 +1393,12 @@ impl Enso {
                     .parent()
                     .map(PathBuf::from)
                     .into_iter()
-                    .chain(self.expanded.iter().filter(|p| p.starts_with(&new)).cloned())
+                    .chain(
+                        self.expanded
+                            .iter()
+                            .filter(|p| p.starts_with(&new))
+                            .cloned(),
+                    )
                     .collect();
                 for path in reload {
                     self.load_folder(path, cx);
@@ -1433,7 +1592,11 @@ impl Enso {
     }
 
     fn tree_rows(&self, path: &PathBuf, threads: &mut Vec<bool>, rows: &mut Vec<TreeRow>) {
-        let entries = self.folders.get(path).map(Vec::as_slice).unwrap_or_default();
+        let entries = self
+            .folders
+            .get(path)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
         // A new entry is named in place, at the top of the folder it goes in.
         if let Some(NewEntry { dir, folder }) = &self.naming
             && dir == path
@@ -1467,18 +1630,44 @@ impl Enso {
 
 impl Render for Enso {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let started = shell_perf::enabled().then(std::time::Instant::now);
+        let shell = self.render_shell(window, cx).into_any_element();
+        match started {
+            Some(started) => {
+                shell_perf::ShellProbe::new(shell, started.elapsed()).into_any_element()
+            }
+            None => shell,
+        }
+    }
+}
+
+impl Enso {
+    fn render_shell(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        shell_perf::count("shell");
+        if self.pending_source_place.is_some() && !self.place_source_caret(cx) {
+            cx.notify();
+        }
         if self.focus_after_close {
             self.focus_after_close = false;
+            if let Some(i) = self.active
+                && self.mode != Mode::Source
+            {
+                self.ensure_visual(i, window, cx);
+            }
             let focus = self
                 .active
-                .filter(|index| self.mode != Mode::Read || !self.documents[*index].markdown)
-                .map(|index| self.documents[index].editor.focus_handle(cx))
+                .map(|index| {
+                    let doc = &self.documents[index];
+                    match &doc.visual {
+                        Some(visual) if doc.markdown && self.mode == Mode::Visual => {
+                            visual.read(cx).focus.clone()
+                        }
+                        _ if doc.markdown && self.mode == Mode::Visual => self.focus.clone(),
+                        _ => doc.editor.focus_handle(cx),
+                    }
+                })
                 .unwrap_or_else(|| self.focus.clone());
             window.defer(cx, move |window, cx| focus.focus(window, cx));
-        }
-        let mut rows = Vec::new();
-        if let Some(root) = &self.root {
-            self.tree_rows(root, &mut Vec::new(), &mut rows);
         }
         let theme = cx.theme().clone();
         let backdrop = backdrop_visible(window, cx);
@@ -1491,16 +1680,383 @@ impl Render for Enso {
             cx,
         )
         .clamp(0., 1.);
+        let chrome = transition(
+            "chrome",
+            if self.chrome_hidden {
+                tokens::HIDDEN
+            } else {
+                tokens::SHOWN
+            },
+            Transition::new(tokens::CHROME_FADE).easing(motion.easing_move.clone()),
+            window,
+            cx,
+        )
+        .clamp(0., 1.);
         let sidebar_width = self.sidebar_width;
 
-        let active_path = self.active.and_then(|i| self.documents[i].path.clone());
         let markdown = self.active.is_none_or(|i| self.documents[i].markdown);
-        let mode = if markdown { self.mode } else { Mode::Edit };
+        let mode = if markdown { self.mode } else { Mode::Source };
         let active_doc = self.active.map(|i| self.documents[i].editor.entity_id());
         if active_doc != self.warmed_doc {
             self.warmed_doc = active_doc;
             self.warm_documents(cx);
         }
+        let mut body = h_flex().flex_1().min_h_0().w_full();
+        let visual = match self.active {
+            Some(i) if mode != Mode::Source => self.ensure_visual(i, window, cx),
+            _ => None,
+        };
+        if let Some(i) = self.active {
+            let document = &self.documents[i];
+            let mut editor_pane = None;
+            let mut reading_pane = None;
+            if mode != Mode::Visual {
+                editor_pane = Some(
+                    div()
+                        .id(("editor-pane", document.editor.entity_id()))
+                        .when(document.markdown, |pane| {
+                            markdown_commands(pane, &document.editor)
+                        })
+                        .overflow_hidden()
+                        .flex_1()
+                        .min_w_0()
+                        .h_full()
+                        .border_r_1()
+                        .border_color(theme.border)
+                        .child(
+                            Editor::new(&document.editor)
+                                .bordered(false)
+                                .size_full()
+                                .font_family(theme.mono_font_family.clone())
+                                .text_sm()
+                                .on_paste({
+                                    let weak = cx.entity().downgrade();
+                                    let editor = document.editor.clone();
+                                    move |item, window, cx| {
+                                        let images = pasted_images(item);
+                                        if images.is_empty() {
+                                            return false;
+                                        }
+                                        let editor = editor.clone();
+                                        let _ = weak.update(cx, |this, cx| {
+                                            this.paste_images(images, editor, window, cx)
+                                        });
+                                        true
+                                    }
+                                }),
+                        )
+                        .into_any_element(),
+                );
+            }
+            if mode != Mode::Source {
+                if let Some(reader) = &document.large_reader {
+                    reading_pane = Some(
+                        div()
+                            .id(("preview-pane", document.editor.entity_id()))
+                            .overflow_hidden()
+                            .flex_1()
+                            .min_w_0()
+                            .h_full()
+                            .child(reader.clone())
+                            .into_any_element(),
+                    );
+                } else if let Some(visual) = visual {
+                    reading_pane = Some(
+                        div()
+                            .id(("visual-pane", document.editor.entity_id()))
+                            .flex_1()
+                            .min_w_0()
+                            .h_full()
+                            .overflow_hidden()
+                            .child(visual)
+                            .into_any_element(),
+                    );
+                }
+            }
+            body = match (editor_pane, reading_pane) {
+                (Some(editor), Some(reader)) => body.child(
+                    h_resizable(("document-split", document.editor.entity_id()))
+                        .child(
+                            resizable_panel()
+                                .size_range(tokens::PANE_MIN..Pixels::MAX)
+                                .child(editor),
+                        )
+                        .child(
+                            resizable_panel()
+                                .size_range(tokens::PANE_MIN..Pixels::MAX)
+                                .child(reader),
+                        ),
+                ),
+                (Some(editor), None) => body.child(editor),
+                (None, Some(reader)) => body.child(reader),
+                (None, None) => body,
+            };
+        } else {
+            body = body.child(
+                v_flex()
+                    .id("empty-workspace")
+                    .size_full()
+                    .min_w_0()
+                    .items_center()
+                    .justify_center()
+                    .p_6()
+                    .gap_5()
+                    .child(
+                        v_flex()
+                            .items_center()
+                            .gap_3()
+                            .child(brand::logo(104., cx))
+                            .child(
+                                div()
+                                    .text_2xl()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .child("enso"),
+                            )
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .text_color(theme.muted_foreground)
+                                    .child("Open a file, find a thought, or start something new."),
+                            ),
+                    )
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .items_center()
+                            .child(
+                                Button::new("start-open")
+                                    .small()
+                                    .icon(IconName::File)
+                                    .label("Open file")
+                                    .on_click(
+                                        cx.listener(|this, _, w, cx| this.pick(false, w, cx)),
+                                    ),
+                            )
+                            .child(
+                                Button::new("start-folder")
+                                    .small()
+                                    .icon(IconName::FolderOpen)
+                                    .label("Open folder")
+                                    .on_click(cx.listener(|this, _, w, cx| this.pick(true, w, cx))),
+                            )
+                            .child(
+                                Button::new("start-new")
+                                    .small()
+                                    .icon(IconName::Plus)
+                                    .label("New note")
+                                    .on_click(cx.listener(|this, _, w, cx| this.new_file(w, cx))),
+                            ),
+                    ),
+            );
+        }
+        let (custom_titlebar, standard_header) = if CUSTOM_TITLEBAR {
+            let toggle_label = if self.sidebar_open {
+                "Collapse sidebar"
+            } else {
+                "Expand sidebar"
+            };
+            let toggle_width = 28.;
+            let header_offset = (f32::from(sidebar_width) * sidebar_reveal
+                - TRAFFIC_LIGHTS_WIDTH
+                - toggle_width
+                - 8.)
+                .max(0.);
+            let titlebar = TitleBar::new()
+                .h(px(TITLEBAR_HEIGHT))
+                .bg(gpui_kit::transparent_black())
+                .border_color(gpui_kit::transparent_black())
+                .child(
+                    div().absolute().inset_0().child(
+                        h_flex()
+                            .size_full()
+                            .min_w_0()
+                            .items_center()
+                            .gap_2()
+                            .pr_2()
+                            .child(
+                                div()
+                                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                        cx.stop_propagation()
+                                    })
+                                    .child(
+                                        Button::new("toggle-sidebar")
+                                            .ghost()
+                                            .small()
+                                            .icon(IconName::PanelLeft)
+                                            .tooltip(toggle_label)
+                                            .accessibility_label(toggle_label)
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.sidebar_open = !this.sidebar_open;
+                                                cx.notify();
+                                            })),
+                                    ),
+                            )
+                            .child(div().flex_shrink_0().w(px(header_offset)))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .h_full()
+                                    .opacity(chrome)
+                                    .child(self.part(Part::Header, cx)),
+                            ),
+                    ),
+                );
+            (Some(titlebar.into_any_element()), None)
+        } else {
+            (
+                None,
+                Some(
+                    div()
+                        .w_full()
+                        .flex_shrink_0()
+                        .opacity(chrome)
+                        .child(self.part(Part::Header, cx))
+                        .into_any_element(),
+                ),
+            )
+        };
+        v_flex()
+            .id("enso")
+            .key_context("Enso")
+            .on_mouse_move(cx.listener(|this, _: &MouseMoveEvent, _, cx| {
+                if this.chrome_hidden {
+                    this.chrome_hidden = false;
+                    cx.notify();
+                }
+            }))
+            .on_action(cx.listener(|this, _: &visual::view::Cancel, _, cx| {
+                if this.chrome_hidden {
+                    this.chrome_hidden = false;
+                    cx.notify();
+                }
+            }))
+            .track_focus(&self.focus)
+            .relative()
+            .size_full()
+            .when(!backdrop, |view| view.bg(theme.background))
+            .text_color(theme.foreground)
+            .on_action(cx.listener(|this, _: &OpenFile, w, cx| this.pick(false, w, cx)))
+            .on_action(cx.listener(|this, _: &OpenFolder, w, cx| this.pick(true, w, cx)))
+            .on_action(cx.listener(|this, _: &NewFile, w, cx| this.new_file(w, cx)))
+            .on_action(cx.listener(|this, _: &Save, _, cx| this.save(cx)))
+            .on_action(cx.listener(|this, _: &CloseFile, window, cx| {
+                if this.active.is_some() {
+                    this.close_current_file(cx);
+                } else {
+                    this.request_close(CloseTarget::Window, window, cx);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &NewFolder, w, cx| this.new_folder(w, cx)))
+            .on_action(cx.listener(|this, _: &RenameSelected, w, cx| {
+                match this.selected_entry().filter(|_| this.focus.is_focused(w)) {
+                    Some(path) => this.start_rename(path, w, cx),
+                    None => cx.propagate(),
+                }
+            }))
+            .on_action(cx.listener(|this, _: &DeleteSelected, w, cx| {
+                match this.selected_entry().filter(|_| this.focus.is_focused(w)) {
+                    Some(path) => this.delete_entry(path, cx),
+                    None => cx.propagate(),
+                }
+            }))
+            .on_action(cx.listener(|this, _: &ToggleView, window, cx| {
+                let next = if this.mode == Mode::Source {
+                    Mode::Visual
+                } else {
+                    Mode::Source
+                };
+                this.set_mode(next, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ToggleSplit, window, cx| {
+                let next = if this.mode == Mode::SideBySide {
+                    this.previous_mode
+                } else {
+                    Mode::SideBySide
+                };
+                this.set_mode(next, window, cx);
+            }))
+            .child(
+                div().flex_1().min_h_0().w_full().child(
+                    h_flex()
+                        .id("workspace-panels")
+                        .size_full()
+                        .on_drag_move(cx.listener(
+                            |this, event: &DragMoveEvent<SidebarResize>, _, cx| {
+                                if !this.sidebar_open {
+                                    return;
+                                }
+                                let width = (event.event.position.x - event.bounds.left())
+                                    .clamp(tokens::SIDEBAR_MIN, tokens::SIDEBAR_MAX);
+                                if this.sidebar_width != width {
+                                    this.sidebar_width = width;
+                                    cx.notify();
+                                }
+                            },
+                        ))
+                        .child(
+                            div()
+                                .id("sidebar-viewport")
+                                .relative()
+                                .h_full()
+                                .flex_shrink_0()
+                                .w(sidebar_width * sidebar_reveal)
+                                .overflow_hidden()
+                                .when(sidebar_reveal <= 0.001, |sidebar| sidebar.invisible())
+                                .child(
+                                    div()
+                                        .w(sidebar_width)
+                                        .h_full()
+                                        .opacity(chrome)
+                                        .child(self.part(Part::Sidebar, cx)),
+                                )
+                                .when(self.sidebar_open && sidebar_reveal >= 0.999, |sidebar| {
+                                    sidebar.child(
+                                        resize_handle("sidebar-resize", Axis::Horizontal)
+                                            .inside(HandleEdge::Trailing)
+                                            .on_drag(SidebarResize, |_, _, _, cx| {
+                                                cx.new(|_| SidebarResize)
+                                            }),
+                                    )
+                                }),
+                        )
+                        .child(
+                            v_flex()
+                                .flex_1()
+                                .min_w_0()
+                                .h_full()
+                                .bg(content_background(window, cx))
+                                .when(custom_titlebar.is_some(), |view| {
+                                    view.child(
+                                        div()
+                                            .h(px(TITLEBAR_HEIGHT))
+                                            .flex_shrink_0()
+                                            .border_b_1()
+                                            .border_color(theme.border),
+                                    )
+                                })
+                                .when_some(standard_header, |view, header| view.child(header))
+                                .child(body)
+                                .child(
+                                    div()
+                                        .w_full()
+                                        .flex_shrink_0()
+                                        .opacity(chrome)
+                                        .child(self.part(Part::Status, cx)),
+                                ),
+                        ),
+                ),
+            )
+            .when_some(custom_titlebar, |view, titlebar| {
+                view.child(div().absolute().top_0().left_0().right_0().child(titlebar))
+            })
+    }
+
+    fn render_header_part(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        shell_perf::count("header");
+        let theme = cx.theme().clone();
+        let markdown = self.active.is_none_or(|i| self.documents[i].markdown);
+        let mode = if markdown { self.mode } else { Mode::Source };
         // Bring a newly active tab into view, once, so scrolling away stays put.
         // From the last frame's layout (tab bounds there exclude the scroll
         // offset); a tab not laid out yet is revealed on the next frame.
@@ -1550,95 +2106,147 @@ impl Render for Enso {
             // One pill: name and close button share the hover and active fill.
             // The wrapper keeps a press on a tab from starting a title-bar
             // window drag (after the tab's own handlers have seen it).
-            tabs = tabs.child(div().flex_shrink_0().on_mouse_down(MouseButton::Left, |_, _, cx| {
-                cx.stop_propagation()
-            }).child(
-                h_flex()
-                    .id(("file-tab", editor_id))
+            tabs = tabs.child(
+                div()
                     .flex_shrink_0()
-                    .h(px(28.))
-                    .pl_2p5()
-                    .pr_1()
-                    .gap_0p5()
-                    .items_center()
-                    .rounded_md()
-                    .cursor_pointer()
-                    .text_sm()
-                    .on_hover(cx.listener(move |this, hovered, _, cx| {
-                        let next = if *hovered {
-                            Some(editor_id)
-                        } else if this.hovered_tab == Some(editor_id) {
-                            None
-                        } else {
-                            this.hovered_tab
-                        };
-                        if this.hovered_tab != next {
-                            this.hovered_tab = next;
-                            cx.notify();
-                        }
-                    }))
-                    .when(active, |tab| tab.bg(theme.secondary))
-                    .when(!active, |tab| {
-                        tab.text_color(theme.muted_foreground)
-                            .hover(|tab| tab.bg(theme.secondary.opacity(0.6)))
-                    })
-                    // Long names end in "…" at a fixed width; the full name is in
-                    // the tooltip, and the unsaved dot stays outside the cut.
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .child(
-                        div()
-                            .max_w(px(TAB_TITLE_WIDTH))
-                            .min_w_0()
-                            .truncate()
-                            .child(document.title()),
-                    )
-                    .when(document.dirty(cx), |tab| tab.child("•"))
-                    .tooltip({
-                        let title = document.title();
-                        move |window, cx| Tooltip::new(title.clone()).build(window, cx)
-                    })
-                    // Built only while shown: a hidden button per tab made every
-                    // frame cost more with each open file.
-                    .when(reveal > 0.001, |tab| tab.child(
                         h_flex()
-                            .w(px(20. * reveal))
-                            .h(px(20.))
+                            .id(("file-tab", editor_id))
                             .flex_shrink_0()
-                            .overflow_hidden()
+                            .h(tokens::CONTROL)
+                            .pl_2p5()
+                            .pr_1()
+                            .gap_0p5()
+                            .items_center()
+                            .rounded_md()
+                            .cursor_pointer()
+                            .text_sm()
+                            .on_hover(cx.listener(move |this, hovered, _, cx| {
+                                let next = if *hovered {
+                                    Some(editor_id)
+                                } else if this.hovered_tab == Some(editor_id) {
+                                    None
+                                } else {
+                                    this.hovered_tab
+                                };
+                                if this.hovered_tab != next {
+                                    this.hovered_tab = next;
+                                    cx.notify();
+                                }
+                            }))
+                            .when(active, |tab| tab.bg(theme.secondary))
+                            .when(!active, |tab| {
+                                tab.text_color(theme.muted_foreground)
+                                    .hover(|tab| tab.bg(theme.secondary.opacity(tokens::HOVER)))
+                            })
                             .child(
-                                Button::new(("close-tab", editor_id))
-                                    .ghost()
-                                    .xsmall()
-                                    .icon(IconName::X)
-                                    .tooltip("Close file")
-                                    .accessibility_label(format!("Close {}", document.title()))
-                                    .w(px(20.))
-                                    .h(px(20.))
-                                    .flex_shrink_0()
-                                    .opacity(reveal)
-                                    .disabled(!hovered)
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        // Not also a click on the tab around it.
-                                        cx.stop_propagation();
-                                        if let Some(index) = this
-                                            .documents
-                                            .iter()
-                                            .position(|doc| doc.editor.entity_id() == editor_id)
-                                        {
-                                            this.close_document(index, cx);
-                                        }
-                                    })),
-                            ),
-                    ))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.active = this
-                            .documents
-                            .iter()
-                            .position(|doc| doc.editor.entity_id() == editor_id);
-                        this.selected = None;
-                        cx.notify();
-                    })),
-            ));
+                                div()
+                                    .max_w(px(TAB_TITLE_WIDTH))
+                                    .min_w_0()
+                                    .truncate()
+                                    .child(document.title()),
+                            )
+                            .when(document.dirty(cx), |tab| tab.child("•"))
+                            .tooltip({
+                                let title = document.title();
+                                move |window, cx| Tooltip::new(title.clone()).build(window, cx)
+                            })
+                            .when(reveal > 0.001, |tab| {
+                                tab.child(
+                                    h_flex()
+                                        .w(px(20. * reveal))
+                                        .h(tokens::CONTROL_SM)
+                                        .flex_shrink_0()
+                                        .overflow_hidden()
+                                        .child(
+                                            Button::new(("close-tab", editor_id))
+                                                .ghost()
+                                                .xsmall()
+                                                .icon(IconName::X)
+                                                .tooltip("Close file")
+                                                .accessibility_label(format!(
+                                                    "Close {}",
+                                                    document.title()
+                                                ))
+                                                .w(tokens::CONTROL_SM)
+                                                .h(tokens::CONTROL_SM)
+                                                .flex_shrink_0()
+                                                .opacity(reveal)
+                                                .disabled(!hovered)
+                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                    cx.stop_propagation();
+                                                    if let Some(index) =
+                                                        this.documents.iter().position(|doc| {
+                                                            doc.editor.entity_id() == editor_id
+                                                        })
+                                                    {
+                                                        this.close_document(index, cx);
+                                                    }
+                                                })),
+                                        ),
+                                )
+                            })
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.active = this
+                                    .documents
+                                    .iter()
+                                    .position(|doc| doc.editor.entity_id() == editor_id);
+                                this.selected = None;
+                                cx.notify();
+                            })),
+                    ),
+            );
         }
+        let document_header = h_flex()
+            .size_full()
+            .h(tokens::BAR)
+            .when(CUSTOM_TITLEBAR, |header| header.flex_1())
+            .when(!CUSTOM_TITLEBAR, |header| header.w_full().flex_shrink_0())
+            .min_w_0()
+            .px_2()
+            .gap_2()
+            .items_center()
+            .when(!CUSTOM_TITLEBAR, |header| {
+                header.border_b_1().border_color(theme.border)
+            })
+            .child(tabs)
+            .child(
+                h_flex().gap_1().items_center().flex_shrink_0().children(
+                    [
+                        (Mode::Visual, "Visual", IconName::BookOpen),
+                        (Mode::Source, "Source", IconName::SquareTerminal),
+                        (Mode::SideBySide, "Side by side", IconName::Columns2),
+                    ]
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, (value, label, icon))| {
+                        Button::new(("mode", i))
+                            .ghost()
+                            .small()
+                            .icon(icon)
+                            .tooltip(label)
+                            .accessibility_label(label)
+                            .disabled(!markdown || self.active.is_none())
+                            .when(mode == value, |b| b.bg(theme.secondary))
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.set_mode(value, window, cx)
+                            }))
+                    }),
+                ),
+            );
+        document_header.into_any_element()
+    }
+
+    fn render_sidebar_part(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        shell_perf::count("sidebar");
+        let mut rows = Vec::new();
+        if let Some(root) = &self.root {
+            self.tree_rows(root, &mut Vec::new(), &mut rows);
+        }
+        let theme = cx.theme().clone();
+        let backdrop = backdrop_visible(window, cx);
+        let active_path = self.active.and_then(|i| self.documents[i].path.clone());
         let highlighted = self.selected.clone().or_else(|| active_path.clone());
         let switcher = {
             let weak = cx.entity().downgrade();
@@ -1688,9 +2296,10 @@ impl Render for Enso {
                                         .size_3p5()
                                         .flex_shrink_0()
                                         .text_color(theme.muted_foreground)
-                                        .when(!(self.switcher_hovered || self.switcher_open), |icon| {
-                                            icon.opacity(0.)
-                                        }),
+                                        .when(
+                                            !(self.switcher_hovered || self.switcher_open),
+                                            |icon| icon.opacity(tokens::HIDDEN),
+                                        ),
                                 ),
                         )
                         .accessibility_label("Switch workspace")
@@ -1712,17 +2321,17 @@ impl Render for Enso {
                     let item = |id: ElementId| {
                         h_flex()
                             .id(id)
-                            .h(px(28.))
+                            .h(tokens::CONTROL)
                             .px_2()
                             .gap_1p5()
                             .items_center()
                             .rounded_md()
                             .cursor_pointer()
                             .text_sm()
-                            .hover(|row| row.bg(theme.secondary.opacity(0.6)))
+                            .hover(|row| row.bg(theme.secondary.opacity(tokens::HOVER)))
                     };
                     v_flex()
-                        .w(px(240.))
+                        .w(tokens::MENU_WIDTH)
                         .p_1()
                         .children(recent.iter().enumerate().map(|(i, recent)| {
                             let path = recent.path.clone();
@@ -1730,7 +2339,7 @@ impl Render for Enso {
                             let exists = recent.exists();
                             let weak = weak.clone();
                             item(("workspace", i).into())
-                                .when(!exists, |row| row.opacity(0.55))
+                                .when(!exists, |row| row.opacity(tokens::MISSING))
                                 .child(
                                     Icon::new(if current {
                                         IconName::Check
@@ -1767,8 +2376,8 @@ impl Render for Enso {
                                         // Only shown on the row under the pointer.
                                         h_flex()
                                             .flex_shrink_0()
-                                            .opacity(0.)
-                                            .group_hover(group, |s| s.opacity(1.))
+                                            .opacity(tokens::HIDDEN)
+                                            .group_hover(group, |s| s.opacity(tokens::SHOWN))
                                             .child(
                                                 Button::new(("reveal-workspace", i))
                                                     .ghost()
@@ -1779,10 +2388,11 @@ impl Render for Enso {
                                                     .on_click(move |_, _, cx| {
                                                         cx.stop_propagation();
                                                         cx.reveal_path(&reveal_path);
-                                                        let _ = reveal_weak.update(cx, |this, cx| {
-                                                            this.switcher_open = false;
-                                                            cx.notify();
-                                                        });
+                                                        let _ =
+                                                            reveal_weak.update(cx, |this, cx| {
+                                                                this.switcher_open = false;
+                                                                cx.notify();
+                                                            });
                                                     }),
                                             )
                                             // The current workspace is already in this window.
@@ -1797,11 +2407,12 @@ impl Render for Enso {
                                                         .on_click(move |_, window, cx| {
                                                             cx.stop_propagation();
                                                             let path = open_path.clone();
-                                                            let _ = open_weak.update(cx, |this, cx| {
-                                                                this.switch_workspace(
-                                                                    path, true, window, cx,
-                                                                )
-                                                            });
+                                                            let _ =
+                                                                open_weak.update(cx, |this, cx| {
+                                                                    this.switch_workspace(
+                                                                        path, true, window, cx,
+                                                                    )
+                                                                });
                                                         }),
                                                 )
                                             }),
@@ -1831,7 +2442,7 @@ impl Render for Enso {
                                     });
                                 })
                         }))
-                        .child(div().my_1().h(px(1.)).bg(theme.border))
+                        .child(div().my_1().h(tokens::HAIRLINE).bg(theme.border))
                         .child({
                             let weak = weak.clone();
                             item("workspace-open".into())
@@ -1860,7 +2471,7 @@ impl Render for Enso {
             // through, so only there it gets a veil of the sidebar color.
             .when(!backdrop, |sidebar| sidebar.bg(theme.sidebar))
             .when(backdrop && theme.mode.is_dark(), |sidebar| {
-                sidebar.bg(theme.sidebar.opacity(0.6))
+                sidebar.bg(theme.sidebar.opacity(tokens::VEIL))
             })
             .border_r_1()
             .border_color(theme.border)
@@ -1956,7 +2567,7 @@ impl Render for Enso {
                             .into_owned();
                         // Tree threads use the text color, faded: light lines on
                         // dark, dark lines on light, and visible over the tint.
-                        let line = theme.foreground.opacity(0.25);
+                        let line = theme.foreground.opacity(tokens::SUBTLE);
                         let half = px(TREE_INDENT / 2.);
                         let mid = px(TREE_ROW_HEIGHT / 2.);
                         let depth = threads.len();
@@ -1998,7 +2609,7 @@ impl Render for Enso {
                                             .h(mid)
                                             .border_l_1()
                                             .border_b_1()
-                                            .rounded_bl(px(6.))
+                                            .rounded_bl(tokens::RADIUS_MD)
                                             .border_color(line),
                                     )
                                     .when(!last, |col| {
@@ -2028,17 +2639,17 @@ impl Render for Enso {
                             // Selection is a soft tint; the darker text carries it.
                             .when(active, |row| row.font_weight(FontWeight::MEDIUM))
                             .when(active || renaming, |row| {
-                                row.bg(theme.secondary.opacity(0.5))
+                                row.bg(theme.secondary.opacity(tokens::ACTIVE))
                             })
                             .when(!active && !renaming, |row| {
                                 row.text_color(muted)
-                                    .hover(|row| row.bg(theme.secondary.opacity(0.35)))
+                                    .hover(|row| row.bg(theme.secondary.opacity(tokens::HOVER)))
                             })
                             .children(guides)
                             .child(
                                 div()
                                     .flex_shrink_0()
-                                    .w(px(16.))
+                                    .w(tokens::ICON)
                                     .flex()
                                     .items_center()
                                     .justify_center()
@@ -2201,473 +2812,106 @@ impl Render for Enso {
                         .on_click(|_, _, cx| settings::open(cx)),
                 ),
             );
+        sidebar.into_any_element()
+    }
 
-        let mut body = h_flex().flex_1().min_h_0().w_full();
-        if let Some(i) = self.active {
-            let document = &self.documents[i];
-            let mut editor_pane = None;
-            let mut reading_pane = None;
-            if mode != Mode::Read {
-                editor_pane = Some(
-                    div()
-                        .id(("editor-pane", document.editor.entity_id()))
-                        .when(document.markdown, |pane| {
-                            markdown_commands(pane, &document.editor)
-                        })
-                        .overflow_hidden()
-                        .flex_1()
-                        .min_w_0()
-                        .h_full()
-                        .border_r_1()
-                        .border_color(theme.border)
-                        .child(
-                            Editor::new(&document.editor)
-                                .bordered(false)
-                                .size_full()
-                                .font_family(theme.mono_font_family.clone())
-                                .text_sm()
-                                .on_paste({
-                                    let weak = cx.entity().downgrade();
-                                    let editor = document.editor.clone();
-                                    move |item, window, cx| {
-                                        // Text pastes as usual. Image data (a screenshot)
-                                        // or image files (copied in Finder) are saved into
-                                        // the workspace and linked instead.
-                                        let mut images = Vec::new();
-                                        for entry in item.entries() {
-                                            match entry {
-                                                ClipboardEntry::Image(image) => {
-                                                    images.push(PastedImage::Data(image.clone()))
-                                                }
-                                                ClipboardEntry::ExternalPaths(paths) => images.extend(
-                                                    paths
-                                                        .paths()
-                                                        .iter()
-                                                        .filter(|p| files::is_image(p))
-                                                        .cloned()
-                                                        .map(PastedImage::File),
-                                                ),
-                                                _ => {}
-                                            }
-                                        }
-                                        if images.is_empty() {
-                                            return false;
-                                        }
-                                        let editor = editor.clone();
-                                        let _ = weak.update(cx, |this, cx| {
-                                            this.paste_images(images, editor, window, cx)
-                                        });
-                                        true
-                                    }
-                                }),
-                        )
-                        .into_any_element(),
-                );
-            }
-            if mode != Mode::Edit {
-                if let Some(reader) = &document.large_reader {
-                    reading_pane = Some(
-                        div()
-                            .id(("preview-pane", document.editor.entity_id()))
-                            .overflow_hidden()
-                            .flex_1()
-                            .min_w_0()
-                            .h_full()
-                            .child(reader.clone())
-                            .into_any_element(),
-                    );
-                } else {
-                    let base = document
-                        .path
-                        .as_ref()
-                        .and_then(|p| p.parent())
-                        .map(PathBuf::from);
-                    let link_base = base.clone();
-                    reading_pane = Some(
-                        div()
-                            .id(("preview-pane", document.editor.entity_id()))
-                            .flex_1()
-                            .min_w_0()
-                            .h_full()
-                            .overflow_hidden()
-                            .child(
-                                div().size_full().child(
-                                    // Spans the whole pane, like the editor, so its
-                                    // scrollbar sits at the pane's right edge. The
-                                    // padding is inside the scroll box: text starts
-                                    // where the editor's does (Read and Edit swap in
-                                    // place) and stops short of the overlaid bar.
-                                    TextView::new(&document.preview)
-                                        .selectable(true)
-                                        .scrollable(true)
-                                        .size_full()
-                                        .pl(px(reader::TEXT_INSET_X))
-                                        .pr_4()
-                                        .pt(px(reader::TEXT_INSET_Y))
-                                        .pb_8()
-                                        .image_source(move |uri| {
-                                            let source = uri.to_string();
-                                            if !source.contains(':') {
-                                                if let Some(base) = &base {
-                                                    return ImageSource::from(base.join(source));
-                                                }
-                                            }
-                                            ImageSource::from(uri.clone())
-                                        })
-                                        .on_link_click(move |url, event, _, cx| {
-                                            if event.is_right_click() {
-                                                return;
-                                            }
-                                            if url.starts_with("https://")
-                                                || url.starts_with("http://")
-                                                || url.starts_with("mailto:")
-                                            {
-                                                cx.open_url(url);
-                                            } else if !url.contains(':') && !url.starts_with('#') {
-                                                if let Some(base) = &link_base {
-                                                    cx.reveal_path(&base.join(url.as_ref()));
-                                                }
-                                            }
-                                        }),
-                                ),
-                            )
-                            .into_any_element(),
-                    );
-                }
-            }
-            // Read and Edit have independent element paths. Only Split owns
-            // resizable state, so switching modes never reuses panel zero for
-            // a different kind of document view or its cached draw state.
-            body = match (editor_pane, reading_pane) {
-                (Some(editor), Some(reader)) => body.child(
-                    h_resizable(("document-split", document.editor.entity_id()))
-                        .child(
-                            resizable_panel()
-                                .size_range(px(180.)..Pixels::MAX)
-                                .child(editor),
-                        )
-                        .child(
-                            resizable_panel()
-                                .size_range(px(180.)..Pixels::MAX)
-                                .child(reader),
-                        ),
-                ),
-                (Some(editor), None) => body.child(editor),
-                (None, Some(reader)) => body.child(reader),
-                (None, None) => body,
-            };
-        } else {
-            body = body.child(
-                v_flex()
-                    .id("empty-workspace")
-                    .size_full()
-                    .min_w_0()
-                    .items_center()
-                    .justify_center()
-                    .p_6()
-                    .gap_5()
-                    .child(
-                        v_flex()
-                            .items_center()
-                            .gap_3()
-                            .child(brand::logo(104., cx))
-                            .child(
-                                div()
-                                    .text_2xl()
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .child("enso"),
-                            )
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .text_color(theme.muted_foreground)
-                                    .child("Open a file, find a thought, or start something new."),
-                            ),
-                    )
-                    .child(
-                        h_flex()
-                            .gap_2()
-                            .items_center()
-                            .child(
-                                Button::new("start-open")
-                                    .small()
-                                    .icon(IconName::File)
-                                    .label("Open file")
-                                    .on_click(
-                                        cx.listener(|this, _, w, cx| this.pick(false, w, cx)),
-                                    ),
-                            )
-                            .child(
-                                Button::new("start-folder")
-                                    .small()
-                                    .icon(IconName::FolderOpen)
-                                    .label("Open folder")
-                                    .on_click(cx.listener(|this, _, w, cx| this.pick(true, w, cx))),
-                            )
-                            .child(
-                                Button::new("start-new")
-                                    .small()
-                                    .icon(IconName::Plus)
-                                    .label("New note")
-                                    .on_click(cx.listener(|this, _, w, cx| this.new_file(w, cx))),
-                            ),
-                    ),
-            );
-        }
-        // The tab strip and view buttons: in Enso's title bar on macOS and
-        // Windows, a bar of the same shape under the native one on Linux.
-        let document_header = h_flex()
-            .h(px(44.))
-            // Fills the title bar's width beside the toggle; as a row of the
-            // content column (Linux) it keeps its height instead of growing.
-            .when(CUSTOM_TITLEBAR, |header| header.flex_1())
-            .when(!CUSTOM_TITLEBAR, |header| header.w_full().flex_shrink_0())
-            .min_w_0()
-            .px_2()
-            .gap_2()
-            .items_center()
-            .when(!CUSTOM_TITLEBAR, |header| {
-                header.border_b_1().border_color(theme.border)
-            })
-            .child(tabs)
-            .child(
-                h_flex().gap_1().items_center().flex_shrink_0().children(
-                    [
-                        (Mode::Read, "Read", IconName::BookOpen),
-                        (Mode::Edit, "Edit", IconName::Pencil),
-                        (Mode::Split, "Split", IconName::Columns2),
-                    ]
-                    .into_iter()
-                    .enumerate()
-                    .map(|(i, (value, label, icon))| {
-                        Button::new(("mode", i))
-                            .ghost()
-                            .small()
-                            .icon(icon)
-                            .tooltip(label)
-                            .accessibility_label(label)
-                            .disabled(!markdown || self.active.is_none())
-                            .when(mode == value, |b| b.bg(theme.secondary))
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                this.set_mode(value, window, cx)
-                            }))
-                    }),
-                ),
-            );
-        let (custom_titlebar, standard_header) = if CUSTOM_TITLEBAR {
-            let toggle_label = if self.sidebar_open {
-                "Collapse sidebar"
-            } else {
-                "Expand sidebar"
-            };
-            // Keeps the document header lined up with the content column as the
-            // sidebar opens, closes and resizes beneath the title bar.
-            let toggle_width = 28.;
-            let header_offset = (f32::from(sidebar_width) * sidebar_reveal
-                - TRAFFIC_LIGHTS_WIDTH
-                - toggle_width
-                - 8.)
-                .max(0.);
-            // Transparent and borderless: it floats over the sidebar and the
-            // content's own top strip, which draws the only horizontal border.
-            let titlebar = TitleBar::new()
-                .h(px(TITLEBAR_HEIGHT))
-                .bg(gpui_kit::transparent_black())
-                .border_color(gpui_kit::transparent_black())
-                // Laid out on top of the bar rather than in it, so a full tab
-                // strip scrolls within the window instead of widening the bar.
-                .child(div().absolute().inset_0().child(
-                    h_flex()
-                        .size_full()
-                        .min_w_0()
-                        .items_center()
-                        .gap_2()
-                        .pr_2()
-                        .child(
-                            // The title bar starts a window move on any press
-                            // that then moves; keep presses on the toggle to
-                            // itself so a slightly shaky click still toggles.
-                            div()
-                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                                .child(
-                                    Button::new("toggle-sidebar")
-                                        .ghost()
-                                        .small()
-                                        .icon(IconName::PanelLeft)
-                                        .tooltip(toggle_label)
-                                        .accessibility_label(toggle_label)
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            this.sidebar_open = !this.sidebar_open;
-                                            cx.notify();
-                                        })),
-                                ),
-                        )
-                        .child(div().flex_shrink_0().w(px(header_offset)))
-                        .child(document_header),
-                ));
-            (Some(titlebar.into_any_element()), None)
-        } else {
-            (None, Some(document_header.into_any_element()))
-        };
+    fn render_status_part(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        shell_perf::count("status");
+        let theme = cx.theme().clone();
         let stats = self
             .active
             .map(|i| self.documents[i].stats.clone())
             .unwrap_or_default();
-        v_flex()
-            .id("enso")
-            .key_context("Enso")
-            .track_focus(&self.focus)
+        h_flex()
             .relative()
-            .size_full()
-            // Over a translucent backdrop the window itself stays clear; the
-            // content column paints its own opaque background.
-            .when(!backdrop, |view| view.bg(theme.background))
-            .text_color(theme.foreground)
-            .on_action(cx.listener(|this, _: &OpenFile, w, cx| this.pick(false, w, cx)))
-            .on_action(cx.listener(|this, _: &OpenFolder, w, cx| this.pick(true, w, cx)))
-            .on_action(cx.listener(|this, _: &NewFile, w, cx| this.new_file(w, cx)))
-            .on_action(cx.listener(|this, _: &Save, _, cx| this.save(cx)))
-            // Closes the current tab; with no tabs left, the window, as Cmd-W
-            // does in other Mac apps (and quits after the last window).
-            .on_action(cx.listener(|this, _: &CloseFile, window, cx| {
-                if this.active.is_some() {
-                    this.close_current_file(cx);
-                } else {
-                    this.request_close(CloseTarget::Window, window, cx);
-                }
-            }))
-            .on_action(cx.listener(|this, _: &NewFolder, w, cx| this.new_folder(w, cx)))
-            // Only when the tree itself has focus: a text field passes Enter
-            // and Cmd-Backspace on to here after handling them, and acting
-            // again would reset a rename in progress (or delete a file).
-            .on_action(cx.listener(|this, _: &RenameSelected, w, cx| {
-                match this.selected_entry().filter(|_| this.focus.is_focused(w)) {
-                    Some(path) => this.start_rename(path, w, cx),
-                    None => cx.propagate(),
-                }
-            }))
-            .on_action(cx.listener(|this, _: &DeleteSelected, w, cx| {
-                match this.selected_entry().filter(|_| this.focus.is_focused(w)) {
-                    Some(path) => this.delete_entry(path, cx),
-                    None => cx.propagate(),
-                }
-            }))
-            .on_action(cx.listener(|this, _: &ToggleView, window, cx| {
-                let next = if this.mode == Mode::Edit {
-                    Mode::Read
-                } else {
-                    Mode::Edit
-                };
-                this.set_mode(next, window, cx);
-            }))
-            .on_action(cx.listener(|this, _: &ToggleSplit, window, cx| {
-                let next = if this.mode == Mode::Split {
-                    this.previous_mode
-                } else {
-                    Mode::Split
-                };
-                this.set_mode(next, window, cx);
-            }))
-            .child(
-                div().flex_1().min_h_0().w_full().child(
-                    h_flex()
-                        .id("workspace-panels")
-                        .size_full()
-                        .on_drag_move(cx.listener(
-                            |this, event: &DragMoveEvent<SidebarResize>, _, cx| {
-                                if !this.sidebar_open {
-                                    return;
-                                }
-                                // The sidebar starts at the panels' left edge, so the
-                                // pointer's offset from it is the new width.
-                                let width = (event.event.position.x - event.bounds.left())
-                                    .clamp(px(160.), px(480.));
-                                if this.sidebar_width != width {
-                                    this.sidebar_width = width;
-                                    cx.notify();
-                                }
-                            },
-                        ))
-                        .child(
-                            div()
-                                .id("sidebar-viewport")
-                                .relative()
-                                .h_full()
-                                .flex_shrink_0()
-                                .w(sidebar_width * sidebar_reveal)
-                                .overflow_hidden()
-                                .when(sidebar_reveal <= 0.001, |sidebar| sidebar.invisible())
-                                .child(div().w(sidebar_width).h_full().child(sidebar))
-                                .when(self.sidebar_open && sidebar_reveal >= 0.999, |sidebar| {
-                                    sidebar.child(
-                                        resize_handle("sidebar-resize", Axis::Horizontal)
-                                            .inside(HandleEdge::Trailing)
-                                            .on_drag(SidebarResize, |_, _, _, cx| {
-                                                cx.new(|_| SidebarResize)
-                                            }),
-                                    )
-                                }),
-                        )
-                        .child(
-                            v_flex()
-                                .flex_1()
-                                .min_w_0()
-                                .h_full()
-                                .bg(content_background(window, cx))
-                                // Room for the floating title bar; its bottom
-                                // border stops at the sidebar.
-                                .when(custom_titlebar.is_some(), |view| {
-                                    view.child(
-                                        div()
-                                            .h(px(TITLEBAR_HEIGHT))
-                                            .flex_shrink_0()
-                                            .border_b_1()
-                                            .border_color(theme.border),
-                                    )
-                                })
-                                .when_some(standard_header, |view, header| view.child(header))
-                                .child(body)
-                                .child(
-                                    h_flex()
-                                        .relative()
-                                        .h(px(20.))
-                                        .flex_shrink_0()
-                                        .items_center()
-                                        .overflow_hidden()
-                                        .px_3()
-                                        .py_0()
-                                        .gap_3()
-                                        .justify_end()
-                                        .border_t_1()
-                                        .border_color(theme.border)
-                                        .text_size(px(10.))
-                                        .line_height(relative(1.))
-                                        .when(self.error && self.error_shown, |bar| {
-                                            bar.child(
-                                                div()
-                                                    .absolute()
-                                                    .inset_0()
-                                                    .flex()
-                                                    .items_center()
-                                                    .justify_center()
-                                                    .text_color(theme.danger)
-                                                    .child(self.status.clone()),
-                                            )
-                                        })
-                                        .child(
-                                            div().text_color(theme.muted_foreground).child(stats),
-                                        ),
-                                ),
-                        ),
-                ),
-            )
-            .when_some(custom_titlebar, |view, titlebar| {
-                view.child(div().absolute().top_0().left_0().right_0().child(titlebar))
+            .w_full()
+            .h(tokens::STATUS_BAR)
+            .flex_shrink_0()
+            .items_center()
+            .overflow_hidden()
+            .px_3()
+            .py_0()
+            .gap_3()
+            .justify_end()
+            .border_t_1()
+            .border_color(theme.border)
+            .text_size(tokens::CAPTION_TEXT)
+            .line_height(relative(1.))
+            .when(self.error && self.error_shown, |bar| {
+                bar.child(
+                    div()
+                        .absolute()
+                        .inset_0()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .text_color(theme.danger)
+                        .child(self.status.clone()),
+                )
             })
+            .child(div().text_color(theme.muted_foreground).child(stats))
+            .into_any_element()
+    }
+
+    fn part(&mut self, part: Part, cx: &mut Context<Self>) -> AnyElement {
+        let view = match self.parts.iter().find(|(p, _)| *p == part) {
+            Some((_, view)) => view.clone(),
+            None => {
+                let app = cx.entity().downgrade();
+                let enso = cx.entity();
+                let view = cx.new(|cx| {
+                    let observe = cx.observe(&enso, |_, _, cx| cx.notify());
+                    ShellPart {
+                        app,
+                        part,
+                        _observe: observe,
+                        #[cfg(test)]
+                        renders: 0,
+                    }
+                });
+                self.parts.push((part, view.clone()));
+                view
+            }
+        };
+        let style = match part {
+            Part::Sidebar => StyleRefinement::default().size_full(),
+            Part::Header if CUSTOM_TITLEBAR => {
+                StyleRefinement::default().flex_1().min_w_0().h(tokens::BAR)
+            }
+            Part::Header => StyleRefinement::default()
+                .w_full()
+                .flex_shrink_0()
+                .h(tokens::BAR),
+            Part::Status => StyleRefinement::default()
+                .w_full()
+                .flex_shrink_0()
+                .h(tokens::STATUS_BAR),
+        };
+        AnyView::from(view).cached(style).into_any_element()
     }
 }
 
+fn pasted_images(item: &ClipboardItem) -> Vec<PastedImage> {
+    let mut images = Vec::new();
+    for entry in item.entries() {
+        match entry {
+            ClipboardEntry::Image(image) => images.push(PastedImage::Data(image.clone())),
+            ClipboardEntry::ExternalPaths(paths) => images.extend(
+                paths
+                    .paths()
+                    .iter()
+                    .filter(|p| files::is_image(p))
+                    .cloned()
+                    .map(PastedImage::File),
+            ),
+            _ => {}
+        }
+    }
+    images
+}
+
 fn bind_view_keys(cx: &mut App) {
+    visual::view::init(cx);
     // Bind at the input's context depth too: macOS inputs normally
     // consume Ctrl+E as end-of-line before a parent action can see it.
     for context in ["Enso", "Enso > Input"] {
@@ -2819,14 +3063,17 @@ fn open_enso_window(
 ) {
     // Cascade each new window off the ones already open.
     let offset = px(28. * open_views(cx).len() as f32);
-    let mut bounds = Bounds::centered(None, size(px(1180.), px(780.)), cx);
+    let mut bounds = Bounds::centered(None, size(px(tokens::WINDOW.0), px(tokens::WINDOW.1)), cx);
     bounds.origin.x += offset;
     bounds.origin.y += offset;
     let opened = gpui_kit::open_window(
         WindowOptions {
             titlebar: Some(if CUSTOM_TITLEBAR {
                 TitlebarOptions {
-                    traffic_light_position: Some(point(px(12.), px(TITLEBAR_HEIGHT / 2. - 7.))),
+                    traffic_light_position: Some(point(
+                        tokens::SPACE_5,
+                        px(TITLEBAR_HEIGHT / 2. - 7.),
+                    )),
                     ..TitleBar::title_bar_options()
                 }
             } else {
@@ -2837,7 +3084,7 @@ fn open_enso_window(
             }),
             app_owns_titlebar_drag: CUSTOM_TITLEBAR,
             window_bounds: Some(WindowBounds::Windowed(bounds)),
-            window_min_size: Some(size(px(800.), px(500.))),
+            window_min_size: Some(size(px(tokens::WINDOW_MIN.0), px(tokens::WINDOW_MIN.1))),
             window_background: window_backdrop(),
             // Linux docks and task switchers find Enso's icon and name through
             // the .desktop file of this id (scripts/install-linux.sh).
@@ -2955,125 +3202,126 @@ fn main() {
         let _ = opened_tx.unbounded_send(urls);
     });
     app.run(move |cx| {
-            gpui_kit::init(cx);
-            app_icon::init();
-            settings::init(cx);
-            workspaces::init(cx);
-            cx.on_action(|_: &OpenSettings, cx| settings::open(cx));
-            cx.bind_keys([
-                KeyBinding::new("cmd-,", OpenSettings, None),
-                KeyBinding::new("ctrl-,", OpenSettings, None),
-            ]);
-            macro_rules! shortcut {
-                ($key:literal, $action:expr) => {
-                    KeyBinding::new(
-                        if cfg!(target_os = "macos") {
-                            concat!("cmd-", $key)
-                        } else {
-                            concat!("ctrl-", $key)
-                        },
-                        $action,
-                        Some("Enso"),
-                    )
-                };
-            }
-            cx.bind_keys([
-                shortcut!("o", OpenFile),
-                shortcut!("shift-o", OpenFolder),
-                shortcut!("n", NewFile),
-                shortcut!("s", Save),
-                shortcut!("e", ToggleView),
-                shortcut!("q", Quit),
-            ]);
-            // Act on the selected tree row. Bound on the window, not in text
-            // fields, so they never take over these keys while typing.
-            cx.bind_keys(if cfg!(target_os = "macos") {
-                [
-                    KeyBinding::new("cmd-backspace", DeleteSelected, Some("Enso")),
-                    KeyBinding::new("enter", RenameSelected, Some("Enso")),
-                ]
-            } else {
-                [
-                    KeyBinding::new("delete", DeleteSelected, Some("Enso")),
-                    KeyBinding::new("f2", RenameSelected, Some("Enso")),
-                ]
-            });
-            cx.bind_keys([
-                KeyBinding::new("ctrl-shift-n", NewFolder, Some("Enso")),
-                #[cfg(target_os = "macos")]
-                KeyBinding::new("cmd-shift-n", NewFolder, Some("Enso")),
-            ]);
-            bind_view_keys(cx);
-            bind_markdown_keys(cx);
-            cx.set_menus(vec![
-                Menu {
-                    name: "enso".into(),
-                    items: vec![
-                        MenuItem::action("Settings…", OpenSettings),
-                        MenuItem::separator(),
-                        MenuItem::action("Quit enso", Quit),
-                    ],
-                    disabled: false,
-                },
-                Menu {
-                    name: "File".into(),
-                    items: vec![
-                        MenuItem::action("Open File…", OpenFile),
-                        MenuItem::action("Open Folder…", OpenFolder),
-                        MenuItem::action("New File", NewFile),
-                        MenuItem::action("New Folder", NewFolder),
-                        MenuItem::action("Close File", CloseFile),
-                        #[cfg(not(target_os = "macos"))]
-                        MenuItem::action("Settings…", OpenSettings),
-                        MenuItem::separator(),
-                        MenuItem::action("Save", Save),
-                    ],
-                    disabled: false,
-                },
-            ]);
-            cx.on_action(|_: &Quit, cx| cx.defer(quit_all));
-            cx.on_window_closed(|cx, _| {
-                let windows = cx.windows();
-                cx.default_global::<OpenWindows>()
-                    .0
-                    .retain(|(handle, _)| windows.contains(handle));
-                if open_views(cx).is_empty() {
-                    cx.quit();
-                }
-            })
-            .detach();
-            if let Some(path) = initial {
-                let path = std::fs::canonicalize(&path).unwrap_or(path);
-                open_enso_window(cx, move |app, window, cx| app.open_path(path, window, cx));
-            } else {
-                match workspaces::last(cx) {
-                    Some(last) if last.exists() => open_workspace_window(Some(last.path), cx),
-                    Some(last) => open_enso_window(cx, move |app, _, cx| {
-                        app.message(
-                            format!("Your last workspace “{}” is no longer available.", last.name()),
-                            true,
-                            cx,
-                        )
-                    }),
-                    None => open_enso_window(cx, |app, window, cx| {
-                        app.open_first_launch_sample(window, cx)
-                    }),
-                }
-            }
-            cx.spawn(async move |cx| {
-                use futures::StreamExt as _;
-                while let Some(urls) = opened_rx.next().await {
-                    cx.update(|cx| open_urls(urls, cx));
-                }
-            })
-            .detach();
-            cx.activate(true);
+        gpui_kit::init(cx);
+        app_icon::init();
+        settings::init(cx);
+        workspaces::init(cx);
+        cx.on_action(|_: &OpenSettings, cx| settings::open(cx));
+        cx.bind_keys([
+            KeyBinding::new("cmd-,", OpenSettings, None),
+            KeyBinding::new("ctrl-,", OpenSettings, None),
+        ]);
+        macro_rules! shortcut {
+            ($key:literal, $action:expr) => {
+                KeyBinding::new(
+                    if cfg!(target_os = "macos") {
+                        concat!("cmd-", $key)
+                    } else {
+                        concat!("ctrl-", $key)
+                    },
+                    $action,
+                    Some("Enso"),
+                )
+            };
+        }
+        cx.bind_keys([
+            shortcut!("o", OpenFile),
+            shortcut!("shift-o", OpenFolder),
+            shortcut!("n", NewFile),
+            shortcut!("s", Save),
+            shortcut!("e", ToggleView),
+            shortcut!("q", Quit),
+        ]);
+        cx.bind_keys(if cfg!(target_os = "macos") {
+            [
+                KeyBinding::new("cmd-backspace", DeleteSelected, Some("Enso")),
+                KeyBinding::new("enter", RenameSelected, Some("Enso")),
+            ]
+        } else {
+            [
+                KeyBinding::new("delete", DeleteSelected, Some("Enso")),
+                KeyBinding::new("f2", RenameSelected, Some("Enso")),
+            ]
         });
+        cx.bind_keys([
+            KeyBinding::new("ctrl-shift-n", NewFolder, Some("Enso")),
+            #[cfg(target_os = "macos")]
+            KeyBinding::new("cmd-shift-n", NewFolder, Some("Enso")),
+        ]);
+        bind_view_keys(cx);
+        bind_markdown_keys(cx);
+        cx.set_menus(vec![
+            Menu {
+                name: "enso".into(),
+                items: vec![
+                    MenuItem::action("Settings…", OpenSettings),
+                    MenuItem::separator(),
+                    MenuItem::action("Quit enso", Quit),
+                ],
+                disabled: false,
+            },
+            Menu {
+                name: "File".into(),
+                items: vec![
+                    MenuItem::action("Open File…", OpenFile),
+                    MenuItem::action("Open Folder…", OpenFolder),
+                    MenuItem::action("New File", NewFile),
+                    MenuItem::action("New Folder", NewFolder),
+                    MenuItem::action("Close File", CloseFile),
+                    #[cfg(not(target_os = "macos"))]
+                    MenuItem::action("Settings…", OpenSettings),
+                    MenuItem::separator(),
+                    MenuItem::action("Save", Save),
+                ],
+                disabled: false,
+            },
+        ]);
+        cx.on_action(|_: &Quit, cx| cx.defer(quit_all));
+        cx.on_window_closed(|cx, _| {
+            let windows = cx.windows();
+            cx.default_global::<OpenWindows>()
+                .0
+                .retain(|(handle, _)| windows.contains(handle));
+            if open_views(cx).is_empty() {
+                cx.quit();
+            }
+        })
+        .detach();
+        if let Some(path) = initial {
+            let path = std::fs::canonicalize(&path).unwrap_or(path);
+            open_enso_window(cx, move |app, window, cx| app.open_path(path, window, cx));
+        } else {
+            match workspaces::last(cx) {
+                Some(last) if last.exists() => open_workspace_window(Some(last.path), cx),
+                Some(last) => open_enso_window(cx, move |app, _, cx| {
+                    app.message(
+                        format!(
+                            "Your last workspace “{}” is no longer available.",
+                            last.name()
+                        ),
+                        true,
+                        cx,
+                    )
+                }),
+                None => open_enso_window(cx, |app, window, cx| {
+                    app.open_first_launch_sample(window, cx)
+                }),
+            }
+        }
+        cx.spawn(async move |cx| {
+            use futures::StreamExt as _;
+            while let Some(urls) = opened_rx.next().await {
+                cx.update(|cx| open_urls(urls, cx));
+            }
+        })
+        .detach();
+        cx.activate(true);
+    });
 }
 
 #[cfg(all(test, feature = "ui-tests"))]
 mod transition_tests {
-    use super::{Enso, Mode, bind_view_keys, reader};
+    use super::{Enso, Mode, bind_view_keys, reader, visual};
     use ::core::prelude::v1::test;
     use gpui_kit::Focusable;
     use gpui_kit::{
@@ -3088,6 +3336,255 @@ mod transition_tests {
         })
         .unwrap();
         cx.run_until_parked();
+    }
+
+    #[gpui_kit::test]
+    fn switching_views_keeps_the_caret_and_its_place(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            bind_view_keys(cx);
+        });
+        let source: String = (0..120)
+            .map(|i| format!("Paragraph {i} with **some** words in it.\n\n"))
+            .collect();
+        let text = source.clone();
+        let (handle, view) = cx.update(|cx| {
+            gpui_kit::open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(Bounds {
+                        origin: Default::default(),
+                        size: size(px(1000.), px(700.)),
+                    })),
+                    ..Default::default()
+                },
+                cx,
+                |window, cx| {
+                    cx.new(|cx| {
+                        let mut view = Enso::new(window, cx);
+                        view.add_document(Some(PathBuf::from("v.md")), text, None, window, cx);
+                        view
+                    })
+                },
+            )
+            .unwrap()
+        });
+        draw(cx, handle);
+        let visual = cx.update(|cx| {
+            let v = view.read(cx);
+            assert!(v.mode == Mode::Visual);
+            v.documents[0].visual.clone().expect("a visual editor")
+        });
+        let at = source.find("Paragraph 60 ").unwrap() + "Paragraph 60 w".len();
+        cx.update(|cx| visual.update(cx, |v, cx| v.place_caret(at, None, cx)));
+        for _ in 0..3 {
+            draw(cx, handle);
+        }
+        let y_visual = cx.update(|cx| visual.read(cx).caret_viewport_y().expect("caret in view"));
+        cx.simulate_keystrokes(handle, "ctrl-e");
+        for _ in 0..4 {
+            draw(cx, handle);
+        }
+        cx.update_window(handle, |_, window, cx| {
+            let v = view.read(cx);
+            assert!(v.mode == Mode::Source);
+            let editor = v.documents[0].editor.read(cx);
+            assert_eq!(editor.cursor(), at);
+            assert!(v.documents[0].editor.focus_handle(cx).is_focused(window));
+            let caret = editor.range_to_bounds(&(at..at)).expect("caret laid out");
+            let y = caret.top() - editor.input_bounds().top();
+            assert!(
+                (y - y_visual).abs() < px(40.),
+                "source {y:?} visual {y_visual:?}"
+            );
+        })
+        .unwrap();
+        let sel = source.find("Paragraph 70 ").unwrap();
+        cx.update(|cx| {
+            view.read(cx).documents[0]
+                .editor
+                .clone()
+                .update(cx, |e, cx| e.set_selected_range(sel..sel + 9, cx))
+        });
+        draw(cx, handle);
+        let y_source = cx.update(|cx| {
+            let editor = view.read(cx).documents[0].editor.read(cx);
+            let caret = editor
+                .range_to_bounds(&(sel + 9..sel + 9))
+                .expect("in view");
+            caret.top() - editor.input_bounds().top()
+        });
+        cx.simulate_keystrokes(handle, "ctrl-e");
+        for _ in 0..4 {
+            draw(cx, handle);
+        }
+        cx.update_window(handle, |_, window, cx| {
+            let v = visual.read(cx);
+            assert_eq!(v.selection(), sel..sel + 9);
+            assert!(v.focus.is_focused(window));
+            let y = v.caret_viewport_y().expect("the caret is in view");
+            assert!(
+                (y - y_source).abs() < px(40.),
+                "visual {y:?} source {y_source:?}"
+            );
+        })
+        .unwrap();
+        cx.simulate_keystrokes(handle, "ctrl-\\");
+        draw(cx, handle);
+        cx.simulate_input(handle, "Section");
+        draw(cx, handle);
+        cx.update(|cx| {
+            let v = view.read(cx);
+            assert!(v.mode == Mode::SideBySide);
+            let value = v.documents[0].editor.read(cx).value().to_string();
+            assert!(
+                value.contains("Section 70 with"),
+                "{}",
+                &value[sel - 5..sel + 30]
+            );
+            assert!(v.documents[0].dirty);
+            assert_eq!(visual.read(cx).selection(), sel + 7..sel + 7);
+        });
+        let far = source.find("Paragraph 100 ").unwrap() + 2;
+        cx.update_window(handle, |_, window, cx| {
+            let editor = view.read(cx).documents[0].editor.clone();
+            editor.update(cx, |e, cx| {
+                e.focus(window, cx);
+                e.set_selected_range(far..far, cx);
+            });
+        })
+        .unwrap();
+        for _ in 0..3 {
+            draw(cx, handle);
+        }
+        cx.update(|cx| assert_eq!(visual.read(cx).caret, far - 2 + 2));
+    }
+
+    #[gpui_kit::test]
+    fn visual_round_trip_and_minimal_diff_on_disk(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            bind_view_keys(cx);
+        });
+        let directory = std::env::temp_dir().join(format!("enso-rt-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let lf = "Title\n=====\n\nSome *odd*   spacing\t\nand a hard break  \nhere.\n\n* star\n+ plus\n    - deep\n\n1) paren\n2) list\n\n| a |b|\n|:-|-:|\n|x| y |\n\n<div align=\"center\">\nhtml\n</div>\n\n[r]: https://example.com  \"T\"\n\n~~~\ncode\n~~~\nNo final newline";
+        let crlf = lf.replace('\n', "\r\n");
+        for (name, original) in [("lf.md", lf.to_string()), ("crlf.md", crlf)] {
+            let path = directory.join(name);
+            std::fs::write(&path, &original).unwrap();
+            let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+            let source = original.clone();
+            let (handle, view) = cx.update(|cx| {
+                gpui_kit::open_window(
+                    WindowOptions {
+                        window_bounds: Some(WindowBounds::Windowed(Bounds {
+                            origin: Default::default(),
+                            size: size(px(1000.), px(700.)),
+                        })),
+                        ..Default::default()
+                    },
+                    cx,
+                    |window, cx| {
+                        cx.new(|cx| {
+                            let mut view = Enso::new(window, cx);
+                            view.add_document(Some(path.clone()), source, None, window, cx);
+                            view
+                        })
+                    },
+                )
+                .unwrap()
+            });
+            draw(cx, handle);
+            for keys in ["ctrl-e", "ctrl-e", "ctrl-\\", "ctrl-\\"] {
+                cx.simulate_keystrokes(handle, keys);
+                draw(cx, handle);
+            }
+            cx.executor()
+                .advance_clock(std::time::Duration::from_secs(2));
+            draw(cx, handle);
+            cx.update(|cx| {
+                let v = view.read(cx);
+                assert!(v.mode == Mode::Visual);
+                assert!(!v.documents[0].dirty, "{name}: viewing is not editing");
+            });
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), original, "{name}");
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().modified().unwrap(),
+                modified,
+                "{name}: not rewritten"
+            );
+            let visual = cx.update(|cx| view.read(cx).documents[0].visual.clone().unwrap());
+            let at = original.find("spacing").unwrap();
+            cx.update(|cx| visual.update(cx, |v, cx| v.place_caret(at, None, cx)));
+            cx.simulate_input(handle, "wide ");
+            draw(cx, handle);
+            cx.executor()
+                .advance_clock(std::time::Duration::from_secs(2));
+            draw(cx, handle);
+            let mut expected = original.clone();
+            expected.insert_str(at, "wide ");
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), expected, "{name}");
+            cx.update(|cx| assert!(!view.read(cx).documents[0].dirty, "{name}: saved"));
+        }
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[gpui_kit::test]
+    fn the_interface_fades_while_typing_and_returns(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            bind_view_keys(cx);
+        });
+        let (handle, view) = cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| {
+                    let mut view = Enso::new(window, cx);
+                    view.add_document(
+                        Some(PathBuf::from("c.md")),
+                        "Some text.\n".into(),
+                        None,
+                        window,
+                        cx,
+                    );
+                    view
+                })
+            })
+            .unwrap()
+        });
+        draw(cx, handle);
+        let visual = cx.update(|cx| view.read(cx).documents[0].visual.clone().unwrap());
+        cx.update_window(handle, |_, window, cx| {
+            visual.update(cx, |v, cx| window.focus(&v.focus, cx));
+        })
+        .unwrap();
+        cx.simulate_input(handle, "x");
+        draw(cx, handle);
+        cx.update(|cx| assert!(view.read(cx).chrome_hidden));
+        cx.update_window(handle, |_, window, cx| {
+            use gpui_kit::InputEvent as _;
+            window.dispatch_event(
+                gpui_kit::MouseMoveEvent {
+                    position: gpui_kit::point(px(40.), px(40.)),
+                    pressed_button: None,
+                    modifiers: Default::default(),
+                }
+                .to_platform_input(),
+                cx,
+            );
+        })
+        .unwrap();
+        draw(cx, handle);
+        cx.update(|cx| assert!(!view.read(cx).chrome_hidden));
+        cx.simulate_input(handle, "y");
+        cx.simulate_keystrokes(handle, "escape");
+        cx.update(|cx| assert!(!view.read(cx).chrome_hidden));
+        cx.update(|cx| {
+            let mut prefs = visual::prefs::WritingPrefs::get(cx);
+            prefs.hide_chrome = false;
+            cx.set_global(prefs);
+        });
+        cx.simulate_input(handle, "z");
+        cx.update(|cx| assert!(!view.read(cx).chrome_hidden));
     }
 
     #[gpui_kit::test]
@@ -3118,7 +3615,7 @@ mod transition_tests {
     }
 
     #[gpui_kit::test]
-    fn only_recently_viewed_documents_keep_a_preview(cx: &mut TestAppContext) {
+    fn only_recently_viewed_documents_keep_a_visual_editor(cx: &mut TestAppContext) {
         cx.update(|cx| gpui_kit::init(cx));
         let (handle, view) = cx.update(|cx| {
             gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
@@ -3139,10 +3636,12 @@ mod transition_tests {
             .unwrap()
         });
         let view_tab = |cx: &mut TestAppContext, i: usize| {
-            cx.update(|cx| view.update(cx, |view, cx| {
-                view.active = Some(i);
-                cx.notify();
-            }));
+            cx.update(|cx| {
+                view.update(cx, |view, cx| {
+                    view.active = Some(i);
+                    cx.notify();
+                })
+            });
             draw(cx, handle);
         };
         let loaded = |cx: &mut TestAppContext| {
@@ -3150,7 +3649,7 @@ mod transition_tests {
                 view.read(cx)
                     .documents
                     .iter()
-                    .map(|d| d.preview_loaded)
+                    .map(|d| d.visual.is_some())
                     .collect::<Vec<_>>()
             })
         };
@@ -3160,14 +3659,14 @@ mod transition_tests {
         for i in [0, 1, 2] {
             view_tab(cx, i);
         }
-        // Three kept; the oldest (4) dropped its preview.
         assert_eq!(loaded(cx), [true, true, true, false, false]);
         // Coming back to it parses it again.
         view_tab(cx, 4);
         assert_eq!(loaded(cx), [false, true, true, false, true]);
         cx.update(|cx| {
-            let text = view.read(cx).documents[4].preview.read(cx).rendered_text();
-            assert!(text.as_str().contains("Note 4"), "{:?}", text.as_str());
+            let visual = view.read(cx).documents[4].visual.clone().unwrap();
+            let blocks = visual.read(cx).doc.blocks.len();
+            assert_eq!(blocks, 1, "the note's heading");
         });
     }
 
@@ -3253,7 +3752,7 @@ mod transition_tests {
                         window,
                         cx,
                     );
-                    view.mode = Mode::Edit;
+                    view.mode = Mode::Source;
                     view
                 })
             })
@@ -3269,7 +3768,11 @@ mod transition_tests {
             .unwrap();
         };
         let text = |cx: &mut TestAppContext| cx.update(|cx| editor.read(cx).value().to_string());
-        let primary = if cfg!(target_os = "macos") { "cmd" } else { "ctrl" };
+        let primary = if cfg!(target_os = "macos") {
+            "cmd"
+        } else {
+            "ctrl"
+        };
 
         // Enter continues the list, Tab nests the new item, a second Enter on
         // the empty item steps it back out.
@@ -3345,7 +3848,7 @@ mod transition_tests {
             }
             cx.update_window(handle, |_, window, cx| {
                 let state = view.read(cx);
-                assert!(state.mode == Mode::Edit);
+                assert!(state.mode == Mode::Source);
                 assert!(
                     state.documents[0]
                         .editor
@@ -3376,7 +3879,7 @@ mod transition_tests {
             draw(cx, handle);
             cx.update_window(handle, |_, window, cx| {
                 let state = view.read(cx);
-                assert!(state.mode == Mode::Read);
+                assert!(state.mode == Mode::Visual);
                 let doc = &state.documents[0];
                 let cursor = doc.editor.read(cx).cursor();
                 let range = doc
@@ -3404,7 +3907,7 @@ mod transition_tests {
         draw(cx, handle);
         cx.update(|cx| {
             let state = view.read(cx);
-            assert!(state.mode == Mode::Split);
+            assert!(state.mode == Mode::SideBySide);
             let doc = &state.documents[0];
             let cursor = doc.editor.read(cx).cursor();
             let range = doc
@@ -3478,7 +3981,7 @@ mod transition_tests {
         });
         cx.simulate_keystrokes(handle, "ctrl-\\");
         draw(cx, handle);
-        cx.update(|cx| assert!(view.read(cx).mode == Mode::Read));
+        cx.update(|cx| assert!(view.read(cx).mode == Mode::Visual));
     }
     #[gpui_kit::test]
     fn closing_tabs_flushes_saves_and_keeps_async_writes_on_the_right_file(
@@ -3586,5 +4089,69 @@ mod transition_tests {
             assert!(view.read(cx).active.is_none());
         });
         std::fs::remove_dir_all(directory).unwrap();
+    }
+    #[gpui_kit::test]
+    fn typing_does_not_rerender_the_shell_parts(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            bind_view_keys(cx);
+        });
+        let (handle, view) = cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| {
+                    let mut view = Enso::new(window, cx);
+                    view.add_document(
+                        Some(PathBuf::from("note.md")),
+                        "hello".into(),
+                        None,
+                        window,
+                        cx,
+                    );
+                    view.mode = Mode::Source;
+                    view
+                })
+            })
+            .unwrap()
+        });
+        draw(cx, handle);
+        let editor = cx.update(|cx| view.read(cx).documents[0].editor.clone());
+        cx.update_window(handle, |_, window, cx| {
+            editor.focus_handle(cx).focus(window, cx);
+            editor.update(cx, |e, cx| e.set_selected_range(5..5, cx));
+        })
+        .unwrap();
+        let frame = |cx: &mut TestAppContext| {
+            cx.update_window(handle, |_, window, cx| window.draw(cx).clear(cx))
+                .unwrap();
+            cx.run_until_parked();
+        };
+        frame(cx);
+        let renders = |cx: &mut TestAppContext| {
+            cx.update(|cx| {
+                view.read(cx)
+                    .parts
+                    .iter()
+                    .map(|(part, v)| (*part, v.read(cx).renders))
+                    .collect::<Vec<_>>()
+            })
+        };
+        let before = renders(cx);
+        for _ in 0..30 {
+            cx.simulate_input(handle, "x");
+            frame(cx);
+        }
+        let after = renders(cx);
+        assert_eq!(
+            cx.update(|cx| editor.read(cx).value().to_string()),
+            format!("hello{}", "x".repeat(30))
+        );
+        assert_eq!(before.len(), 3, "all three parts are cached views");
+        for ((part, b), (_, a)) in before.iter().zip(&after) {
+            assert!(
+                a - b <= 2,
+                "{part:?} rendered {} times for 30 keystrokes",
+                a - b
+            );
+        }
     }
 }

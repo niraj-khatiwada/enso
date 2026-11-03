@@ -125,9 +125,7 @@ pub fn toggle_inline(text: &str, selection: Range<usize>, inline: Inline) -> Edi
             };
         }
     }
-    let cursor_offset = selection
-        .is_empty()
-        .then(|| selection.start - range.start);
+    let cursor_offset = selection.is_empty().then(|| selection.start - range.start);
     let inner = &text[range.clone()];
 
     // Selected with its markers, like `**bold**`.
@@ -268,7 +266,10 @@ fn parse_prefix(line: &str) -> Prefix {
         let after = &rest[digits + 1..];
         if after.is_empty() || after.starts_with(' ') {
             let n = rest[..digits].parse().unwrap_or(1);
-            return done(Kind::Numbered(n, delim), digits + 1 + usize::from(!after.is_empty()));
+            return done(
+                Kind::Numbered(n, delim),
+                digits + 1 + usize::from(!after.is_empty()),
+            );
         }
     }
     done(Kind::Plain, 0)
@@ -494,7 +495,11 @@ pub fn continue_on_enter(text: &str, cursor: usize) -> Option<Edit> {
         // A nested one steps out a level instead, keeping its marker.
         let insert = if is_list(&prefix.kind) && !prefix.indent.is_empty() {
             let width = prefix.indent.len().min(marker_width(&prefix));
-            format!("{}{}", &prefix.indent[width..], &line[prefix.indent.len()..prefix.len])
+            format!(
+                "{}{}",
+                &prefix.indent[width..],
+                &line[prefix.indent.len()..prefix.len]
+            )
         } else {
             String::new()
         };
@@ -670,7 +675,10 @@ mod tests {
         let (text, sel) = parse("|");
         assert_eq!(show(&text, &toggle_code_block(&text, sel)), "```\n|\n```");
         let (text, sel) = parse("[a\nb]");
-        assert_eq!(show(&text, &toggle_code_block(&text, sel)), "```\n[a\nb]\n```");
+        assert_eq!(
+            show(&text, &toggle_code_block(&text, sel)),
+            "```\n[a\nb]\n```"
+        );
         let (text, sel) = parse("[```\na\n```]");
         assert_eq!(show(&text, &toggle_code_block(&text, sel)), "[a]");
     }

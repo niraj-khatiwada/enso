@@ -210,8 +210,8 @@ pub fn move_to_trash(path: &Path) -> io::Result<()> {
 fn recycle(path: &Path) -> io::Result<()> {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::UI::Shell::{
-        FO_DELETE, FOF_ALLOWUNDO, FOF_NOERRORUI, FOF_SILENT, FOF_WANTNUKEWARNING,
-        SHFILEOPSTRUCTW, SHFileOperationW,
+        FO_DELETE, FOF_ALLOWUNDO, FOF_NOERRORUI, FOF_SILENT, FOF_WANTNUKEWARNING, SHFILEOPSTRUCTW,
+        SHFileOperationW,
     };
     let path = std::path::absolute(path)?;
     // A list of paths, each NUL-terminated, ending in an extra NUL.
@@ -246,9 +246,9 @@ fn recycle(path: &Path) -> io::Result<()> {
 /// Rename a file or folder in place. Never replaces another entry, though a
 /// change of case alone is allowed on case-insensitive volumes.
 pub fn rename(path: &Path, name: &str) -> io::Result<PathBuf> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "This item cannot be renamed."))?;
+    let parent = path.parent().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "This item cannot be renamed.")
+    })?;
     let target = parent.join(plain_name(name)?);
     if target == path {
         return Ok(target);
@@ -372,12 +372,13 @@ mod tests {
             root.join(".assets/images/Photo-1.jpg")
         );
         assert!(is_image(&source) && !is_image(&root.join("notes.md")));
-        assert!(
-            list_folder(&root)
+        assert!(list_folder(&root).unwrap().iter().all(|e| {
+            !e.path
+                .file_name()
                 .unwrap()
-                .iter()
-                .all(|e| !e.path.file_name().unwrap().to_string_lossy().starts_with('.'))
-        );
+                .to_string_lossy()
+                .starts_with('.')
+        }));
         fs::write(root.join("binary"), [0, 1, 2]).unwrap();
         assert!(read_text(&root.join("binary")).is_err());
         assert!(is_markdown(Path::new("NOTE.MD")));
