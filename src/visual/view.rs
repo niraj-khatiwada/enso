@@ -589,8 +589,20 @@ impl VisualView {
                 None => lines.push((p.y, p.x, p.x)),
             }
         }
+        let bounds = g.bounds();
+        let count = lines.len();
         lines
             .into_iter()
+            .enumerate()
+            .map(|(ix, (y, left, right))| {
+                let left = if ix > 0 { bounds.left() } else { left };
+                let right = if ix + 1 < count {
+                    bounds.right()
+                } else {
+                    right
+                };
+                (y, left, right)
+            })
             .map(|(y, left, right)| {
                 Bounds::new(
                     point(left - tokens::SPACE_1, y),
