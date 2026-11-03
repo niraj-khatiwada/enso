@@ -8,7 +8,7 @@ use gpui_kit::component::text::{
 use std::ops::Range;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-enum Alignment {
+pub(crate) enum Alignment {
     #[default]
     Left,
     Center,
@@ -36,12 +36,12 @@ impl Alignment {
 
 #[derive(Clone, Debug, Default)]
 pub struct Picture {
-    src: String,
-    alt: String,
-    width: String,
+    pub(crate) src: String,
+    pub(crate) alt: String,
+    pub(crate) width: String,
     height: String,
     title: String,
-    alignment: Alignment,
+    pub(crate) alignment: Alignment,
 }
 fn escape(text: &str) -> String {
     text.replace('&', "&amp;")
@@ -102,7 +102,7 @@ fn attributes(tag: &str) -> HashMap<String, String> {
     }
     result
 }
-fn html_picture(source: &str) -> Option<Picture> {
+pub(crate) fn html_picture(source: &str) -> Option<Picture> {
     let source = source.trim();
     if !source.to_ascii_lowercase().starts_with("<img ") || !source.ends_with('>') {
         return None;
@@ -844,7 +844,7 @@ pub struct TableForm {
 
 /// How a table is written in the source, so saving writes it back the same way.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum TableSyntax {
+pub(crate) enum TableSyntax {
     /// A pipe table; `aligns` holds its delimiter row.
     Markdown,
     /// A plain `<table>`; `header` says whether its first row is `<th>` cells.
@@ -854,10 +854,10 @@ enum TableSyntax {
 /// A table the table editor can open: its rows (header first) and how to
 /// write them back.
 #[derive(Debug, PartialEq)]
-struct EditableTable {
-    rows: Vec<Vec<String>>,
+pub(crate) struct EditableTable {
+    pub(crate) rows: Vec<Vec<String>>,
     aligns: Vec<String>,
-    syntax: TableSyntax,
+    pub(crate) syntax: TableSyntax,
 }
 
 impl EditableTable {
@@ -881,7 +881,7 @@ impl EditableTable {
     /// Plain HTML tables only: rows of `<th>`/`<td>` cells, optionally in
     /// `<thead>`/`<tbody>`. Merged cells, captions, column groups and nested
     /// tables can't be shown as a grid, so those tables aren't editable.
-    fn parse_html(source: &str) -> Option<Self> {
+    pub(crate) fn parse_html(source: &str) -> Option<Self> {
         let text = source.trim();
         // ASCII lowercasing keeps byte offsets, so `lower` indexes `text`.
         let lower = text.to_ascii_lowercase();

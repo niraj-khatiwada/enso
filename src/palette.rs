@@ -119,6 +119,8 @@ enum Choice {
     Settings,
     Reveal,
     SearchEverything,
+    Export,
+    CopyRichText,
 }
 impl Choice {
     fn key(&self) -> String {
@@ -152,6 +154,8 @@ impl Choice {
             Self::Settings => "settings".into(),
             Self::Reveal => "reveal".into(),
             Self::SearchEverything => "search-everything".into(),
+            Self::Export => "export".into(),
+            Self::CopyRichText => "copy-rich-text".into(),
         }
     }
 
@@ -181,6 +185,8 @@ impl Choice {
             Self::Settings => Box::new(OpenSettings),
             Self::Mode(Mode::Split) => Box::new(ToggleSplit),
             Self::SearchEverything => Box::new(SearchEverything),
+            Self::Export => Box::new(ExportNote),
+            Self::CopyRichText => Box::new(CopyRichText),
             _ => return None,
         })
     }
@@ -444,6 +450,18 @@ impl Enso {
                     Some("\\"),
                 ),
                 entry(
+                    "Export…",
+                    &["save", "pdf", "html", "print", "share", "document", "web"],
+                    Choice::Export,
+                    None,
+                ),
+                entry(
+                    "Copy as Rich Text",
+                    &["clipboard", "formatted", "email", "docs", "paste"],
+                    Choice::CopyRichText,
+                    None,
+                ),
+                entry(
                     "Swap Split Sides",
                     &["switch", "left", "right", "reader", "editor"],
                     Choice::Swap,
@@ -662,6 +680,11 @@ impl Enso {
                 }
             }
             Choice::Settings => settings::open(cx),
+            Choice::Export => self.open_export(window, cx),
+            Choice::CopyRichText => {
+                let images = self.export_choice.images;
+                self.copy_rich_text(images, cx)
+            }
             Choice::Reveal => {
                 if let Some(path) = self
                     .active

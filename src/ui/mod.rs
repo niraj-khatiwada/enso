@@ -5,6 +5,7 @@
 mod button;
 mod drop;
 mod surface;
+pub mod toast;
 
 pub use button::{cancel_button, icon_button, primary_button, secondary_button};
 pub use drop::drop_line;

@@ -1,6 +1,6 @@
 [package]
 name = "enso"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2024"
 description = "A quiet, native Markdown workspace"
 license = "MIT"
@@ -12,6 +12,19 @@ chrono = "0.4"
 url = "2"
 gpui-test = { package = "gpui-pre", version = "=0.3.10", features = ["test-support"], optional = true }
 gpui-kit = "0.8.1"
+# Export: Markdown parsed as the reader parses it, HTML with its images, PDFs
+# laid out by enso itself and written by krilla (text shaped by rustybuzz, in
+# the system's fonts), and HTML on the clipboard for Copy as Rich Text.
+markdown = "1.0.0"
+base64 = "0.22"
+# Already built for GPUI; scales large images down for Copy as Rich Text.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
+arboard = { version = "3.7", default-features = false }
+krilla = { version = "0.8.2", default-features = false, features = ["raster-images", "simple-text"] }
+rustybuzz = "0.20.1"
+fontdb = "0.23"
+memmap2 = "0.9"
+unicode-linebreak = "0.1.5"
 
 # Moving deleted files to the Trash: the trash crate on macOS and Linux;
 # Windows goes through the shell itself (see files::move_to_trash).
@@ -21,6 +34,10 @@ embed-resource = "3"
 
 [target.'cfg(not(windows))'.dependencies]
 trash = "5"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# Rich text on the clipboard under Wayland as well as X11.
+arboard = { version = "3.7", default-features = false, features = ["wayland-data-control"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_UI_Shell", "Win32_Foundation"] }

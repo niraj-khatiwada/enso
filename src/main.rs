@@ -1,5 +1,6 @@
 mod app_icon;
 mod brand;
+mod export;
 mod files;
 mod markdown_edit;
 mod onboarding;
@@ -23,7 +24,7 @@ use gpui_kit::component::{
     button::{Button, ButtonVariants},
     h_flex,
     input::{Editor, EditorState, Input, InputEvent, InputState},
-    menu::{ContextMenuExt, PopupMenuItem},
+    menu::{ContextMenuExt, DropdownMenu, PopupMenuItem},
     tooltip::Tooltip,
     popover::Popover,
     resizable::{
@@ -59,6 +60,9 @@ actions!(
         OpenCommandPalette,
         SearchEverything,
         PasteFiles,
+        ExportNote,
+        DismissExport,
+        CopyRichText,
         DismissCommandPalette,
         DismissRichControls,
         OpenInsertMenu,
@@ -322,6 +326,21 @@ impl Render for DraggedTab {
     }
 }
 
+/// A toast on screen, or leaving it.
+struct ToastEntry {
+    toast: ui::toast::Toast,
+    /// Which showing this is: an autohide timer only ends its own.
+    serial: u64,
+    leaving: bool,
+}
+
+/// Background work under way (see `Enso::busy`). Toasts that report its
+/// outcome use the same `id`, so they replace its spinner.
+struct Busy {
+    id: SharedString,
+    done: Arc<std::sync::atomic::AtomicBool>,
+}
+
 /// A sidebar entry being dragged; the preview is its icon and name.
 #[derive(Clone)]
 struct DraggedEntry {
@@ -373,11 +392,7 @@ struct Enso {
     expanded: HashSet<PathBuf>,
     mode: Mode,
     previous_mode: Mode,
-    status: String,
     error: bool,
-    /// Whether the last error is still on the status bar; it hides itself.
-    error_shown: bool,
-    _error_task: Option<Task<()>>,
     naming: Option<NewEntry>,
     filename: Entity<InputState>,
     /// The tree row last clicked, file or folder; new entries go beside it.
@@ -424,6 +439,13 @@ struct Enso {
     /// Where the pointer was when a row last claimed the drop, so the list
     /// behind the rows doesn't take it back for the workspace root.
     tree_drop_point: Option<Point<Pixels>>,
+    /// The Export dialog while open (and while it fades out), and the
+    /// format and image choice it last ran with.
+    export_dialog: Option<export::ExportDialog>,
+    closing_export: Option<export::ExportDialog>,
+    export_choice: export::ExportChoice,
+    toasts: Vec<ToastEntry>,
+    toast_serial: u64,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -488,10 +510,7 @@ impl Enso {
             expanded: HashSet::new(),
             mode: Mode::Read,
             previous_mode: Mode::Read,
-            status: "A little space for your thoughts.".into(),
             error: false,
-            error_shown: false,
-            _error_task: None,
             naming: None,
             filename,
             selected: None,
@@ -525,6 +544,11 @@ impl Enso {
             tab_drop: None,
             tree_drop: None,
             tree_drop_point: None,
+            export_dialog: None,
+            closing_export: None,
+            export_choice: Default::default(),
+            toasts: Vec::new(),
+            toast_serial: 0,
             _subscriptions: vec![
                 subscription,
                 rename_subscription,
@@ -722,24 +746,137 @@ impl Enso {
         }));
     }
 
+    /// Report an error (as a toast), or note that things are fine again.
+    /// `error` stays set until the next fine message: quitting relies on it
+    /// to know whether auto-save failed. Messages that aren't errors show
+    /// nothing; confirmations use `toast` directly.
     fn message(&mut self, message: impl Into<String>, error: bool, cx: &mut Context<Self>) {
-        self.status = message.into();
+        let message = message.into();
         self.error = error;
-        self.error_shown = error;
-        // Errors fade from the bar after a while; `error` itself stays set,
-        // since quitting relies on it to know auto-save failed.
-        self._error_task = error.then(|| {
+        if error && !message.is_empty() {
+            self.toast(ui::toast::error(message), cx);
+        }
+        cx.notify();
+    }
+
+    /// Show a toast; one with the same id is replaced in place.
+    fn toast(&mut self, toast: ui::toast::Toast, cx: &mut Context<Self>) {
+        self.toast_serial += 1;
+        let serial = self.toast_serial;
+        let id = toast.id.clone();
+        let autohide = toast.autohide;
+        match self.toasts.iter_mut().find(|t| t.toast.id == id) {
+            Some(entry) => {
+                entry.toast = toast;
+                entry.serial = serial;
+                entry.leaving = false;
+            }
+            None => {
+                self.toasts.push(ToastEntry { toast, serial, leaving: false });
+                // At most four at once: the oldest gives way.
+                let showing = self.toasts.iter().filter(|t| !t.leaving).count();
+                if showing > 4 {
+                    if let Some(oldest) = self.toasts.iter_mut().find(|t| !t.leaving) {
+                        oldest.leaving = true;
+                    }
+                }
+            }
+        }
+        if autohide {
             cx.spawn(async move |this, cx| {
-                cx.background_executor()
-                    .timer(std::time::Duration::from_secs(5))
-                    .await;
+                cx.background_executor().timer(std::time::Duration::from_secs(4)).await;
                 let _ = this.update(cx, |this, cx| {
-                    this.error_shown = false;
-                    cx.notify();
+                    if let Some(entry) = this.toasts.iter_mut().find(|t| t.serial == serial) {
+                        entry.leaving = true;
+                        cx.notify();
+                    }
                 });
             })
-        });
+            .detach();
+        }
         cx.notify();
+    }
+
+    fn dismiss_toast(&mut self, id: &SharedString, cx: &mut Context<Self>) {
+        if let Some(entry) = self.toasts.iter_mut().find(|t| t.toast.id == *id) {
+            entry.leaving = true;
+            cx.notify();
+        }
+    }
+
+    /// The toasts, stacked at the bottom middle of the window, newest last.
+    fn toast_layer(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if self.toasts.is_empty() {
+            return None;
+        }
+        let easing = cx.theme().motion_tokens().easing_move.clone();
+        let mut shown = Vec::new();
+        let mut gone = Vec::new();
+        for entry in &self.toasts {
+            let presence = transition(
+                ElementId::from((ElementId::from(entry.toast.id.clone()), "toast")),
+                if entry.leaving { 0.0_f32 } else { 1.0 },
+                Transition::new(std::time::Duration::from_millis(220)).easing(easing.clone()),
+                window,
+                cx,
+            )
+            .clamp(0., 1.);
+            if entry.leaving && presence <= 0.001 {
+                gone.push(entry.serial);
+                continue;
+            }
+            let weak = cx.entity().downgrade();
+            let id = entry.toast.id.clone();
+            shown.push(ui::toast::render(
+                &entry.toast,
+                presence,
+                move |_, cx| {
+                    let _ = weak.update(cx, |this, cx| this.dismiss_toast(&id, cx));
+                },
+                cx,
+            ));
+        }
+        if !gone.is_empty() {
+            self.toasts.retain(|t| !gone.contains(&t.serial));
+        }
+        Some(
+            v_flex()
+                .absolute()
+                .left_0()
+                .right_0()
+                .bottom(px(36.))
+                .px_4()
+                .gap_2()
+                .items_center()
+                .children(shown)
+                .into_any_element(),
+        )
+    }
+
+    /// Work has started in the background: if it's still going after a
+    /// moment, a spinner toast says so (quick work shows nothing). Pass the
+    /// result to `finish`.
+    fn busy(&mut self, id: impl Into<SharedString>, text: impl Into<SharedString>, cx: &mut Context<Self>) -> Busy {
+        let busy = Busy { id: id.into(), done: Default::default() };
+        let (id, done, text) = (busy.id.clone(), busy.done.clone(), text.into());
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(std::time::Duration::from_millis(250)).await;
+            if !done.load(std::sync::atomic::Ordering::SeqCst) {
+                let _ = this.update(cx, |this, cx| this.toast(ui::toast::working(id, text), cx));
+            }
+        })
+        .detach();
+        busy
+    }
+
+    /// The work behind `busy` is over: its spinner (if it came up) gives way
+    /// to `then`, or just goes.
+    fn finish(&mut self, busy: Busy, then: Option<ui::toast::Toast>, cx: &mut Context<Self>) {
+        busy.done.store(true, std::sync::atomic::Ordering::SeqCst);
+        match then {
+            Some(toast) => self.toast(toast, cx),
+            None => self.dismiss_toast(&busy.id, cx),
+        }
     }
 
     fn add_document(
@@ -959,7 +1096,8 @@ impl Enso {
             cx.notify();
             return;
         }
-        self.message("Opening file…", false, cx);
+        let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let busy = self.busy(format!("open:{}", path.display()), format!("Opening “{name}”…"), cx);
         let task = cx.background_executor().spawn(async move {
             files::read_text(&path).map(|text| {
                 let sections =
@@ -973,11 +1111,14 @@ impl Enso {
         });
         cx.spawn_in(window, async move |this, cx| {
             let result = task.await;
-            let _ = this.update_in(cx, |this, window, cx| match result {
-                Ok((path, source, sections)) => {
-                    this.add_document(Some(path), source, sections, window, cx)
+            let _ = this.update_in(cx, |this, window, cx| {
+                this.finish(busy, None, cx);
+                match result {
+                    Ok((path, source, sections)) => {
+                        this.add_document(Some(path), source, sections, window, cx)
+                    }
+                    Err(error) => this.message(error.to_string(), true, cx),
                 }
-                Err(error) => this.message(error.to_string(), true, cx),
             });
         })
         .detach();
@@ -997,6 +1138,8 @@ impl Enso {
             cx.notify();
             return;
         }
+        let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let busy = self.busy(format!("open:{}", path.display()), format!("Opening “{name}”…"), cx);
         let task = cx.background_executor().spawn({
             let path = path.clone();
             async move {
@@ -1010,7 +1153,9 @@ impl Enso {
         });
         cx.spawn_in(window, async move |this, cx| {
             let result = task.await;
-            let _ = this.update_in(cx, |this, window, cx| match result {
+            let _ = this.update_in(cx, |this, window, cx| {
+                this.finish(busy, None, cx);
+                match result {
                 Ok((text, sections)) => {
                     this.add_document(Some(path), text, sections, window, cx);
                     if let Some(doc) = this.active.and_then(|i| this.documents.get(i)) {
@@ -1018,6 +1163,7 @@ impl Enso {
                     }
                 }
                 Err(error) => this.message(error.to_string(), true, cx),
+                }
             });
         })
         .detach();
@@ -1242,7 +1388,10 @@ impl Enso {
         doc.revision += 1;
         self.schedule_word_count(index, true, cx);
         let title = self.documents[index].title();
-        self.message(format!("Reloaded “{title}”, changed outside enso."), false, cx);
+        self.toast(
+            ui::toast::done(SharedString::from(format!("reloaded:{title}")), format!("Reloaded “{title}”"), "It changed outside enso."),
+            cx,
+        );
         cx.notify();
     }
 
@@ -1339,6 +1488,12 @@ impl Enso {
             return;
         }
         self.restoring_session = true;
+        let count = saved.tabs.len();
+        let busy = self.busy(
+            format!("restore:{}", root.display()),
+            if count == 1 { "Opening your note…".to_string() } else { format!("Opening your {count} notes…") },
+            cx,
+        );
         let tabs = saved.tabs.clone();
         let task = cx.background_executor().spawn(async move {
             tabs.into_iter()
@@ -1359,6 +1514,7 @@ impl Enso {
             let files = task.await;
             let _ = handle.update(cx, |_, window, cx| {
                 this.update(cx, |this, cx| {
+                    this.finish(busy, None, cx);
                     this.restoring_session = false;
                     // The user moved on to another workspace meanwhile.
                     if this.root.as_ref() != Some(&root) {
@@ -1588,16 +1744,26 @@ impl Enso {
             .clone()
             .filter(|root| doc_dir.starts_with(root))
             .unwrap_or_else(|| doc_dir.clone());
-        let mut links = Vec::new();
-        for image in images {
-            let saved = match &image {
-                PastedImage::Data(image) => {
-                    files::save_image(&root, None, &image.bytes, image.format.extension())
-                }
-                PastedImage::File(path) => files::import_image(&root, path),
-            };
-            match saved {
-                Ok(saved) => {
+        // Saving the images happens off the window's thread (a big
+        // screenshot takes a moment), then the links go in where the cursor
+        // was when they were pasted.
+        let selection = editor.read(cx).selected_range();
+        let count = images.len();
+        let busy = self.busy(
+            format!("images:{}", editor.entity_id()),
+            if count == 1 { "Adding the image…".to_string() } else { format!("Adding {count} images…") },
+            cx,
+        );
+        let task = cx.background_executor().spawn(async move {
+            images
+                .into_iter()
+                .map(|image| {
+                    let saved = match &image {
+                        PastedImage::Data(image) => {
+                            files::save_image(&root, None, &image.bytes, image.format.extension())
+                        }
+                        PastedImage::File(path) => files::import_image(&root, path),
+                    }?;
                     let alt = saved
                         .file_stem()
                         .map(|s| s.to_string_lossy().into_owned())
@@ -1611,20 +1777,42 @@ impl Enso {
                             .replace('<', "&lt;")
                     };
                     let link = files::relative_link(&doc_dir, &saved);
-                    links.push(format!(
+                    Ok(format!(
                         "<img src=\"{}\" alt=\"{}\" width=\"100%\" />",
                         attr(&link),
                         attr(&alt)
-                    ));
+                    ))
+                })
+                .collect::<Vec<std::io::Result<String>>>()
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let results = task.await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                this.finish(busy, None, cx);
+                let mut links = Vec::new();
+                for result in results {
+                    match result {
+                        Ok(link) => links.push(link),
+                        Err(error) => {
+                            this.message(format!("Could not save the image: {error}"), true, cx)
+                        }
+                    }
                 }
-                Err(error) => {
-                    self.message(format!("Could not save the image: {error}"), true, cx)
+                if !links.is_empty() {
+                    editor.update(cx, |editor, cx| {
+                        let text = editor.text().clone();
+                        let len = text.len();
+                        let start = selection.start.min(len);
+                        let end = selection.end.clamp(start, len);
+                        if text.is_char_boundary(start) && text.is_char_boundary(end) {
+                            editor.set_selected_range(start..end, cx);
+                        }
+                        editor.replace(links.join("\n"), window, cx)
+                    });
                 }
-            }
-        }
-        if !links.is_empty() {
-            editor.update(cx, |editor, cx| editor.replace(links.join("\n"), window, cx));
-        }
+            });
+        })
+        .detach();
     }
 
     /// Files dropped on the document area: images are inserted into the open
@@ -1670,7 +1858,7 @@ impl Enso {
         match files::move_to_trash(&path) {
             Ok(()) => self.forget_entry(&path, cx),
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {
-                self.message(format!("Kept “{name}”: {error}"), false, cx)
+                self.toast(ui::toast::done(SharedString::from(format!("kept:{name}")), format!("Kept “{name}”"), error.to_string()), cx)
             }
             Err(error) => self.message(format!("Could not delete “{name}”: {error}"), true, cx),
         }
@@ -1827,6 +2015,12 @@ impl Enso {
             return;
         }
         let target = dir.clone();
+        let count = paths.len();
+        let busy = self.busy(
+            format!("copy-in:{}", dir.display()),
+            if count == 1 { "Copying 1 item…".to_string() } else { format!("Copying {count} items…") },
+            cx,
+        );
         let task = cx.background_executor().spawn(async move {
             paths
                 .iter()
@@ -1836,6 +2030,7 @@ impl Enso {
         cx.spawn(async move |this, cx| {
             let results = task.await;
             let _ = this.update(cx, |this, cx| {
+                this.finish(busy, None, cx);
                 let mut copied = Vec::new();
                 for result in results {
                     match result {
@@ -3233,7 +3428,24 @@ impl Render for Enso {
                                 this.set_mode(value, window, cx)
                             }))
                     }),
-                ),
+                )
+                // More document actions; for now, exporting.
+                .child({
+                    let weak = cx.entity().downgrade();
+                    ui::icon_button("document-menu", IconName::Ellipsis, "More")
+                        .small()
+                        .disabled(!markdown || self.active.is_none())
+                        .dropdown_menu(move |menu, _, _| {
+                            let weak = weak.clone();
+                            menu.item(
+                                PopupMenuItem::new("Export…")
+                                    .icon(IconName::Share)
+                                    .on_click(move |_, window, cx| {
+                                        let _ = weak.update(cx, |this, cx| this.open_export(window, cx));
+                                    }),
+                            )
+                        })
+                }),
             );
         let (custom_titlebar, standard_header) = if CUSTOM_TITLEBAR {
             let toggle_label = if self.sidebar_open {
@@ -3303,6 +3515,11 @@ impl Render for Enso {
             .on_action(cx.listener(|this, _: &OpenCommandPalette, w, cx| this.open_palette(w, cx)))
             .on_action(cx.listener(|this, _: &SearchEverything, w, cx| this.toggle_content_search(w, cx)))
             .on_action(cx.listener(|this, _: &PasteFiles, w, cx| this.paste_files(w, cx)))
+            .on_action(cx.listener(|this, _: &ExportNote, w, cx| this.open_export(w, cx)))
+            .on_action(cx.listener(|this, _: &CopyRichText, _, cx| {
+                let images = this.export_choice.images;
+                this.copy_rich_text(images, cx)
+            }))
             .on_action(cx.listener(|this, _: &OpenSelectionInsertMenu, w, cx| {
                 if !this.open_selection_insert_menu(w, cx) { cx.propagate(); }
             }))
@@ -3432,18 +3649,6 @@ impl Render for Enso {
                                         .border_color(theme.border)
                                         .text_size(px(10.))
                                         .line_height(relative(1.))
-                                        .when(self.error && self.error_shown, |bar| {
-                                            bar.child(
-                                                div()
-                                                    .absolute()
-                                                    .inset_0()
-                                                    .flex()
-                                                    .items_center()
-                                                    .justify_center()
-                                                    .text_color(theme.danger)
-                                                    .child(self.status.clone()),
-                                            )
-                                        })
                                         .child(
                                             div().text_color(theme.muted_foreground).child(stats),
                                         ),
@@ -3456,6 +3661,8 @@ impl Render for Enso {
             })
             .when_some(self.palette_overlay(window, cx), |view, overlay| view.child(overlay))
             .when_some(self.controls_overlay(window, cx), |view, overlay| view.child(overlay))
+            .when_some(self.export_overlay(window, cx), |view, overlay| view.child(overlay))
+            .when_some(self.toast_layer(window, cx), |view, layer| view.child(layer))
     }
 }
 
@@ -3464,6 +3671,7 @@ fn bind_view_keys(cx: &mut App) {
         KeyBinding::new("escape", DismissCommandPalette, Some("CommandPalette > Input")),
         KeyBinding::new("escape", DismissRichControls, Some("RichControls > Input")),
         KeyBinding::new("escape", DismissRichControls, Some("RichControls")),
+        KeyBinding::new("escape", DismissExport, Some("ExportDialog")),
         KeyBinding::new(if cfg!(target_os = "macos") { "cmd-shift-t" } else { "ctrl-shift-t" }, ReopenClosedTab, Some("Enso")),
         KeyBinding::new("ctrl-shift-p", OpenCommandPalette, Some("Enso")),
         KeyBinding::new("cmd-shift-p", OpenCommandPalette, Some("Enso")),
@@ -3875,6 +4083,9 @@ fn main() {
                         MenuItem::action("Command Palette…", OpenCommandPalette),
                         MenuItem::action("Search Everything…", SearchEverything),
                         MenuItem::separator(),
+                        MenuItem::action("Export…", ExportNote),
+                        MenuItem::action("Copy as Rich Text", CopyRichText),
+                        MenuItem::separator(),
                         MenuItem::action("Open File…", OpenFile),
                         MenuItem::action("Open Folder…", OpenFolder),
                         MenuItem::action("New File", NewFile),
@@ -4180,6 +4391,102 @@ mod transition_tests {
         draw(cx, handle);
         std::fs::remove_dir_all(root).unwrap();
         std::fs::remove_dir_all(outside).unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn export_dialog_writes_the_chosen_format(cx: &mut TestAppContext) {
+        cx.update(|cx| { gpui_kit::init(cx); bind_view_keys(cx); });
+        let root = std::env::temp_dir().join(format!("enso-export-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("pics")).unwrap();
+        image::RgbImage::new(4, 4).save(root.join("pics/p.png")).unwrap();
+        let note = root.join("Trip Notes.md");
+        let text = "# Trip\n\n![photo](pics/p.png)\n";
+        std::fs::write(&note, text).unwrap();
+        let (handle, view) = cx.update(|cx| gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+            cx.new(|cx| {
+                let mut app = Enso::new(window, cx);
+                app.add_document(Some(note.clone()), text.into(), None, window, cx);
+                app
+            })
+        }).unwrap());
+        draw(cx, handle);
+        let run = |cx: &mut TestAppContext, format, images, name: &str| {
+            cx.update_window(handle, |_, window, cx| {
+                view.update(cx, |app, cx| {
+                    app.open_export(window, cx);
+                    let dialog = app.export_dialog.as_mut().unwrap();
+                    dialog.choice.format = format;
+                    dialog.choice.images = images;
+                    cx.notify();
+                })
+            }).unwrap();
+            draw(cx, handle);
+            let target = root.join(name);
+            cx.simulate_keystrokes(handle, "enter");
+            cx.run_until_parked();
+            cx.simulate_new_path_selection(|folder| {
+                // Offered beside the note, under its name.
+                assert_eq!(folder, root.as_path());
+                Some(target)
+            });
+            cx.run_until_parked();
+            draw(cx, handle);
+        };
+        run(cx, crate::export::Format::Html, false, "a.html");
+        let html = std::fs::read_to_string(root.join("a.html")).unwrap();
+        assert!(html.contains("<h1>Trip</h1>") && !html.contains("<img"));
+        assert!(!root.join("a_files").exists());
+        run(cx, crate::export::Format::Html, true, "b.html");
+        assert!(root.join("b_files/p.png").is_file());
+        run(cx, crate::export::Format::Pdf, true, "c.pdf");
+        assert!(std::fs::read(root.join("c.pdf")).unwrap().starts_with(b"%PDF"));
+        // The dialog offers the last choice again.
+        assert!(cx.update(|cx| view.read(cx).export_choice.format) == crate::export::Format::Pdf);
+        // Each export ends in one toast (its "Exporting…" one replaced).
+        let toasts = cx.update(|cx| view.read(cx).toasts.iter().filter(|t| !t.leaving).count());
+        assert_eq!(toasts, 3);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn toasts_replace_in_place_hide_themselves_and_stay_few(cx: &mut TestAppContext) {
+        cx.update(|cx| { gpui_kit::init(cx); bind_view_keys(cx); });
+        let (handle, view) = cx.update(|cx| gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+            cx.new(|cx| Enso::new(window, cx))
+        }).unwrap());
+        let showing = |cx: &mut TestAppContext| cx.update(|cx| {
+            view.read(cx).toasts.iter().filter(|t| !t.leaving).map(|t| t.toast.title.to_string()).collect::<Vec<_>>()
+        });
+        cx.update(|cx| view.update(cx, |app, cx| {
+            app.toast(super::ui::toast::working("job", "Working…"), cx);
+            app.toast(super::ui::toast::done("job", "Done", "detail"), cx);
+        }));
+        draw(cx, handle);
+        // The spinner became the result: one toast, not two.
+        assert_eq!(showing(cx), ["Done"]);
+        cx.update(|cx| view.update(cx, |app, cx| {
+            for n in 0..5 {
+                app.toast(super::ui::toast::done(format!("n{n}"), format!("T{n}"), ""), cx);
+            }
+        }));
+        draw(cx, handle);
+        assert_eq!(showing(cx), ["T1", "T2", "T3", "T4"]);
+        // A few seconds later they leave, and are gone once faded.
+        cx.executor().advance_clock(std::time::Duration::from_secs(5));
+        draw(cx, handle);
+        assert!(showing(cx).is_empty());
+        cx.executor().advance_clock(std::time::Duration::from_secs(1));
+        draw(cx, handle);
+        draw(cx, handle);
+        assert!(cx.update(|cx| view.read(cx).toasts.is_empty()));
+        // A working toast stays until it's finished; dismissing takes it away.
+        cx.update(|cx| view.update(cx, |app, cx| app.toast(super::ui::toast::working("w", "Busy…"), cx)));
+        cx.executor().advance_clock(std::time::Duration::from_secs(10));
+        draw(cx, handle);
+        assert_eq!(showing(cx), ["Busy…"]);
+        cx.update(|cx| view.update(cx, |app, cx| app.dismiss_toast(&"w".into(), cx)));
+        assert!(showing(cx).is_empty());
     }
 
     #[gpui_kit::test]

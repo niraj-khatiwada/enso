@@ -3,7 +3,7 @@
 #
 # Run it by hand: Actions -> Release -> Run workflow. It builds every package
 # and puts them in a draft GitHub Release for the version in Cargo.toml
-# (v0.1.0 and so on), to check and publish from the Releases page. Running it
+# (v1.0.0 and so on), to check and publish from the Releases page. Running it
 # again for the same version replaces the draft's files.
 name: Release
 
