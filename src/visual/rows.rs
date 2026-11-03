@@ -148,10 +148,6 @@ impl Rows {
             })
             .unwrap_or(first)
     }
-
-    pub fn first_row(&self, bix: usize) -> usize {
-        self.starts.get(bix).copied().unwrap_or(0)
-    }
 }
 
 #[cfg(test)]

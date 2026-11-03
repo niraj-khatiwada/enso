@@ -149,6 +149,7 @@ impl Perf {
         self.frames.iter().filter(|f| **f > budget).count()
     }
 
+    #[allow(dead_code)]
     pub fn reset(&mut self) {
         self.samples.clear();
         self.frames.clear();
@@ -158,6 +159,7 @@ impl Perf {
     }
 }
 
+#[allow(dead_code)]
 pub fn percentiles(values: &mut [f64]) -> Option<[f64; 5]> {
     if values.is_empty() {
         return None;

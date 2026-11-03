@@ -8,6 +8,7 @@ use gpui_kit::*;
 use super::document::Kind;
 use super::table_edit;
 use super::view::{PAGE_TOP, VisualView};
+use crate::tokens;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TableOp {
@@ -176,7 +177,7 @@ impl VisualView {
             .bounds_for_item(first_row)
             .map(|b| b.top())
             .unwrap_or(viewport.top());
-        let top = (table_top - viewport.top()).max(px(0.)) + px(PAGE_TOP) - px(34.);
+        let top = (table_top - viewport.top()).max(px(0.)) + px(PAGE_TOP) - tokens::FLOAT_OFFSET;
         let theme = cx.theme().clone();
         let button = |id: &'static str, icon: IconName, tip: &'static str, op: TableOp| {
             Button::new(id)
@@ -194,14 +195,14 @@ impl VisualView {
         Some(
             div()
                 .absolute()
-                .top(top.max(px(2.)))
+                .top(top.max(tokens::SPACE_1))
                 .left_0()
                 .right_0()
                 .flex()
                 .justify_center()
                 .child(
                     div()
-                        .w(px(680.))
+                        .w(tokens::PAGE_WIDTH)
                         .max_w_full()
                         .px_4()
                         .flex()
@@ -243,7 +244,13 @@ impl VisualView {
                                     "Insert column right",
                                     TableOp::ColumnRight,
                                 ))
-                                .child(div().w(px(1.)).h(px(16.)).mx_0p5().bg(theme.border))
+                                .child(
+                                    div()
+                                        .w(tokens::HAIRLINE)
+                                        .h(tokens::ICON)
+                                        .mx_0p5()
+                                        .bg(theme.border),
+                                )
                                 .child(button(
                                     "table-del-row",
                                     IconName::TableRowsSplit,
@@ -256,7 +263,13 @@ impl VisualView {
                                     "Delete column",
                                     TableOp::DeleteColumn,
                                 ))
-                                .child(div().w(px(1.)).h(px(16.)).mx_0p5().bg(theme.border))
+                                .child(
+                                    div()
+                                        .w(tokens::HAIRLINE)
+                                        .h(tokens::ICON)
+                                        .mx_0p5()
+                                        .bg(theme.border),
+                                )
                                 .child(button(
                                     "table-tidy",
                                     IconName::Sparkles,

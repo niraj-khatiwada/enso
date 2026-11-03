@@ -11,9 +11,10 @@ use gpui_kit::*;
 use super::document::Kind;
 use super::image::{ImageAlign, ImageBlock};
 use super::view::{BODY_SIZE, VisualView};
+use crate::tokens;
 use gpui_kit::assets::IconName;
 
-const MIN_WIDTH: f32 = 48.;
+const MIN_WIDTH: f32 = tokens::MIN_IMAGE_WIDTH;
 
 #[derive(Clone, Copy, Debug)]
 pub struct ImageResize {
@@ -363,12 +364,12 @@ impl VisualView {
         let picture = img(source)
             .max_w_full()
             .when_some(width, |img, width| img.w(width))
-            .rounded(px(4.))
+            .rounded(tokens::RADIUS_SM)
             .with_loading(move || {
                 div()
-                    .w(px(240.))
-                    .h(px(140.))
-                    .rounded(px(4.))
+                    .w(tokens::PLACEHOLDER_WIDTH)
+                    .h(tokens::PREVIEW_HEIGHT)
+                    .rounded(tokens::RADIUS_SM)
                     .bg(surface)
                     .into_any_element()
             })
@@ -376,7 +377,7 @@ impl VisualView {
                 div()
                     .px_3()
                     .py_2()
-                    .rounded(px(4.))
+                    .rounded(tokens::RADIUS_SM)
                     .bg(surface)
                     .text_sm()
                     .text_color(muted)
@@ -387,9 +388,9 @@ impl VisualView {
             div()
                 .id(("image-resize", id))
                 .absolute()
-                .right(px(5.))
-                .bottom(px(5.))
-                .size(px(11.))
+                .right(tokens::HANDLE_INSET)
+                .bottom(tokens::HANDLE_INSET)
+                .size(tokens::HANDLE)
                 .rounded_full()
                 .bg(ring)
                 .border_2()
@@ -404,7 +405,7 @@ impl VisualView {
                             .image_bounds
                             .borrow()
                             .get(&id)
-                            .map_or(px(240.), |b| b.size.width);
+                            .map_or(tokens::PLACEHOLDER_WIDTH, |b| b.size.width);
                         this.image_resize = Some(ImageResize {
                             block: id,
                             start_x: event.position.x,
@@ -429,7 +430,7 @@ impl VisualView {
                     .relative()
                     .max_w_full()
                     .cursor_pointer()
-                    .rounded(px(5.))
+                    .rounded(tokens::RADIUS_MD)
                     .border_2()
                     .border_color(if selected {
                         ring
@@ -529,7 +530,13 @@ impl VisualView {
                     },
                 ))
             }))
-            .child(div().w(px(1.)).h(px(16.)).mx_0p5().bg(theme.border))
+            .child(
+                div()
+                    .w(tokens::HAIRLINE)
+                    .h(tokens::ICON)
+                    .mx_0p5()
+                    .bg(theme.border),
+            )
             .child(
                 button("image-edit", IconName::SquarePen, "Edit image…", false).on_click(
                     cx.listener(|this, _, window, cx| {
@@ -568,7 +575,7 @@ impl VisualView {
         };
         let preview = if preview_url.is_empty() {
             div()
-                .h(px(120.))
+                .h(tokens::PREVIEW_HEIGHT)
                 .w_full()
                 .rounded_md()
                 .bg(surface)
@@ -582,7 +589,7 @@ impl VisualView {
         } else {
             let url = preview_url.clone();
             div()
-                .h(px(140.))
+                .h(tokens::PREVIEW_HEIGHT)
                 .w_full()
                 .rounded_md()
                 .bg(surface)
@@ -592,7 +599,7 @@ impl VisualView {
                 .overflow_hidden()
                 .child(
                     img(resolve_image(self.base.as_deref(), &preview_url))
-                        .max_h(px(132.))
+                        .max_h(tokens::PREVIEW_HEIGHT - tokens::SPACE_4)
                         .max_w_full()
                         .object_fit(ObjectFit::Contain)
                         .with_fallback(move || {
@@ -642,7 +649,7 @@ impl VisualView {
                 .child(
                     div()
                         .id("image-dialog")
-                        .w(px(420.))
+                        .w(tokens::DIALOG_WIDTH)
                         .max_w_full()
                         .p_5()
                         .flex()
@@ -682,7 +689,11 @@ impl VisualView {
                             div()
                                 .flex()
                                 .gap_3()
-                                .child(div().w(px(120.)).child(field("Width (px)", &dialog.width)))
+                                .child(
+                                    div()
+                                        .w(tokens::FIELD_NARROW)
+                                        .child(field("Width (px)", &dialog.width)),
+                                )
                                 .child(
                                     div()
                                         .flex()

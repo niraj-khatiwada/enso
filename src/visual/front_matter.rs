@@ -11,6 +11,7 @@ use gpui_kit::*;
 
 use super::document::Kind;
 use super::view::{BODY_SIZE, VisualView};
+use crate::tokens;
 
 const LINE: f32 = 21.;
 
@@ -155,7 +156,7 @@ impl VisualView {
                     .rounded_lg()
                     .border_1()
                     .border_color(theme.border)
-                    .bg(theme.secondary.opacity(0.45))
+                    .bg(theme.secondary.opacity(tokens::FADED))
                     .overflow_hidden()
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .child(
@@ -164,7 +165,7 @@ impl VisualView {
                             .items_center()
                             .justify_between()
                             .px_3()
-                            .h(px(32.))
+                            .h(tokens::CONTROL_LG)
                             .text_xs()
                             .text_color(theme.muted_foreground)
                             .child(

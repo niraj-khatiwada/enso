@@ -84,6 +84,7 @@ impl LeafMap {
         best
     }
 
+    #[cfg(test)]
     pub fn is_stop(&self, index: usize) -> bool {
         !self
             .segs
@@ -162,6 +163,7 @@ impl LeafBuilder {
         self.align(value, source, base, false);
     }
 
+    #[cfg(test)]
     pub fn push_prose(&mut self, value: &str, source: &str, base: usize) {
         self.align(value, source, base, true);
     }
@@ -245,17 +247,6 @@ impl LeafBuilder {
                 j += rest.chars().next().map_or(1, char::len_utf8);
             }
         }
-    }
-
-    pub fn push_atomic(&mut self, text: &str, src: Range<usize>) {
-        let start = self.text.len();
-        self.text.push_str(text);
-        self.push_seg(Seg {
-            leaf: start..self.text.len(),
-            src,
-            linear: false,
-            line_end: text == "\n",
-        });
     }
 }
 

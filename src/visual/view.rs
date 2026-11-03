@@ -14,6 +14,7 @@ use super::document::{self, EditResult, Kind, VisualDocument};
 use super::perf::{Perf, ms};
 use super::prefs::FocusMode;
 use super::rows::Rows;
+use crate::tokens;
 
 actions!(
     visual_editor,
@@ -40,11 +41,12 @@ pub type PasteImages = Rc<dyn Fn(&ClipboardItem, &mut App) -> Option<Vec<(String
 
 pub const OPEN_PREFIX_BYTES: usize = 12 * 1024;
 
-pub const BODY_SIZE: f32 = 17.;
-pub const PAGE_TOP: f32 = 28.;
-pub const PAGE_BOTTOM: f32 = 96.;
-const FOCUS_DIM: f32 = 0.62;
-const FOCUS_FADE: Duration = Duration::from_millis(160);
+pub const BODY_SIZE: f32 = tokens::BODY_TEXT;
+pub const PAGE_TOP: f32 = tokens::PAGE_TOP;
+pub const PAGE_BOTTOM: f32 = tokens::PAGE_BOTTOM;
+const OVERDRAW: Pixels = px(600.);
+const FOCUS_DIM: f32 = tokens::FOCUS_DIM;
+const FOCUS_FADE: Duration = tokens::FOCUS_FADE;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct FocusTarget {
@@ -198,7 +200,7 @@ impl VisualView {
         let cut = document::prefix_cut(&source, OPEN_PREFIX_BYTES);
         let doc = VisualDocument::from_blocks(document::parse_blocks(&source[..cut], 0), &text);
         let rows = Rows::build(&doc);
-        let list = ListState::new(rows.len(), ListAlignment::Top, px(600.));
+        let list = ListState::new(rows.len(), ListAlignment::Top, OVERDRAW);
         let render_cx = RenderContext::from_app(cx).with_body_font_size(px(BODY_SIZE));
         let caret = doc
             .blocks
@@ -266,10 +268,12 @@ impl VisualView {
         view
     }
 
+    #[allow(dead_code)]
     pub fn loading(&self) -> bool {
         self.background.loading
     }
 
+    #[allow(dead_code)]
     pub fn parse_pending(&self) -> bool {
         self.background.task.is_some()
     }
@@ -523,6 +527,7 @@ impl VisualView {
         })
     }
 
+    #[cfg(test)]
     pub fn focus_fade_active(&self) -> Option<&FocusTarget> {
         self.focus_fade.as_ref().map(|(old, _)| old)
     }
@@ -586,8 +591,8 @@ impl VisualView {
             .into_iter()
             .map(|(y, left, right)| {
                 Bounds::new(
-                    point(left - px(2.), y),
-                    size(right - left + px(4.), line_height),
+                    point(left - tokens::SPACE_1, y),
+                    size(right - left + tokens::SPACE_2, line_height),
                 )
             })
             .collect()
@@ -624,8 +629,8 @@ impl VisualView {
                     break;
                 }
                 let row = Bounds::new(
-                    point(row.left() - px(8.), row.top()),
-                    size(row.size.width + px(16.), row.size.height),
+                    point(row.left() - tokens::SPACE_4, row.top()),
+                    size(row.size.width + tokens::SPACE_6, row.size.height),
                 );
                 let inside: Vec<Bounds<Pixels>> = clear
                     .iter()
@@ -778,20 +783,30 @@ impl VisualView {
         let theme = cx.theme();
         let color = theme.muted_foreground;
         let active = self.guide_drag.is_some();
-        let dashes = (0..56).map(move |_| div().w(px(6.)).h(px(1.)).flex_shrink_0().bg(color));
+        let dashes = (0..56).map(move |_| {
+            div()
+                .w(tokens::SPACE_3)
+                .h(tokens::HAIRLINE)
+                .flex_shrink_0()
+                .bg(color)
+        });
         Some(
             div()
                 .id("typewriter-guide")
                 .absolute()
-                .top(px(PAGE_TOP) + y - px(6.))
+                .top(px(PAGE_TOP) + y - tokens::SPACE_3)
                 .left_0()
                 .right_0()
-                .h(px(13.))
+                .h(tokens::GUIDE_HIT)
                 .flex()
                 .justify_center()
                 .cursor_row_resize()
-                .opacity(if active { 0.7 } else { 0.18 })
-                .hover(|guide| guide.opacity(0.55))
+                .opacity(if active {
+                    tokens::GUIDE_ACTIVE
+                } else {
+                    tokens::GUIDE_REST
+                })
+                .hover(|guide| guide.opacity(tokens::GUIDE_HOVER))
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(|this, _: &MouseDownEvent, _, cx| {
@@ -802,14 +817,14 @@ impl VisualView {
                 )
                 .child(
                     div()
-                        .w(px(680.))
+                        .w(tokens::PAGE_WIDTH)
                         .max_w_full()
                         .px_4()
                         .h_full()
                         .flex()
                         .items_center()
                         .overflow_hidden()
-                        .child(div().flex().gap(px(6.)).children(dashes)),
+                        .child(div().flex().gap(tokens::SPACE_3).children(dashes)),
                 )
                 .into_any_element(),
         )
@@ -1136,16 +1151,20 @@ impl VisualView {
                 let index = g.index_for_position(point(goal, y));
                 let at = g.position_for_index(index);
                 let moved = if down {
-                    at.y > top.y + px(0.5)
+                    at.y > top.y + tokens::NUDGE
                 } else {
-                    at.y < top.y - px(0.5)
+                    at.y < top.y - tokens::NUDGE
                 };
                 if moved && let Some((bix, lix)) = self.doc.leaf_by_key(key) {
                     self.caret = self.doc.src_of(bix, lix, index);
                     return true;
                 }
             }
-            y += if down { px(2.) } else { px(-2.) };
+            y += if down {
+                tokens::SPACE_1
+            } else {
+                -tokens::SPACE_1
+            };
         }
         false
     }
@@ -1159,7 +1178,9 @@ impl VisualView {
             cx.notify();
             return;
         }
-        let step = self.caret_position().map_or(px(40.), |(_, h, _)| h * 2.);
+        let step = self
+            .caret_position()
+            .map_or(px(BODY_SIZE) * 2., |(_, h, _)| h * 2.);
         self.list.scroll_by(if down { step } else { -step });
         self.pending_vertical = Some(down);
         cx.notify();
@@ -1290,13 +1311,13 @@ impl VisualView {
             return;
         }
         let viewport = self.list.viewport_bounds();
-        let edge = px(24.);
+        let edge = tokens::AUTOSCROLL_EDGE;
         if event.position.y < viewport.top() + edge {
             self.list
-                .scroll_by((event.position.y - viewport.top() - edge).min(px(-4.)));
+                .scroll_by((event.position.y - viewport.top() - edge).min(-tokens::SPACE_2));
         } else if event.position.y > viewport.bottom() - edge {
             self.list
-                .scroll_by((event.position.y - viewport.bottom() + edge).max(px(4.)));
+                .scroll_by((event.position.y - viewport.bottom() + edge).max(tokens::SPACE_2));
         }
         if let Some(src) = self.source_for_point(event.position) {
             self.anchor.get_or_insert(self.caret);
@@ -1546,7 +1567,7 @@ impl VisualView {
             } else {
                 theme.success
             };
-            div().w(px(2.)).h(px(height)).bg(color)
+            div().w(tokens::SPACE_1).h(px(height)).bg(color)
         });
         let last = perf.samples.last();
         let line = |s: String| div().child(s);
@@ -1564,8 +1585,8 @@ impl VisualView {
                 .font_family("monospace")
                 .child(
                     div()
-                        .h(px(60.))
-                        .w(px(240.))
+                        .h(tokens::BAR + tokens::SPACE_6)
+                        .w(tokens::PLACEHOLDER_WIDTH)
                         .flex()
                         .items_end()
                         .gap(px(0.))
@@ -1645,7 +1666,7 @@ impl Render for VisualView {
         });
         let page = div().size_full().flex().justify_center().child(
             div()
-                .w(px(680.))
+                .w(tokens::PAGE_WIDTH)
                 .max_w_full()
                 .h_full()
                 .px_4()
@@ -1653,7 +1674,7 @@ impl Render for VisualView {
                 .flex()
                 .flex_col()
                 .text_size(px(self.text_size))
-                .line_height(px((self.text_size * 1.53).round()))
+                .line_height(px((self.text_size * tokens::LINE_RATIO).round()))
                 .child(list),
         );
         let outline = window.is_a11y_enabled().then(|| self.a11y_outline());

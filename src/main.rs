@@ -8,6 +8,7 @@ mod settings;
 mod shell_perf;
 mod stats;
 #[allow(dead_code)]
+mod tokens;
 mod visual;
 mod workspaces;
 
@@ -413,7 +414,7 @@ impl Enso {
             rename_input,
             closing: None,
             sidebar_open: true,
-            sidebar_width: px(248.),
+            sidebar_width: tokens::SIDEBAR_WIDTH,
             focus_after_close: false,
             hovered_tab: None,
             tab_scroll: ScrollHandle::new(),
@@ -641,7 +642,7 @@ impl Enso {
                 return false;
             };
             let delta = bounds.top() - viewport.top() - y;
-            if delta.abs() < px(1.) {
+            if delta.abs() < tokens::HAIRLINE {
                 return true;
             }
             let offset = state.scroll_offset();
@@ -1758,12 +1759,12 @@ impl Enso {
                     h_resizable(("document-split", document.editor.entity_id()))
                         .child(
                             resizable_panel()
-                                .size_range(px(180.)..Pixels::MAX)
+                                .size_range(tokens::PANE_MIN..Pixels::MAX)
                                 .child(editor),
                         )
                         .child(
                             resizable_panel()
-                                .size_range(px(180.)..Pixels::MAX)
+                                .size_range(tokens::PANE_MIN..Pixels::MAX)
                                 .child(reader),
                         ),
                 ),
@@ -1938,7 +1939,7 @@ impl Enso {
                                     return;
                                 }
                                 let width = (event.event.position.x - event.bounds.left())
-                                    .clamp(px(160.), px(480.));
+                                    .clamp(tokens::SIDEBAR_MIN, tokens::SIDEBAR_MAX);
                                 if this.sidebar_width != width {
                                     this.sidebar_width = width;
                                     cx.notify();
@@ -2058,7 +2059,7 @@ impl Enso {
                         h_flex()
                             .id(("file-tab", editor_id))
                             .flex_shrink_0()
-                            .h(px(28.))
+                            .h(tokens::CONTROL)
                             .pl_2p5()
                             .pr_1()
                             .gap_0p5()
@@ -2082,7 +2083,7 @@ impl Enso {
                             .when(active, |tab| tab.bg(theme.secondary))
                             .when(!active, |tab| {
                                 tab.text_color(theme.muted_foreground)
-                                    .hover(|tab| tab.bg(theme.secondary.opacity(0.6)))
+                                    .hover(|tab| tab.bg(theme.secondary.opacity(tokens::HOVER)))
                             })
                             .child(
                                 div()
@@ -2100,7 +2101,7 @@ impl Enso {
                                 tab.child(
                                     h_flex()
                                         .w(px(20. * reveal))
-                                        .h(px(20.))
+                                        .h(tokens::CONTROL_SM)
                                         .flex_shrink_0()
                                         .overflow_hidden()
                                         .child(
@@ -2113,8 +2114,8 @@ impl Enso {
                                                     "Close {}",
                                                     document.title()
                                                 ))
-                                                .w(px(20.))
-                                                .h(px(20.))
+                                                .w(tokens::CONTROL_SM)
+                                                .h(tokens::CONTROL_SM)
                                                 .flex_shrink_0()
                                                 .opacity(reveal)
                                                 .disabled(!hovered)
@@ -2144,7 +2145,7 @@ impl Enso {
         }
         let document_header = h_flex()
             .size_full()
-            .h(px(44.))
+            .h(tokens::BAR)
             .when(CUSTOM_TITLEBAR, |header| header.flex_1())
             .when(!CUSTOM_TITLEBAR, |header| header.w_full().flex_shrink_0())
             .min_w_0()
@@ -2242,7 +2243,7 @@ impl Enso {
                                         .text_color(theme.muted_foreground)
                                         .when(
                                             !(self.switcher_hovered || self.switcher_open),
-                                            |icon| icon.opacity(0.),
+                                            |icon| icon.opacity(tokens::HIDDEN),
                                         ),
                                 ),
                         )
@@ -2265,17 +2266,17 @@ impl Enso {
                     let item = |id: ElementId| {
                         h_flex()
                             .id(id)
-                            .h(px(28.))
+                            .h(tokens::CONTROL)
                             .px_2()
                             .gap_1p5()
                             .items_center()
                             .rounded_md()
                             .cursor_pointer()
                             .text_sm()
-                            .hover(|row| row.bg(theme.secondary.opacity(0.6)))
+                            .hover(|row| row.bg(theme.secondary.opacity(tokens::HOVER)))
                     };
                     v_flex()
-                        .w(px(240.))
+                        .w(tokens::MENU_WIDTH)
                         .p_1()
                         .children(recent.iter().enumerate().map(|(i, recent)| {
                             let path = recent.path.clone();
@@ -2283,7 +2284,7 @@ impl Enso {
                             let exists = recent.exists();
                             let weak = weak.clone();
                             item(("workspace", i).into())
-                                .when(!exists, |row| row.opacity(0.55))
+                                .when(!exists, |row| row.opacity(tokens::MISSING))
                                 .child(
                                     Icon::new(if current {
                                         IconName::Check
@@ -2320,8 +2321,8 @@ impl Enso {
                                         // Only shown on the row under the pointer.
                                         h_flex()
                                             .flex_shrink_0()
-                                            .opacity(0.)
-                                            .group_hover(group, |s| s.opacity(1.))
+                                            .opacity(tokens::HIDDEN)
+                                            .group_hover(group, |s| s.opacity(tokens::SHOWN))
                                             .child(
                                                 Button::new(("reveal-workspace", i))
                                                     .ghost()
@@ -2386,7 +2387,7 @@ impl Enso {
                                     });
                                 })
                         }))
-                        .child(div().my_1().h(px(1.)).bg(theme.border))
+                        .child(div().my_1().h(tokens::HAIRLINE).bg(theme.border))
                         .child({
                             let weak = weak.clone();
                             item("workspace-open".into())
@@ -2415,7 +2416,7 @@ impl Enso {
             // through, so only there it gets a veil of the sidebar color.
             .when(!backdrop, |sidebar| sidebar.bg(theme.sidebar))
             .when(backdrop && theme.mode.is_dark(), |sidebar| {
-                sidebar.bg(theme.sidebar.opacity(0.6))
+                sidebar.bg(theme.sidebar.opacity(tokens::VEIL))
             })
             .border_r_1()
             .border_color(theme.border)
@@ -2511,7 +2512,7 @@ impl Enso {
                             .into_owned();
                         // Tree threads use the text color, faded: light lines on
                         // dark, dark lines on light, and visible over the tint.
-                        let line = theme.foreground.opacity(0.25);
+                        let line = theme.foreground.opacity(tokens::SUBTLE);
                         let half = px(TREE_INDENT / 2.);
                         let mid = px(TREE_ROW_HEIGHT / 2.);
                         let depth = threads.len();
@@ -2553,7 +2554,7 @@ impl Enso {
                                             .h(mid)
                                             .border_l_1()
                                             .border_b_1()
-                                            .rounded_bl(px(6.))
+                                            .rounded_bl(tokens::RADIUS_MD)
                                             .border_color(line),
                                     )
                                     .when(!last, |col| {
@@ -2583,17 +2584,17 @@ impl Enso {
                             // Selection is a soft tint; the darker text carries it.
                             .when(active, |row| row.font_weight(FontWeight::MEDIUM))
                             .when(active || renaming, |row| {
-                                row.bg(theme.secondary.opacity(0.5))
+                                row.bg(theme.secondary.opacity(tokens::ACTIVE))
                             })
                             .when(!active && !renaming, |row| {
                                 row.text_color(muted)
-                                    .hover(|row| row.bg(theme.secondary.opacity(0.35)))
+                                    .hover(|row| row.bg(theme.secondary.opacity(tokens::HOVER)))
                             })
                             .children(guides)
                             .child(
                                 div()
                                     .flex_shrink_0()
-                                    .w(px(16.))
+                                    .w(tokens::ICON)
                                     .flex()
                                     .items_center()
                                     .justify_center()
@@ -2769,7 +2770,7 @@ impl Enso {
         h_flex()
             .relative()
             .w_full()
-            .h(px(20.))
+            .h(tokens::STATUS_BAR)
             .flex_shrink_0()
             .items_center()
             .overflow_hidden()
@@ -2779,7 +2780,7 @@ impl Enso {
             .justify_end()
             .border_t_1()
             .border_color(theme.border)
-            .text_size(px(10.))
+            .text_size(tokens::CAPTION_TEXT)
             .line_height(relative(1.))
             .when(self.error && self.error_shown, |bar| {
                 bar.child(
@@ -2820,16 +2821,16 @@ impl Enso {
         let style = match part {
             Part::Sidebar => StyleRefinement::default().size_full(),
             Part::Header if CUSTOM_TITLEBAR => {
-                StyleRefinement::default().flex_1().min_w_0().h(px(44.))
+                StyleRefinement::default().flex_1().min_w_0().h(tokens::BAR)
             }
             Part::Header => StyleRefinement::default()
                 .w_full()
                 .flex_shrink_0()
-                .h(px(44.)),
+                .h(tokens::BAR),
             Part::Status => StyleRefinement::default()
                 .w_full()
                 .flex_shrink_0()
-                .h(px(20.)),
+                .h(tokens::STATUS_BAR),
         };
         AnyView::from(view).cached(style).into_any_element()
     }
@@ -3007,14 +3008,17 @@ fn open_enso_window(
 ) {
     // Cascade each new window off the ones already open.
     let offset = px(28. * open_views(cx).len() as f32);
-    let mut bounds = Bounds::centered(None, size(px(1180.), px(780.)), cx);
+    let mut bounds = Bounds::centered(None, size(px(tokens::WINDOW.0), px(tokens::WINDOW.1)), cx);
     bounds.origin.x += offset;
     bounds.origin.y += offset;
     let opened = gpui_kit::open_window(
         WindowOptions {
             titlebar: Some(if CUSTOM_TITLEBAR {
                 TitlebarOptions {
-                    traffic_light_position: Some(point(px(12.), px(TITLEBAR_HEIGHT / 2. - 7.))),
+                    traffic_light_position: Some(point(
+                        tokens::SPACE_5,
+                        px(TITLEBAR_HEIGHT / 2. - 7.),
+                    )),
                     ..TitleBar::title_bar_options()
                 }
             } else {
@@ -3025,7 +3029,7 @@ fn open_enso_window(
             }),
             app_owns_titlebar_drag: CUSTOM_TITLEBAR,
             window_bounds: Some(WindowBounds::Windowed(bounds)),
-            window_min_size: Some(size(px(800.), px(500.))),
+            window_min_size: Some(size(px(tokens::WINDOW_MIN.0), px(tokens::WINDOW_MIN.1))),
             window_background: window_backdrop(),
             // Linux docks and task switchers find Enso's icon and name through
             // the .desktop file of this id (scripts/install-linux.sh).

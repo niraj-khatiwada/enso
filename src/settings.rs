@@ -1,3 +1,4 @@
+use crate::tokens;
 use crate::visual::prefs::{BLINK_CELLS, CaretColor, FocusMode, WritingPrefs};
 use gpui_kit::assets::IconName;
 use gpui_kit::component::{
@@ -191,9 +192,9 @@ fn thin_scrollbars(cx: &mut App) {
         .scrollbar
         .styles()
         .clone()
-        .thumb(|thumb| thumb.width(px(3.)).inset(px(2.)))
-        .thumb_hover(|thumb| thumb.width(px(4.)).inset(px(2.)))
-        .thumb_active(|thumb| thumb.width(px(4.)).inset(px(2.)));
+        .thumb(|thumb| thumb.width(tokens::SCROLL_THUMB).inset(tokens::SPACE_1))
+        .thumb_hover(|thumb| thumb.width(tokens::SPACE_2).inset(tokens::SPACE_1))
+        .thumb_active(|thumb| thumb.width(tokens::SPACE_2).inset(tokens::SPACE_1));
     base.scrollbar = base.scrollbar.clone().with_styles(styles);
     cx.refresh_windows();
 }
@@ -263,7 +264,10 @@ pub fn open(cx: &mut App) {
         WindowOptions {
             titlebar: Some(if cfg!(target_os = "macos") {
                 TitlebarOptions {
-                    traffic_light_position: Some(point(px(12.), px(14.))),
+                    traffic_light_position: Some(point(
+                        tokens::SPACE_5,
+                        tokens::BAR / 2. - tokens::SPACE_4,
+                    )),
                     ..TitleBar::title_bar_options()
                 }
             } else {
@@ -275,10 +279,13 @@ pub fn open(cx: &mut App) {
             app_owns_titlebar_drag: cfg!(target_os = "macos"),
             window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
                 None,
-                size(px(760.), px(480.)),
+                size(px(tokens::SETTINGS_WINDOW.0), px(tokens::SETTINGS_WINDOW.1)),
                 cx,
             ))),
-            window_min_size: Some(size(px(680.), px(420.))),
+            window_min_size: Some(size(
+                px(tokens::SETTINGS_WINDOW_MIN.0),
+                px(tokens::SETTINGS_WINDOW_MIN.1),
+            )),
             ..Default::default()
         },
         cx,
@@ -384,7 +391,7 @@ fn segmented<T: Copy + PartialEq + 'static>(
         .p_0p5()
         .gap_0p5()
         .rounded_md()
-        .bg(theme.secondary.opacity(0.5))
+        .bg(theme.secondary.opacity(tokens::FADED))
         .children(choices.into_iter().enumerate().map(|(i, (value, label))| {
             let on_pick = on_pick.clone();
             let active = value == selected;
@@ -414,11 +421,11 @@ fn preview(appearance: Appearance) -> impl IntoElement {
     };
     h_flex()
         .w_full()
-        .h(px(66.))
+        .h(tokens::SETTING_PREVIEW)
         .rounded_md()
         .overflow_hidden()
         .border_1()
-        .border_color(rgb(0x888888).opacity(0.2))
+        .border_color(rgb(0x888888).opacity(tokens::SUBTLE))
         .children(halves.iter().map(|dark| {
             let background = if *dark { rgb(0x202124) } else { rgb(0xffffff) };
             let sidebar = if *dark { rgb(0x2e3034) } else { rgb(0xf0f1f3) };
@@ -427,20 +434,32 @@ fn preview(appearance: Appearance) -> impl IntoElement {
                 .flex_1()
                 .h_full()
                 .bg(background)
-                .child(div().w(px(18.)).h_full().bg(sidebar))
+                .child(div().w(tokens::PREVIEW_SIDEBAR).h_full().bg(sidebar))
                 .child(
                     v_flex()
                         .flex_1()
                         .p_2()
                         .gap_2()
-                        .child(div().w(relative(0.7)).h(px(4.)).rounded_sm().bg(ink))
-                        .child(div().w_full().h(px(3.)).rounded_sm().bg(ink.opacity(0.5)))
+                        .child(
+                            div()
+                                .w(relative(0.7))
+                                .h(tokens::SPACE_2)
+                                .rounded_sm()
+                                .bg(ink),
+                        )
+                        .child(
+                            div()
+                                .w_full()
+                                .h(tokens::SCROLL_THUMB)
+                                .rounded_sm()
+                                .bg(ink.opacity(tokens::FADED)),
+                        )
                         .child(
                             div()
                                 .w(relative(0.8))
-                                .h(px(3.))
+                                .h(tokens::SCROLL_THUMB)
                                 .rounded_sm()
-                                .bg(ink.opacity(0.5)),
+                                .bg(ink.opacity(tokens::FADED)),
                         ),
                 )
         }))
@@ -493,7 +512,7 @@ impl SettingsWindow {
                                         .ghost()
                                         .flex_1()
                                         .min_w_0()
-                                        .h(px(132.))
+                                        .h(tokens::SETTING_CARD)
                                         .p_3()
                                         .border_1()
                                         .border_color(if selected == appearance {
@@ -627,7 +646,7 @@ impl SettingsWindow {
             let active = prefs.caret_color == value;
             div()
                 .id(("caret-color", id))
-                .size(px(24.))
+                .size(tokens::SWATCH)
                 .rounded_full()
                 .bg(fill)
                 .border_2()
@@ -657,13 +676,13 @@ impl SettingsWindow {
             let on = prefs.blink_pattern & (1 << i) != 0;
             div()
                 .id(("blink-cell", i as usize))
-                .w(px(14.))
-                .h(px(20.))
+                .w(tokens::ICON_SM)
+                .h(tokens::CONTROL_SM)
                 .rounded_sm()
                 .border_1()
                 .border_color(theme.border)
-                .when(on, |c| c.bg(theme.foreground.opacity(0.75)))
-                .when(!prefs.caret_blink, |c| c.opacity(0.4))
+                .when(on, |c| c.bg(theme.foreground.opacity(tokens::ACTIVE)))
+                .when(!prefs.caret_blink, |c| c.opacity(tokens::DISABLED))
                 .cursor_pointer()
                 .on_click(move |_, _, cx| cell(i, cx))
         }));
@@ -798,7 +817,7 @@ impl Render for SettingsWindow {
             .on_action(|_: &CloseSettings, window, _| window.remove_window())
             .when(cfg!(target_os = "macos"), |view| {
                 view.child(
-                    TitleBar::new().h(px(44.)).bg(theme.background).child(
+                    TitleBar::new().h(tokens::BAR).bg(theme.background).child(
                         h_flex()
                             .h_full()
                             .items_center()
@@ -813,7 +832,7 @@ impl Render for SettingsWindow {
                     .items_start()
                     .child(
                         v_flex()
-                            .w(px(180.))
+                            .w(tokens::NAV_WIDTH)
                             .h_full()
                             .flex_shrink_0()
                             .p_3()
@@ -825,7 +844,7 @@ impl Render for SettingsWindow {
                                 let active = item == category;
                                 h_flex()
                                     .id(("settings-category", i))
-                                    .h(px(30.))
+                                    .h(tokens::CONTROL)
                                     .px_2()
                                     .gap_2()
                                     .items_center()
@@ -833,12 +852,13 @@ impl Render for SettingsWindow {
                                     .cursor_pointer()
                                     .text_sm()
                                     .when(active, |row| {
-                                        row.bg(theme.secondary.opacity(0.5))
+                                        row.bg(theme.secondary.opacity(tokens::ACTIVE))
                                             .font_weight(FontWeight::MEDIUM)
                                     })
                                     .when(!active, |row| {
-                                        row.text_color(theme.muted_foreground)
-                                            .hover(|row| row.bg(theme.secondary.opacity(0.35)))
+                                        row.text_color(theme.muted_foreground).hover(|row| {
+                                            row.bg(theme.secondary.opacity(tokens::HOVER))
+                                        })
                                     })
                                     .child(item.icon())
                                     .child(item.label())

@@ -5,6 +5,9 @@ use gpui_kit::{prelude::FluentBuilder, *};
 use std::{ops::Range, path::PathBuf, sync::Arc};
 
 const SECTION_BYTES: usize = 2048;
+const SECTION_ESTIMATE: Pixels = px(900.);
+const OVERDRAW: Pixels = px(400.);
+
 pub const LARGE_DOCUMENT_BYTES: usize = 256 * 1024;
 /// Where text starts in the reading view, matching where GPUI Kit's editor
 /// draws it with line numbers off (6 px padding + 6 px gutter margin across,
@@ -158,7 +161,7 @@ impl LargeReader {
     pub fn replace(&mut self, source: Arc<String>, sections: Vec<Section>, cx: &mut Context<Self>) {
         let offset = self.list.logical_scroll_top();
         self.list
-            .reset_with_uniform_height(sections.len(), px(900.));
+            .reset_with_uniform_height(sections.len(), SECTION_ESTIMATE);
         self.list.scroll_to(offset);
         self.source = source;
         self.sections = Arc::new(sections);
@@ -169,8 +172,8 @@ impl LargeReader {
     }
 
     pub fn new(source: Arc<String>, sections: Vec<Section>, base: Option<PathBuf>) -> Self {
-        let list = ListState::new(sections.len(), ListAlignment::Top, px(400.))
-            .with_uniform_item_height(px(900.));
+        let list = ListState::new(sections.len(), ListAlignment::Top, OVERDRAW)
+            .with_uniform_item_height(SECTION_ESTIMATE);
         Self {
             source,
             sections: Arc::new(sections),
@@ -199,7 +202,7 @@ impl Render for LargeReader {
             let link_base = base.clone();
             div()
                 .w_full()
-                .min_h(px(24.))
+                .min_h(crate::tokens::SPACE_7)
                 .pl(px(TEXT_INSET_X))
                 // Clear of the scrollbar at the pane's right edge.
                 .pr_4()

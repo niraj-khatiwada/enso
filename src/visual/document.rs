@@ -269,6 +269,7 @@ pub fn prefix_cut(text: &str, target: usize) -> usize {
 }
 
 impl VisualDocument {
+    #[cfg(test)]
     pub fn parse(text: &str) -> Self {
         Self::from_blocks(parse_blocks(text, 0), &Rope::from(text))
     }
