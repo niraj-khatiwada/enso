@@ -152,9 +152,32 @@ Typing is built to fit inside a 120 Hz frame on documents of hundreds of kilobyt
 
 The source editor also has ⌘F find, ⌘⇧F replace, ⌘] / ⌘[ to indent and outdent lines, and ⌥⌘↑ / ⌥⌘↓ to add cursors.
 
-## Build
+## Install on macOS
 
-Install Rust with rustup; `rust-toolchain.toml` pins the version.
+### 1. One-time setup
+
+| Step | Command |
+|---|---|
+| Install Xcode from the App Store, open it once, accept the license | `sudo xcodebuild -license accept` |
+| Use Xcode's tools (the Metal shader compiler and Swift) | `sudo xcode-select -s /Applications/Xcode.app` |
+| Install Rust, then open a new terminal | `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \| sh` |
+
+`rust-toolchain.toml` pins the Rust version; rustup downloads it on the first build.
+
+### 2. Get the code
+
+```sh
+git clone https://github.com/viai957/enso.git
+cd enso
+```
+
+If the repository is private, let Cargo fetch the pinned `gpui-base` branch with your git login:
+
+```sh
+export CARGO_NET_GIT_FETCH_WITH_CLI=true
+```
+
+### 3. Run it
 
 ```sh
 cargo run
@@ -162,7 +185,30 @@ cargo run -- /absolute/path/to/note.md
 cargo run -- /absolute/path/to/folder
 ```
 
-On macOS, `make` lists the build targets. `make build.macos` produces `target/enso.app` with its Quick Look extension, ad-hoc signed, and a disk image. `make install` copies the app to `/Applications`. `make bench` runs the editor benchmarks.
+The first build takes several minutes; later builds are incremental.
+
+### 4. Install the app
+
+| Command | Result |
+|---|---|
+| `make app` | `target/enso.app` with its Quick Look extension |
+| `make install` | Copies it to `/Applications` and registers Quick Look (Space-bar previews of Markdown in Finder) |
+| `make build.macos` | A release build and a disk image, `target/enso-<version>-<arch>.dmg` |
+| `make` | Lists every target |
+
+The app is signed locally, not notarized: the first time, right-click `enso.app` and choose **Open**.
+
+### Troubleshooting
+
+| Problem | Fix |
+|---|---|
+| `xcrun: error: unable to find utility "metal"` | Install the full Xcode app and run the `xcode-select` command above |
+| Cargo cannot fetch `gpui-base` | `export CARGO_NET_GIT_FETCH_WITH_CLI=true`, and check that `git clone` of this repository works |
+| "enso can't be opened" | Right-click the app, choose **Open**, then confirm |
+
+## Other platforms and releases
+
+On Windows and Linux, `cargo run` works the same way once GPUI's build dependencies are installed (see below).
 
 On the first launch without arguments, enso opens an editable `Get Started.md` from its application data folder.
 
