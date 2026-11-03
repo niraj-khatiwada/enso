@@ -106,6 +106,7 @@ enum Choice {
     Table,
     CodeBlock,
     Mermaid,
+    Drawing,
     Divider,
     Footnote,
     Highlight,
@@ -125,6 +126,7 @@ enum Choice {
     ToggleLock,
     RenameFile,
     DeleteFile,
+    NewDrawing,
 }
 impl Choice {
     fn key(&self) -> String {
@@ -143,6 +145,7 @@ impl Choice {
             Self::Table => "table".into(),
             Self::CodeBlock => "code-block".into(),
             Self::Mermaid => "mermaid-diagram".into(),
+            Self::Drawing => "drawing".into(),
             Self::Divider => "divider".into(),
             Self::Footnote => "footnote".into(),
             Self::Highlight => "highlight".into(),
@@ -164,6 +167,7 @@ impl Choice {
             Self::ToggleLock => "lock-page".into(),
             Self::RenameFile => "rename-file".into(),
             Self::DeleteFile => "delete-file".into(),
+            Self::NewDrawing => "new-drawing".into(),
         }
     }
 
@@ -346,6 +350,12 @@ impl Enso {
                     None,
                 ),
                 entry(
+                    "Drawing",
+                    &["draw", "sketch", "excalidraw", "whiteboard", "canvas"],
+                    Choice::Drawing,
+                    None,
+                ),
+                entry(
                     "Quote",
                     &["blockquote", "citation"],
                     Choice::Block(Block::Quote),
@@ -510,6 +520,14 @@ impl Enso {
                 },
                 &["reveal", "file manager", "folder"],
                 Choice::Reveal,
+                None,
+            ));
+        }
+        if self.root.is_some() {
+            app.push(entry(
+                "New Drawing",
+                &["draw", "sketch", "excalidraw", "whiteboard", "diagram"],
+                Choice::NewDrawing,
                 None,
             ));
         }
@@ -724,6 +742,7 @@ impl Enso {
                     self.rename_file(path, window, cx);
                 }
             }
+            Choice::NewDrawing => self.new_drawing(cx),
             Choice::DeleteFile => {
                 if let Some(path) = self.active.and_then(|i| self.documents[i].path.clone()) {
                     self.delete_entry(path, window, cx);
@@ -772,6 +791,7 @@ impl Enso {
                         }
                         Choice::Divider => insert(&editor, "\n\n---\n\n".into(), window, cx),
                         Choice::Mermaid => insert_mermaid(&editor, window, cx),
+                        Choice::Drawing => self.embed_drawing(&editor, window, cx),
                         Choice::Highlight => self.open_highlight(editor.clone(), slash, window, cx),
                         Choice::Date => insert(
                             &editor,
@@ -1399,6 +1419,7 @@ fn is_insert(choice: &Choice) -> bool {
             | Choice::ToggleLock
             | Choice::RenameFile
             | Choice::DeleteFile
+            | Choice::NewDrawing
     )
 }
 
@@ -1408,8 +1429,23 @@ const MERMAID_STARTER: &str = "flowchart LR\n  source[Markdown] --> parse --> do
 /// A Mermaid block on its own lines at the selection, its starter diagram
 /// selected so typing replaces it.
 fn insert_mermaid(editor: &Entity<EditorState>, window: &mut Window, cx: &mut App) {
-    let source = editor.read(cx).value().to_string();
     let range = editor.read(cx).selected_range();
+    let (lead, tail) = block_gaps(editor, cx);
+    let fence = "```mermaid\n";
+    let text = format!("{lead}{fence}{MERMAID_STARTER}\n```{tail}");
+    editor.update(cx, |state, cx| {
+        state.replace(text, window, cx);
+        let start = range.start + lead.len() + fence.len();
+        state.set_selected_range(start..start + MERMAID_STARTER.len(), cx);
+    });
+}
+
+/// The blank lines a block needs before and after the selection to stand on
+/// its own lines.
+fn block_gaps(editor: &Entity<EditorState>, cx: &App) -> (&'static str, &'static str) {
+    let state = editor.read(cx);
+    let source = state.value();
+    let range = state.selected_range();
     let before = &source[..range.start];
     let after = &source[range.end..];
     let lead = if before.is_empty() || before.ends_with("\n\n") {
@@ -1426,13 +1462,14 @@ fn insert_mermaid(editor: &Entity<EditorState>, window: &mut Window, cx: &mut Ap
     } else {
         "\n\n"
     };
-    let fence = "```mermaid\n";
-    let text = format!("{lead}{fence}{MERMAID_STARTER}\n```{tail}");
-    editor.update(cx, |state, cx| {
-        state.replace(text, window, cx);
-        let start = range.start + lead.len() + fence.len();
-        state.set_selected_range(start..start + MERMAID_STARTER.len(), cx);
-    });
+    (lead, tail)
+}
+
+/// A block of `text` on its own lines at the selection.
+pub(crate) fn insert_block(editor: &Entity<EditorState>, text: &str, window: &mut Window, cx: &mut App) {
+    let (lead, tail) = block_gaps(editor, cx);
+    let text = format!("{lead}{text}{tail}");
+    editor.update(cx, |state, cx| state.replace(text, window, cx));
 }
 
 fn apply_palette_markdown(

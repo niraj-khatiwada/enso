@@ -671,16 +671,27 @@ fn render_picture(
     let picture = node.data::<Picture>().unwrap().clone();
     // A locked note's images can be viewed, copied and saved, not changed.
     let locked = owner.upgrade().is_some_and(|app| app.read(cx).is_locked(editor_id));
-    let source = if !picture.src.contains(':') {
-        ImageSource::from(
-            base.as_ref()
-                .map(|b| b.join(&picture.src))
-                .unwrap_or_else(|| PathBuf::from(&picture.src)),
-        )
-    } else {
-        ImageSource::from(SharedString::from(picture.src.clone()))
+    let local = (!picture.src.contains(':')).then(|| {
+        base.as_ref()
+            .map(|b| b.join(&picture.src))
+            .unwrap_or_else(|| PathBuf::from(&picture.src))
+    });
+    // A drawing (`.excalidraw`) shows as its picture, in the page's theme.
+    let drawn = local
+        .as_ref()
+        .filter(|path| crate::drawing::is_drawing(path))
+        .and_then(|path| crate::drawing::picture(path, cx.theme().mode.is_dark()));
+    // A drawing with nothing in it yet.
+    let blank = drawn.is_none() && local.as_ref().is_some_and(|p| crate::drawing::is_drawing(p));
+    let source = match (&drawn, local) {
+        (Some(drawn), _) => ImageSource::from(drawn.image.clone()),
+        (None, Some(path)) => ImageSource::from(path),
+        (None, None) => ImageSource::from(SharedString::from(picture.src.clone())),
     };
     let intrinsic = match &source {
+        _ if drawn.is_some() => drawn.as_ref().map(|d| {
+            size(DevicePixels(d.width.round() as i32), DevicePixels(d.height.round() as i32))
+        }),
         ImageSource::Resource(resource) => window
             .use_asset::<ImageAssetLoader>(resource, cx)
             .and_then(Result::ok)
@@ -691,7 +702,7 @@ fn render_picture(
     let ratio = intrinsic
         .filter(|s| s.height.0 > 0)
         .map(|s| s.width.0 as f32 / s.height.0 as f32)
-        .unwrap_or(1.);
+        .unwrap_or(if blank { 4. } else { 1. });
     let range = node
         .source_range()
         .and_then(|r| shifted_range(r, offset, prefix));
@@ -723,7 +734,24 @@ fn render_picture(
         // Percent widths on GPUI's Img otherwise retain the original pixel
         // height. The aspect-ratio container owns both dimensions; the image
         // fills it without contributing an intrinsic-height layout box.
-        .child(img(source).absolute().inset_0().size_full())
+        .child(if blank {
+            let theme = cx.theme();
+            div()
+                .absolute()
+                .inset_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded_md()
+                .border_1()
+                .border_dashed()
+                .border_color(theme.border)
+                .text_color(theme.muted_foreground)
+                .child(Icon::new(IconName::Pencil).size_4())
+                .into_any_element()
+        } else {
+            img(source).absolute().inset_0().size_full().into_any_element()
+        })
         .child(geometry(inner.clone()));
     for left in [true, false].into_iter().filter(|_| !locked) {
         let owner = owner.clone();
@@ -860,6 +888,9 @@ fn render_picture(
     // The file behind the picture, for viewing full size, copying and saving
     // it. Web images only exist in GPUI's cache, so they have neither.
     let local = crate::export::html::local_path(&picture.src, base.as_deref()).filter(|p| p.is_file());
+    // A drawing opens to be drawn in, rather than viewed, copied or saved.
+    let drawing = local.clone().filter(|p| crate::drawing::is_drawing(p));
+    let local = local.filter(|_| drawing.is_none());
     let full = match &local {
         Some(path) => Some(crate::media::Lightbox::Image(path.clone())),
         None if picture.src.starts_with("https://") || picture.src.starts_with("http://") => {
@@ -867,6 +898,20 @@ fn render_picture(
         }
         None => None,
     };
+    if let Some(path) = drawing.clone() {
+        let owner = owner.clone();
+        toolbar = toolbar
+            .when(!locked, |t| t.child(div().w(px(1.)).h(px(14.)).mx(px(2.)).bg(theme.border)))
+            .child(
+                ui::icon_button("drawing-open", IconName::Pencil, "Edit Drawing")
+                    .xsmall()
+                    .compact()
+                    .on_click(move |_, _, cx| {
+                        cx.stop_propagation();
+                        let _ = owner.update(cx, |app, cx| app.open_drawing(path.clone(), cx));
+                    }),
+            );
+    }
     if let Some(full) = full.clone() {
         let owner = owner.clone();
         toolbar = toolbar
@@ -960,10 +1005,13 @@ fn render_picture(
     let alignment = node.data::<Picture>().unwrap().alignment;
     div()
         .id(("editable-image", node.source_range().map_or(0, |r| r.start)))
-        // Double-click to see it full size.
+        // Double-click to see it full size, or a drawing to draw in it.
         .on_mouse_down(MouseButton::Left, move |event, w, cx| {
             if event.click_count == 2 {
-                if let Some(full) = full.clone() {
+                if let Some(path) = drawing.clone() {
+                    cx.stop_propagation();
+                    let _ = opener.update(cx, |app, cx| app.open_drawing(path, cx));
+                } else if let Some(full) = full.clone() {
                     cx.stop_propagation();
                     let _ = opener.update(cx, |app, cx| app.open_lightbox(full, w, cx));
                 }

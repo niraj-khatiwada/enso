@@ -1,6 +1,7 @@
 mod app_icon;
 mod brand;
 mod diagram;
+mod drawing;
 mod export;
 mod files;
 mod http;
@@ -1239,6 +1240,12 @@ impl Enso {
             self.switch_workspace(path, false, window, cx);
             return;
         }
+        if drawing::is_drawing(&path) {
+            if let Err(error) = drawing::open(path, cx) {
+                self.message(format!("Could not open the drawing: {error}"), true, cx);
+            }
+            return;
+        }
         if let Some(index) = self
             .documents
             .iter()
@@ -1774,6 +1781,54 @@ impl Enso {
         }
         self.open_folder(path, cx);
         self.focus.focus(window, cx);
+    }
+
+    fn open_drawing(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        if let Err(error) = drawing::open(path, cx) {
+            self.message(format!("Could not open the drawing: {error}"), true, cx);
+        }
+    }
+
+    /// A new drawing embedded in the open note at the cursor, kept with the
+    /// workspace's images, and opened to draw in.
+    fn embed_drawing(&mut self, editor: &Entity<EditorState>, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(doc_path) = self.active.and_then(|i| self.documents[i].path.clone()) else {
+            self.message("Save this note before adding a drawing to it.", true, cx);
+            return;
+        };
+        let Some(doc_dir) = doc_path.parent().map(PathBuf::from) else { return };
+        let root = self
+            .root
+            .clone()
+            .filter(|root| doc_dir.starts_with(root))
+            .unwrap_or_else(|| doc_dir.clone());
+        match drawing::create_for_note(&root) {
+            Ok(path) => {
+                let link = files::relative_link(&doc_dir, &path);
+                palette::insert_block(editor, &format!("![Drawing]({link})"), window, cx);
+                if let Err(error) = drawing::open(path, cx) {
+                    self.message(format!("Could not open the drawing: {error}"), true, cx);
+                }
+            }
+            Err(error) => self.message(format!("Could not create a drawing: {error}"), true, cx),
+        }
+    }
+
+    /// A new drawing where a new file would go, shown in the sidebar and
+    /// opened in its window.
+    fn new_drawing(&mut self, cx: &mut Context<Self>) {
+        let Some(dir) = self.target_dir() else { return };
+        match drawing::create(&dir) {
+            Ok(path) => {
+                self.load_folder(dir, cx);
+                self.reveal_in_tree(&path, cx);
+                self.selected = Some(path.clone());
+                if let Err(error) = drawing::open(path, cx) {
+                    self.message(format!("Could not open the drawing: {error}"), true, cx);
+                }
+            }
+            Err(error) => self.message(format!("Could not create a drawing: {error}"), true, cx),
+        }
     }
 
     /// Where a new file or folder goes: into the selected folder, beside the
@@ -4378,7 +4433,7 @@ fn open_workspace_window(root: Option<PathBuf>, cx: &mut App) {
 fn main() {
     let initial = std::env::args_os().nth(1).map(PathBuf::from);
     let app = gpui_kit::application()
-        .with_assets(gpui_kit::assets::AllAssets)
+        .with_assets(drawing::Assets)
         // Web images in notes; GPUI's own client refuses every request.
         .with_http_client(std::sync::Arc::new(http::Client::new()));
     // The system can hand over files before the app has a context to open them
@@ -4395,6 +4450,7 @@ fn main() {
             workspaces::init(cx);
             session::init(cx);
             lock::init(cx);
+            drawing::init(cx);
             cx.on_action(|_: &OpenSettings, cx| settings::open(cx));
             cx.bind_keys([
                 KeyBinding::new("cmd-,", OpenSettings, None),
@@ -4870,6 +4926,79 @@ mod transition_tests {
         cx.update(|cx| view.update(cx, |app, _| app.selected = Some(root.join("deep"))));
         draw(cx, handle);
         cx.update(|cx| assert_eq!(view.read(cx).selected.as_ref(), Some(&root.join("deep"))));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn drawings_open_in_one_window_each(cx: &mut TestAppContext) {
+        cx.update(|cx| { gpui_kit::init(cx); bind_view_keys(cx); crate::drawing::init(cx); });
+        let root = std::env::temp_dir().join(format!("enso-draw-ui-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let (handle, view) = cx.update(|cx| gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+            cx.new(|cx| {
+                let mut app = Enso::new(window, cx);
+                app.open_folder(root.clone(), cx);
+                app
+            })
+        }).unwrap());
+        cx.run_until_parked();
+        let windows = |cx: &mut TestAppContext| cx.update(|cx| cx.windows().len());
+        let before = windows(cx);
+        cx.update(|cx| view.update(cx, |app, cx| app.new_drawing(cx)));
+        cx.run_until_parked();
+        let path = root.join("Drawing.excalidraw");
+        assert!(path.is_file());
+        assert_eq!(windows(cx), before + 1);
+        assert!(cx.update(|cx| view.read(cx).folders[&root].iter().any(|e| e.path == path)));
+        // Opening it again from the sidebar brings up the same window.
+        let _ = handle.update(cx, |_, window, cx| {
+            view.update(cx, |app, cx| app.open_path(path.clone(), window, cx))
+        });
+        cx.run_until_parked();
+        assert_eq!(windows(cx), before + 1);
+        assert!(cx.update(|cx| view.read(cx).documents.is_empty()));
+        draw(cx, handle);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn a_drawing_embeds_in_the_note_and_shows_in_the_reader(cx: &mut TestAppContext) {
+        cx.update(|cx| { gpui_kit::init(cx); bind_view_keys(cx); crate::drawing::init(cx); });
+        let root = std::env::temp_dir().join(format!("enso-draw-embed-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("notes")).unwrap();
+        std::fs::write(root.join("notes/plan.md"), "# Plan\n\nBefore").unwrap();
+        let (handle, view) = cx.update(|cx| gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+            cx.new(|cx| {
+                let mut app = Enso::new(window, cx);
+                app.open_folder(root.clone(), cx);
+                app.add_document(Some(root.join("notes/plan.md")), "# Plan\n\nBefore".into(), None, window, cx);
+                app.mode = Mode::Split;
+                app
+            })
+        }).unwrap());
+        cx.run_until_parked();
+        draw(cx, handle);
+        let windows = cx.update(|cx| cx.windows().len());
+        let _ = handle.update(cx, |_, window, cx| {
+            view.update(cx, |app, cx| {
+                let editor = app.documents[0].editor.clone();
+                let end = editor.read(cx).value().len();
+                editor.update(cx, |state, cx| state.set_selected_range(end..end, cx));
+                app.embed_drawing(&editor, window, cx);
+            })
+        });
+        cx.run_until_parked();
+        draw(cx, handle);
+        assert_eq!(cx.update(|cx| cx.windows().len()), windows + 1);
+        let text = cx.update(|cx| view.read(cx).documents[0].editor.read(cx).value().to_string());
+        let link = text.split("![Drawing](").nth(1).and_then(|r| r.split(')').next()).unwrap().to_string();
+        assert!(text.starts_with("# Plan\n\nBefore\n\n![Drawing](../.assets/drawings/drawing-"), "{text}");
+        let file = root.join("notes").join(&link);
+        assert!(crate::drawing::is_drawing(&file) && file.is_file());
+        // Nothing drawn yet: the reader shows the placeholder, not a picture.
+        assert!(crate::drawing::picture(&file, false).is_none());
         std::fs::remove_dir_all(root).unwrap();
     }
 

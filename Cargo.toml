@@ -12,6 +12,8 @@ chrono = "0.4"
 url = "2"
 gpui-test = { package = "gpui-pre", version = "=0.3.10", features = ["test-support"], optional = true }
 gpui-kit = "0.8.1"
+# Drawings: Excalidraw ported to this GPUI Kit (crates/excalidraw).
+gpui-excalidraw = { path = "crates/excalidraw" }
 ropey = "=2.0.0-beta.1"
 # Export: Markdown parsed as the reader parses it, HTML with its images, PDFs
 # laid out by enso itself and written by krilla (text shaped by rustybuzz, in

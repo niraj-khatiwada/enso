@@ -1,0 +1,38 @@
+# Quality gates that run before every commit.
+#
+#   pre-commit install          # wire the hook into .git/hooks/pre-commit
+#   pre-commit run --all-files  # run every gate against the whole tree
+#   SKIP=cargo-test git commit  # bypass a single slow hook for one commit
+#
+# Hooks are declared locally with `language: system` so the config stays
+# offline-friendly and reuses the toolchain already on PATH instead of
+# downloading managed environments.
+default_stages: [pre-commit]
+fail_fast: false
+
+repos:
+  - repo: local
+    hooks:
+      - id: cargo-fmt
+        name: cargo fmt
+        description: Format Rust sources; fails if the tree is not rustfmt-clean.
+        entry: cargo fmt --all -- --check
+        language: system
+        types: [rust]
+        pass_filenames: false
+
+      - id: cargo-clippy
+        name: cargo clippy
+        description: Lint every target and treat any warning as an error.
+        entry: cargo clippy --all-targets -- -D warnings
+        language: system
+        types: [rust]
+        pass_filenames: false
+
+      - id: cargo-test
+        name: cargo test
+        description: Run the full test suite.
+        entry: cargo test
+        language: system
+        types: [rust]
+        pass_filenames: false

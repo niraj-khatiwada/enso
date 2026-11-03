@@ -1593,6 +1593,7 @@ dependencies = [
  "embed-resource",
  "fontdb",
  "futures",
+ "gpui-excalidraw",
  "gpui-kit",
  "gpui-pre",
  "image",
@@ -2366,6 +2367,27 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.119",
+]
+
+[[package]]
+name = "gpui-excalidraw"
+version = "0.1.9"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "chrono",
+ "gpui-kit",
+ "image",
+ "parking_lot",
+ "perfect_freehand",
+ "resvg 0.46.0",
+ "serde",
+ "serde_json",
+ "smallvec",
+ "thiserror 2.0.21",
+ "tiny-skia",
+ "usvg 0.46.0",
+ "uuid",
 ]
 
 [[package]]
@@ -4947,6 +4969,12 @@ name = "percent-encoding"
 version = "2.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
+
+[[package]]
+name = "perfect_freehand"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a9fa6a5c34a2260773ed097c04182ceb594bb46178200d07b46cd16ac3ca4b0d"
 
 [[package]]
 name = "petgraph"
