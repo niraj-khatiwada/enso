@@ -1078,3 +1078,46 @@ fn the_front_matter_panel_edits_the_header_both_ways(cx: &mut TestAppContext) {
     });
     assert_synced(cx, &view, "after front matter edits");
 }
+
+#[gpui_kit::test]
+fn tables_tab_between_cells_and_change_shape(cx: &mut TestAppContext) {
+    let doc = "Intro.\n\n| Stage | km |\n|:--|--:|\n| Lake | 4.2 |\n\nAfter.\n";
+    let (handle, view) = open(cx, doc);
+    let at = doc.find("Stage").unwrap() + 2;
+    cx.update(|cx| view.update(cx, |v, cx| v.place_caret(at, None, cx)));
+    let cell =
+        |cx: &mut TestAppContext| cx.update(|cx| view.read(cx).table_cell().map(|c| (c.1, c.2)));
+    assert_eq!(cell(cx), Some((0, 0)));
+    cx.simulate_keystrokes(handle, "tab");
+    assert_eq!(cell(cx), Some((0, 1)));
+    cx.simulate_keystrokes(handle, "tab");
+    assert_eq!(cell(cx), Some((1, 0)));
+    cx.simulate_keystrokes(handle, "shift-tab");
+    assert_eq!(cell(cx), Some((0, 1)));
+    cx.simulate_keystrokes(handle, "tab tab");
+    assert_eq!(cell(cx), Some((1, 1)));
+    cx.simulate_keystrokes(handle, "tab");
+    draw(cx, handle);
+    assert_eq!(cell(cx), Some((2, 0)));
+    assert_eq!(
+        source(cx, &view),
+        "Intro.\n\n| Stage |  km |\n|:------|----:|\n| Lake  | 4.2 |\n|       |     |\n\nAfter.\n"
+    );
+    cx.simulate_input(handle, "Saddle");
+    draw(cx, handle);
+    cx.simulate_keystrokes(handle, &format!("{MOD}-alt-right"));
+    draw(cx, handle);
+    assert_eq!(cell(cx), Some((2, 1)));
+    cx.simulate_keystrokes(handle, &format!("{MOD}-alt-shift-backspace"));
+    draw(cx, handle);
+    cx.simulate_keystrokes(handle, &format!("{MOD}-alt-up"));
+    draw(cx, handle);
+    assert_eq!(cell(cx), Some((2, 1)));
+    cx.simulate_keystrokes(handle, &format!("{MOD}-alt-backspace"));
+    draw(cx, handle);
+    assert_eq!(
+        source(cx, &view),
+        "Intro.\n\n| Stage  |  km |\n|:-------|----:|\n| Lake   | 4.2 |\n| Saddle |     |\n\nAfter.\n"
+    );
+    assert_synced(cx, &view, "after table edits");
+}

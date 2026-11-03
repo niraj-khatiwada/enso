@@ -46,7 +46,14 @@ actions!(
         IndentListItem,
         OutdentListItem,
         ToggleTypewriter,
-        CycleFocusMode
+        CycleFocusMode,
+        TableRowAbove,
+        TableRowBelow,
+        TableColumnLeft,
+        TableColumnRight,
+        TableDeleteRow,
+        TableDeleteColumn,
+        TableTidy
     ]
 );
 
@@ -94,6 +101,13 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("shift-tab", OutdentListItem, c),
         KeyBinding::new(key!("shift-t"), ToggleTypewriter, c),
         KeyBinding::new(key!("shift-d"), CycleFocusMode, c),
+        KeyBinding::new(key!("alt-up"), TableRowAbove, c),
+        KeyBinding::new(key!("alt-down"), TableRowBelow, c),
+        KeyBinding::new(key!("alt-left"), TableColumnLeft, c),
+        KeyBinding::new(key!("alt-right"), TableColumnRight, c),
+        KeyBinding::new(key!("alt-backspace"), TableDeleteRow, c),
+        KeyBinding::new(key!("alt-shift-backspace"), TableDeleteColumn, c),
+        KeyBinding::new(key!("alt-t"), TableTidy, c),
     ]);
     #[cfg(target_os = "macos")]
     cx.bind_keys([
@@ -230,6 +244,42 @@ pub fn listeners(root: Stateful<Div>, cx: &mut Context<VisualView>) -> Stateful<
         .indent(false, w, cx));
     let root = on!(root, OutdentListItem, |this, w, cx| this
         .indent(true, w, cx));
+    use super::table_ui::TableOp;
+    let root = on!(root, TableRowAbove, |this, w, cx| this.table_op(
+        TableOp::RowAbove,
+        w,
+        cx
+    ));
+    let root = on!(root, TableRowBelow, |this, w, cx| this.table_op(
+        TableOp::RowBelow,
+        w,
+        cx
+    ));
+    let root = on!(root, TableColumnLeft, |this, w, cx| this.table_op(
+        TableOp::ColumnLeft,
+        w,
+        cx
+    ));
+    let root = on!(root, TableColumnRight, |this, w, cx| this.table_op(
+        TableOp::ColumnRight,
+        w,
+        cx
+    ));
+    let root = on!(root, TableDeleteRow, |this, w, cx| this.table_op(
+        TableOp::DeleteRow,
+        w,
+        cx
+    ));
+    let root = on!(root, TableDeleteColumn, |this, w, cx| this.table_op(
+        TableOp::DeleteColumn,
+        w,
+        cx
+    ));
+    let root = on!(root, TableTidy, |this, w, cx| this.table_op(
+        TableOp::Tidy,
+        w,
+        cx
+    ));
     let root = on!(root, ToggleTypewriter, |this, _w, cx| {
         let mut prefs = WritingPrefs::get(cx);
         prefs.typewriter = !prefs.typewriter;
@@ -303,6 +353,9 @@ impl VisualView {
     }
 
     fn indent(&mut self, outdent: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if self.next_cell(outdent, window, cx) {
+            return;
+        }
         self.apply(
             |text, sel| markdown_edit::indent_list(text, sel, outdent),
             window,

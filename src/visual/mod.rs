@@ -11,6 +11,8 @@ pub mod mapping;
 pub mod perf;
 pub mod prefs;
 pub mod rows;
+mod table_edit;
+mod table_ui;
 #[cfg(all(test, feature = "ui-tests"))]
 mod tests;
 pub mod view;

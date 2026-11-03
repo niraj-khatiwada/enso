@@ -1649,6 +1649,7 @@ impl Render for VisualView {
                 decorations: self.decorations(cx),
             })
             .children(guide)
+            .children(self.render_table_toolbar(window, cx))
             .children(self.render_image_dialog(cx))
             .children(loading)
             .children(self.perf_overlay(cx))
