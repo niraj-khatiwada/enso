@@ -31,6 +31,7 @@ actions!(
         Undo,
         Redo,
         InsertImage,
+        InsertMath,
         Cancel
     ]
 );
@@ -109,6 +110,7 @@ const SCROLL_HISTORY: usize = 512;
 
 pub fn init(cx: &mut App) {
     super::commands::init(cx);
+    super::math::warm(cx);
     let (undo, redo, redo_alt) = if cfg!(target_os = "macos") {
         ("cmd-z", "cmd-shift-z", "cmd-y")
     } else {
@@ -125,6 +127,7 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("delete", Delete, Some(CONTEXT)),
         KeyBinding::new("enter", Enter, Some(CONTEXT)),
         KeyBinding::new("escape", Cancel, Some(CONTEXT)),
+        KeyBinding::new("escape", Cancel, Some("VisualEditor > Input")),
         KeyBinding::new(
             if cfg!(target_os = "macos") {
                 "cmd-shift-i"
@@ -132,6 +135,15 @@ pub fn init(cx: &mut App) {
                 "ctrl-shift-i"
             },
             InsertImage,
+            Some(CONTEXT),
+        ),
+        KeyBinding::new(
+            if cfg!(target_os = "macos") {
+                "cmd-shift-m"
+            } else {
+                "ctrl-shift-m"
+            },
+            InsertMath,
             Some(CONTEXT),
         ),
         KeyBinding::new(undo, Undo, Some(CONTEXT)),
@@ -166,6 +178,7 @@ pub struct VisualView {
     pub(super) image_resize: Option<super::image_ui::ImageResize>,
     pub(super) image_bounds: Rc<RefCell<HashMap<u64, Bounds<Pixels>>>>,
     pub(super) image_dialog: Option<super::image_ui::ImageDialog>,
+    pub(super) math_dialog: Option<super::math_ui::MathDialog>,
     pub paste_images: Option<PasteImages>,
     pub(super) front_matter: Option<super::front_matter::FrontMatterPanel>,
     focus_target: Option<FocusTarget>,
@@ -239,6 +252,7 @@ impl VisualView {
             image_resize: None,
             image_bounds: Rc::default(),
             image_dialog: None,
+            math_dialog: None,
             paste_images: None,
             front_matter: None,
             focus_target: None,
@@ -666,6 +680,10 @@ impl VisualView {
         }
     }
 
+    pub(super) fn text_size_px(&self) -> f32 {
+        self.text_size
+    }
+
     pub fn guide_fraction(&self, cx: &App) -> Option<f32> {
         let prefs = super::prefs::WritingPrefs::get(cx);
         prefs
@@ -774,6 +792,7 @@ impl VisualView {
             let all = 0..block.leaves.len();
             match (&block.kind, &block.node) {
                 (Kind::Image(image), _) => out.push((Role::Image, image.alt.clone(), None)),
+                (Kind::Math { tex }, _) => out.push((Role::Math, tex.clone(), None)),
                 (Kind::List { items }, _) => {
                     for item in items {
                         out.push((Role::ListItem, text(item.leaves.clone()), None));
@@ -1069,6 +1088,7 @@ impl VisualView {
         let base = self.base.clone();
         self.text_size = super::prefs::WritingPrefs::get(cx).text_size;
         let mut render_cx = RenderContext::from_app(cx)
+            .with_markdown_extensions(super::math::extensions(false))
             .with_body_font_size(px(self.text_size))
             .with_image_source(move |uri| {
                 let source = uri.to_string();
@@ -1317,6 +1337,13 @@ impl VisualView {
         self.perf.borrow_mut().input();
         window.focus(&self.focus, cx);
         self.selected_image = None;
+        if event.click_count >= 2
+            && let Some(range) = self.inline_math_at(event.position, cx)
+        {
+            self.open_math_dialog(super::math_ui::MathTarget::Inline(range), window, cx);
+            self.perf.borrow_mut().handler_done();
+            return;
+        }
         if let Some(src) = self.source_for_point(event.position) {
             if event.modifiers.secondary(cx) && self.follow_footnote(src, cx) {
                 self.perf.borrow_mut().handler_done();
@@ -1484,6 +1511,10 @@ impl VisualView {
             .is_some()
         {
             return self.render_front_matter(pad_top, cx);
+        }
+        if let Kind::Math { tex } = &self.doc.blocks[bix].kind {
+            let (id, tex) = (self.doc.blocks[bix].id, tex.clone());
+            return self.render_math_block(id, &tex, pad_top, pad_bottom, window, cx);
         }
         if let Kind::Image(image) = &self.doc.blocks[bix].kind {
             let (id, image) = (self.doc.blocks[bix].id, image.clone());
@@ -1798,8 +1829,13 @@ impl Render for VisualView {
                     this.insert_image_dialog(window, cx)
                 }),
             )
+            .on_action(
+                cx.listener(|this, _: &InsertMath, window, cx| this.insert_math_dialog(window, cx)),
+            )
             .on_action(cx.listener(|this, _: &Cancel, window, cx| {
-                if this.image_dialog.is_some() {
+                if this.math_dialog.is_some() {
+                    this.close_math_dialog(window, cx);
+                } else if this.image_dialog.is_some() {
                     this.close_image_dialog(window, cx);
                 } else if this.selected_image.is_some() {
                     this.select_image(None, cx);
@@ -1819,6 +1855,7 @@ impl Render for VisualView {
             .children(empty)
             .children(self.render_table_toolbar(window, cx))
             .children(self.render_image_dialog(cx))
+            .children(self.render_math_dialog(window, cx))
             .children(loading)
             .children(self.perf_overlay(cx))
     }

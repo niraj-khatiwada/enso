@@ -8,6 +8,8 @@ pub mod image;
 mod image_ui;
 mod input;
 pub mod mapping;
+pub mod math;
+mod math_ui;
 pub mod perf;
 pub mod prefs;
 pub mod rows;
