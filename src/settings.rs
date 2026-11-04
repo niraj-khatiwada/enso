@@ -51,6 +51,8 @@ pub struct Preferences {
     /// Split view puts the reader on the left and the editor on the right.
     pub reader_first: bool,
     pub(crate) split_order_path: Option<PathBuf>,
+    /// The sidebar is open; every window and workspace opens it this way.
+    pub sidebar_open: bool,
     window: Option<AnyWindowHandle>,
     path: Option<PathBuf>,
 }
@@ -130,6 +132,40 @@ fn set_document_outline(on: bool, cx: &mut App) -> io::Result<()> {
     }
     Ok(())
 }
+fn sidebar_path() -> Option<PathBuf> {
+    dirs::config_dir().map(|p| crate::files::app_folder(p).join("sidebar"))
+}
+fn load_sidebar_open(path: &Path) -> bool {
+    std::fs::read_to_string(path).map_or(true, |value| value.trim() != "closed")
+}
+
+/// Whether windows open with the sidebar shown: open unless last collapsed.
+pub fn sidebar_open(cx: &App) -> bool {
+    cx.try_global::<Preferences>().is_none_or(|p| p.sidebar_open)
+}
+
+/// Remember the sidebar as open or collapsed, for every window and session.
+pub fn set_sidebar_open(open: bool, cx: &mut App) -> io::Result<()> {
+    // Tests toggle the sidebar too, and mustn't change the real preference.
+    if cfg!(test) {
+        return Ok(());
+    }
+    if !cx.has_global::<Preferences>() {
+        init(cx);
+    }
+    if cx.global::<Preferences>().sidebar_open == open {
+        return Ok(());
+    }
+    cx.update_global::<Preferences, _>(|prefs, _| prefs.sidebar_open = open);
+    if let Some(path) = sidebar_path() {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(path, if open { "open" } else { "closed" })?;
+    }
+    Ok(())
+}
+
 fn split_order_path() -> Option<PathBuf> {
     dirs::config_dir().map(|p| crate::files::app_folder(p).join("split-order"))
 }
@@ -201,6 +237,7 @@ pub fn init(cx: &mut App) {
     let confirm_delete = confirm_delete_path().as_deref().is_none_or(load_document_outline);
     let split_order_path = split_order_path();
     let reader_first = split_order_path.as_deref().is_some_and(load_reader_first);
+    let sidebar_open = sidebar_path().as_deref().is_none_or(load_sidebar_open);
     let reading_path = crate::typography::preference_path();
     let reading = reading_path.as_deref()
         .map(crate::typography::ReadingStyle::load).unwrap_or_default();
@@ -215,6 +252,7 @@ pub fn init(cx: &mut App) {
         confirm_delete,
         reader_first,
         split_order_path,
+        sidebar_open,
         window: None,
         path,
     });

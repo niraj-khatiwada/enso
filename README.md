@@ -83,6 +83,7 @@ Type `/` on an empty Markdown line in Edit or Split to open the Insert menu besi
 | Enter (F2 on Windows/Linux) | Rename the selected file or folder (or double-click its name) |
 | ⌘⌫ (Delete on Windows/Linux) | Delete the selected file or folder (to the Trash / Recycle Bin; only a permanent delete asks first) |
 | ⌘⇧P / Ctrl⇧P | Command palette |
+| ⌘B | Collapse or expand the sidebar, remembered for every window (Bold while typing in a Markdown file) |
 | ⌘S | Save now (saving is also automatic) |
 | ⌘W | Close the current file |
 | ⌘⇧T / Ctrl⇧T | Reopen the last closed tab; repeat for earlier tabs |

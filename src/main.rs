@@ -59,6 +59,7 @@ actions!(
         ToggleView,
         ToggleSplit,
         SwapSplitSides,
+        ToggleSidebar,
         NewFolder,
         RenameSelected,
         DeleteSelected,
@@ -600,7 +601,7 @@ impl Enso {
             renaming: None,
             rename_input,
             closing: None,
-            sidebar_open: true,
+            sidebar_open: settings::sidebar_open(cx),
             sidebar_width: px(248.),
             refocus: false,
             hovered_tab: None,
@@ -745,6 +746,16 @@ impl Enso {
         doc.editor.update(cx, |editor, cx| editor.set_readonly(locked, cx));
         if let Some(path) = doc.path.clone() {
             lock::set_locked(&path, locked, cx);
+        }
+        cx.notify();
+    }
+
+    /// Collapse or expand the sidebar, and remember it for every window and
+    /// session.
+    pub(crate) fn toggle_sidebar(&mut self, cx: &mut Context<Self>) {
+        self.sidebar_open = !self.sidebar_open;
+        if let Err(error) = settings::set_sidebar_open(self.sidebar_open, cx) {
+            eprintln!("enso: couldn't remember the sidebar: {error}");
         }
         cx.notify();
     }
@@ -1669,7 +1680,8 @@ impl Enso {
             "split" => Mode::Split,
             _ => Mode::Read,
         };
-        self.sidebar_open = saved.sidebar_open;
+        // Open or collapsed is one app-wide choice (see `toggle_sidebar`),
+        // not the workspace's; only its width is the workspace's own.
         self.sidebar_width = px(saved.sidebar_width.clamp(160., 480.));
         for folder in &saved.expanded {
             if folder.starts_with(&root) && folder.is_dir() && self.expanded.insert(folder.clone()) {
@@ -3831,10 +3843,7 @@ impl Render for Enso {
                                 .child(
                                     ui::icon_button("toggle-sidebar", IconName::PanelLeft, toggle_label)
                                         .small()
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            this.sidebar_open = !this.sidebar_open;
-                                            cx.notify();
-                                        })),
+                                        .on_click(cx.listener(|this, _, _, cx| this.toggle_sidebar(cx))),
                                 ),
                         )
                         .child(div().flex_shrink_0().w(px(header_offset)))
@@ -3864,6 +3873,7 @@ impl Render for Enso {
             .on_action(cx.listener(|this, action: &spellcheck::ReplaceSpelling, w, cx| this.replace_spelling(action, w, cx)))
             .on_action(cx.listener(|this, _: &ExportNote, w, cx| this.open_export(w, cx)))
             .on_action(cx.listener(|this, _: &ToggleLock, _, cx| this.toggle_lock(cx)))
+            .on_action(cx.listener(|this, _: &ToggleSidebar, _, cx| this.toggle_sidebar(cx)))
             .on_action(cx.listener(|this, _: &CopyRichText, _, cx| {
                 let images = this.export_choice.images;
                 this.copy_rich_text(images, cx)
@@ -4032,6 +4042,9 @@ fn bind_view_keys(cx: &mut App) {
         KeyBinding::new("ctrl-shift-p", OpenCommandPalette, Some("Enso")),
         KeyBinding::new("cmd-shift-p", OpenCommandPalette, Some("Enso")),
         KeyBinding::new(if cfg!(target_os = "macos") { "cmd-shift-s" } else { "ctrl-shift-s" }, SearchEverything, Some("Enso")),
+        // At the window's depth only: in a Markdown editor the same keys are
+        // Bold, which its deeper context binds first.
+        KeyBinding::new(if cfg!(target_os = "macos") { "cmd-b" } else { "ctrl-b" }, ToggleSidebar, Some("Enso")),
         // Only acts while the sidebar has focus; text fields paste as usual.
         KeyBinding::new(if cfg!(target_os = "macos") { "cmd-v" } else { "ctrl-v" }, PasteFiles, Some("Enso")),
     ]);
@@ -4692,7 +4705,6 @@ mod transition_tests {
                 for path in &paths { app.add_document(Some(path.clone()), "text".into(), None, window, cx); }
                 app.active = Some(1);
                 app.mode = Mode::Split;
-                app.sidebar_open = false;
                 app
             })
         }).unwrap());
@@ -4717,7 +4729,6 @@ mod transition_tests {
             assert_eq!(tabs, paths[..2]);
             assert_eq!(app.active, Some(1));
             assert!(app.mode == Mode::Split);
-            assert!(!app.sidebar_open);
             // The folders expanded last time are expanded again.
             assert!(app.expanded.contains(&deep));
         });
@@ -5183,6 +5194,46 @@ mod transition_tests {
         draw(cx, handle);
         assert!(cx.update(|cx| view.read(cx).lightbox.is_none()));
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn cmd_b_toggles_the_sidebar_except_in_the_markdown_editor(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            bind_view_keys(cx);
+            super::bind_markdown_keys(cx);
+        });
+        let text = "hello";
+        let (handle, view) = cx.update(|cx| gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+            cx.new(|cx| {
+                let mut app = Enso::new(window, cx);
+                app.add_document(Some(PathBuf::from("note.md")), text.into(), None, window, cx);
+                app
+            })
+        }).unwrap());
+        draw(cx, handle);
+        let key = if cfg!(target_os = "macos") { "cmd-b" } else { "ctrl-b" };
+        let open = |cx: &mut TestAppContext| cx.update(|cx| view.read(cx).sidebar_open);
+        // Reading: the keys collapse the sidebar, and bring it back.
+        assert!(open(cx));
+        cx.simulate_keystrokes(handle, key);
+        draw(cx, handle);
+        assert!(!open(cx));
+        cx.simulate_keystrokes(handle, key);
+        draw(cx, handle);
+        assert!(open(cx));
+        // Typing in the Markdown editor: they're Bold, and the sidebar stays.
+        cx.update(|cx| view.update(cx, |app, cx| { app.mode = Mode::Edit; cx.notify(); }));
+        draw(cx, handle);
+        let editor = cx.update(|cx| view.read(cx).documents[0].editor.clone());
+        cx.update_window(handle, |_, window, cx| {
+            editor.focus_handle(cx).focus(window, cx);
+            editor.update(cx, |e, cx| e.set_selected_range(0..text.len(), cx));
+        }).unwrap();
+        cx.simulate_keystrokes(handle, key);
+        draw(cx, handle);
+        assert!(open(cx));
+        assert_eq!(cx.update(|cx| editor.read(cx).value().to_string()), "**hello**");
     }
 
     #[gpui_kit::test]
