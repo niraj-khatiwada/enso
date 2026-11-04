@@ -244,16 +244,30 @@ const facts = [
                   <h3>{p.name}</h3>
                 </div>
                 <div class="platform-files">
-                  {p.downloads.map((d) => (
-                    <a href={d.href} class="file" download={d.href.includes("/download/") ? "" : undefined}>
-                      <span class="file-label">{d.label}</span>
-                      <span class="file-name">
-                        {d.file.split(".").slice(-1)[0] === "gz" ? ".tar.gz" : `.${d.file.split(".").pop()}`}
-                        {d.size && ` · ${d.size} MB`}
-                      </span>
-                      <Icon name="arrowDown" size={15} />
-                    </a>
-                  ))}
+                  {p.rows.map((row) =>
+                    row.files.length === 1 ? (
+                      <a href={row.files[0].href} class="file">
+                        <span class="file-label">{row.label}</span>
+                        <span class="file-name">
+                          {row.ext}
+                          {row.files[0].size && ` · ${row.files[0].size} MB`}
+                        </span>
+                        <Icon name="arrowDown" size={15} />
+                      </a>
+                    ) : (
+                      <div class="file file-split">
+                        <span class="file-label">{row.label}</span>
+                        <span class="file-name">{row.ext.slice(1) === row.label ? "" : row.ext}</span>
+                        <span class="file-archs">
+                          {row.files.map((f) => (
+                            <a href={f.href} title={f.size ? `${f.file} · ${f.size} MB` : f.file}>
+                              {f.label}
+                            </a>
+                          ))}
+                        </span>
+                      </div>
+                    )
+                  )}
                 </div>
                 <p class="platform-note">{p.note}</p>
               </div>
@@ -669,6 +683,42 @@ const facts = [
   }
   .file-label {
     font-weight: 600;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  /* A package in two architectures: the row names it, each pill downloads one */
+  .file-split {
+    grid-template-columns: minmax(0, 1fr) auto auto;
+    padding-right: 6px;
+  }
+  .file-split:hover {
+    border-color: var(--line);
+  }
+  .file-archs {
+    display: flex;
+    gap: 4px;
+  }
+  .file-archs a {
+    display: grid;
+    place-items: center;
+    height: 30px;
+    padding: 0 10px;
+    font-size: 12px;
+    font-weight: 600;
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    transition: border-color 0.3s var(--ease), background-color 0.3s var(--ease), color 0.3s var(--ease);
+  }
+  .file-archs a:hover {
+    border-color: var(--ink-soft);
+  }
+  .is-yours .file-split:first-child .file-archs a {
+    color: var(--paper);
+    border-color: color-mix(in srgb, var(--paper) 30%, transparent);
+  }
+  .is-yours .file-split:first-child .file-archs a:hover {
+    background: color-mix(in srgb, var(--paper) 14%, transparent);
   }
   .file-name {
     font-family: var(--font-mono);

@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=enso
+Comment=A quiet, native Markdown workspace
+Exec=enso %F
+Icon=app.enso.markdown
+Terminal=false
+Categories=Office;TextEditor;
+MimeType=text/markdown;text/x-markdown;text/plain;
+StartupWMClass=app.enso.markdown

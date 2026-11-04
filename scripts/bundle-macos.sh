@@ -1,5 +1,7 @@
 #!/bin/sh
 # Build enso.app. Release by default; pass --debug for a quick unoptimized bundle.
+# For another Mac architecture, set ENSO_TARGET to its Rust target, e.g.
+# ENSO_TARGET=x86_64-apple-darwin for Intel Macs (built from Apple silicon).
 set -eu
 cd "$(dirname "$0")/.."
 
@@ -8,17 +10,25 @@ if [ "${1:-}" = "--debug" ]; then
     profile=debug
 fi
 
+target_args=""
+out="target"
+if [ -n "${ENSO_TARGET:-}" ]; then
+    rustup target add "$ENSO_TARGET" >/dev/null 2>&1 || true
+    target_args="--target $ENSO_TARGET"
+    out="target/$ENSO_TARGET"
+fi
+
 if [ "$profile" = release ]; then
-    cargo build --locked --release
+    cargo build --locked --release $target_args
 else
-    cargo build --locked
+    cargo build --locked $target_args
 fi
 
 version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
 bundle="$PWD/target/enso.app"
 rm -rf "$bundle"
 mkdir -p "$bundle/Contents/MacOS" "$bundle/Contents/Resources"
-cp "target/$profile/enso" "$bundle/Contents/MacOS/enso"
+cp "$out/$profile/enso" "$bundle/Contents/MacOS/enso"
 cp assets/enso.icns "$bundle/Contents/Resources/enso.icns"
 cp assets/font-licenses.txt "$bundle/Contents/Resources/font-licenses.txt"
 cat > "$bundle/Contents/Info.plist" <<PLIST

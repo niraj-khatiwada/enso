@@ -13,6 +13,7 @@ interface GitHubRelease {
 }
 
 export interface Download {
+  /** The architecture, when the row offers more than one: x64 or ARM64 */
   label: string
   file: string
   href: string
@@ -20,11 +21,19 @@ export interface Download {
   size?: number
 }
 
+/** One kind of package (a disk image, an installer, a .deb…), in each architecture built */
+export interface Row {
+  label: string
+  /** The file extension, shown beside the label */
+  ext: string
+  files: Download[]
+}
+
 export interface Platform {
   id: 'macos' | 'windows' | 'linux'
   name: string
   note: string
-  downloads: Download[]
+  rows: Row[]
 }
 
 /** The app's version, read from its Cargo.toml whenever the site is built */
@@ -97,25 +106,50 @@ export async function getPlatforms(): Promise<{ version: string; releaseUrl: str
         id: 'macos',
         name: 'macOS',
         note: 'Includes Quick Look previews in Finder.',
-        downloads: [asset('Apple Silicon', `enso-${version}-arm64.dmg`)],
+        rows: [
+          { label: 'Apple Silicon', ext: '.dmg', files: [asset('Apple Silicon', `enso-${version}-arm64.dmg`)] },
+          { label: 'Intel', ext: '.dmg', files: [asset('Intel', `enso-${version}-x64.dmg`)] },
+        ],
       },
       {
         id: 'windows',
         name: 'Windows',
-        note: 'Unzip and run enso.exe.',
-        downloads: [
-          asset('x64', `enso-${version}-windows-x64.zip`),
-          asset('ARM64', `enso-${version}-windows-arm64.zip`),
+        note: 'The installer adds enso to the Start menu. The zip runs from any folder.',
+        rows: [
+          {
+            label: 'Installer',
+            ext: '.exe',
+            files: [
+              asset('x64', `enso-${version}-windows-x64-setup.exe`),
+              asset('ARM64', `enso-${version}-windows-arm64-setup.exe`),
+            ],
+          },
+          {
+            label: 'Portable',
+            ext: '.zip',
+            files: [
+              asset('x64', `enso-${version}-windows-x64.zip`),
+              asset('ARM64', `enso-${version}-windows-arm64.zip`),
+            ],
+          },
         ],
       },
       {
         id: 'linux',
         name: 'Linux',
-        note: 'Unpack and run install.sh.',
-        downloads: [
-          asset('x64', `enso-${version}-linux-x64.tar.gz`),
-          asset('ARM64', `enso-${version}-linux-arm64.tar.gz`),
-        ],
+        note: 'AppImage runs on most distros, .deb on Debian and Ubuntu, .rpm on Fedora and openSUSE.',
+        rows: (
+          [
+            ['AppImage', '.AppImage'],
+            ['Debian', '.deb'],
+            ['Fedora', '.rpm'],
+            ['Archive', '.tar.gz'],
+          ] as const
+        ).map(([label, ext]) => ({
+          label,
+          ext,
+          files: [asset('x64', `enso-${version}-linux-x64${ext}`), asset('ARM64', `enso-${version}-linux-arm64${ext}`)],
+        })),
       },
     ],
   }

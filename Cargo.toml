@@ -5,6 +5,45 @@ edition = "2024"
 description = "A quiet, native Markdown workspace"
 license = "MIT"
 
+# Linux packages (scripts/package-linux.sh): a .deb from cargo-deb and an
+# .rpm from cargo-generate-rpm, installing the same files.
+[package.metadata.deb]
+maintainer = "Niraj Khatiwada <nirazzz.nk@gmail.com>"
+copyright = "Niraj Khatiwada"
+section = "editors"
+priority = "optional"
+extended-description = "A reading-first Markdown workspace: read notes as a page, write in plain text, and keep every note an ordinary file."
+# The libraries the binary links, found by dpkg-shlibdeps. Enchant is loaded
+# only if present (spell check), and a Vulkan driver is what draws the window.
+depends = "$auto"
+recommends = "libenchant-2-2, mesa-vulkan-drivers"
+assets = [
+    ["target/release/enso", "usr/bin/", "755"],
+    ["assets/linux/app.enso.markdown.desktop", "usr/share/applications/", "644"],
+    ["assets/linux/48x48/app.enso.markdown.png", "usr/share/icons/hicolor/48x48/apps/", "644"],
+    ["assets/linux/64x64/app.enso.markdown.png", "usr/share/icons/hicolor/64x64/apps/", "644"],
+    ["assets/linux/128x128/app.enso.markdown.png", "usr/share/icons/hicolor/128x128/apps/", "644"],
+    ["assets/linux/256x256/app.enso.markdown.png", "usr/share/icons/hicolor/256x256/apps/", "644"],
+    ["assets/linux/512x512/app.enso.markdown.png", "usr/share/icons/hicolor/512x512/apps/", "644"],
+    ["assets/font-licenses.txt", "usr/share/doc/enso/", "644"],
+]
+
+[package.metadata.generate-rpm]
+summary = "A quiet, native Markdown workspace"
+# Requires the libraries' sonames (libfoo.so.N), which every RPM distro's
+# packages provide whatever they are named.
+auto-req = "builtin"
+assets = [
+    { source = "target/release/enso", dest = "/usr/bin/enso", mode = "755" },
+    { source = "assets/linux/app.enso.markdown.desktop", dest = "/usr/share/applications/app.enso.markdown.desktop", mode = "644" },
+    { source = "assets/linux/48x48/app.enso.markdown.png", dest = "/usr/share/icons/hicolor/48x48/apps/app.enso.markdown.png", mode = "644" },
+    { source = "assets/linux/64x64/app.enso.markdown.png", dest = "/usr/share/icons/hicolor/64x64/apps/app.enso.markdown.png", mode = "644" },
+    { source = "assets/linux/128x128/app.enso.markdown.png", dest = "/usr/share/icons/hicolor/128x128/apps/app.enso.markdown.png", mode = "644" },
+    { source = "assets/linux/256x256/app.enso.markdown.png", dest = "/usr/share/icons/hicolor/256x256/apps/app.enso.markdown.png", mode = "644" },
+    { source = "assets/linux/512x512/app.enso.markdown.png", dest = "/usr/share/icons/hicolor/512x512/apps/app.enso.markdown.png", mode = "644" },
+    { source = "assets/font-licenses.txt", dest = "/usr/share/doc/enso/font-licenses.txt", mode = "644", doc = true },
+]
+
 [dependencies]
 dirs = "6.0.0"
 futures = "0.3"

@@ -45,9 +45,15 @@ Use Cmd on macOS and Ctrl on Windows/Linux: O opens a file, Shift O opens a fold
 
 ## Releases
 
-`.github/workflows/release.yml` builds release packages on GitHub Actions: a macOS disk image for Apple silicon (with the Quick Look extension), Windows zips for x64 and ARM64, and Linux tarballs for x64 and ARM64. Run it by hand from the Actions tab (Release -> Run workflow): it puts the packages in a draft GitHub Release for the version in `Cargo.toml`, to check and publish from the Releases page. Running it again for the same version replaces the draft's files.
+`.github/workflows/release.yml` builds release packages on GitHub Actions:
 
-The macOS app is ad-hoc signed, not notarized, so Gatekeeper asks on first open. On Linux, unpack the tarball (`tar -xzf enso-<version>-linux-<arch>.tar.gz`) and run `./install.sh` (or `sh install.sh`) to add enso to the app launcher.
+- **macOS:** disk images for Apple silicon (`arm64`) and Intel (`x64`), with the Quick Look extension. Both are built on Apple silicon; `ENSO_TARGET=x86_64-apple-darwin ./scripts/build-mac.sh` makes the Intel one locally.
+- **Windows:** for x64 and ARM64, an installer (`-setup.exe`, made with Inno Setup from `installer/windows/enso.iss`) that adds enso to the Start menu and to Open With for Markdown files, and a portable zip.
+- **Linux:** for x64 and ARM64, an AppImage, a `.deb` (Debian, Ubuntu), an `.rpm` (Fedora, openSUSE) and a `.tar.gz`, all made by `scripts/package-linux.sh`. They're built on Ubuntu 22.04, so they run on distros with glibc 2.35 or later.
+
+Run it by hand from the Actions tab (Release -> Run workflow): it puts the packages in a draft GitHub Release for the version in `Cargo.toml`, to check and publish from the Releases page. Running it again for the same version replaces the draft's files.
+
+The macOS app is ad-hoc signed, not notarized, so Gatekeeper asks on first open; Windows SmartScreen asks too, as the installer isn't code-signed. On Linux, the `.tar.gz` works on any distro: unpack it (`tar -xzf enso-<version>-linux-<arch>.tar.gz`) and run `./install.sh` (or `sh install.sh`) to add enso to the app launcher for your user. The AppImage needs FUSE 2 (`libfuse2`) on some distros, such as Ubuntu 24.04.
 
 ## Reading controls
 
@@ -116,7 +122,7 @@ Each applies to the selection, or to the word or line at the cursor; using it ag
 
 ## Platforms
 
-One codebase targets macOS, Windows, and Linux using GPUI Kit's native backends. This initial version is developed on macOS; Windows and Linux runtime verification remains to be done. Linux needs GPUI's native build dependencies (including a C/C++ toolchain, pkg-config, fontconfig, Wayland/X11 development libraries, and a working Vulkan driver). Follow the platform prerequisites in the supplied GPUI Kit repository. Distribution installers and OS file associations are future work.
+One codebase targets macOS, Windows, and Linux using GPUI Kit's native backends. This initial version is developed on macOS; Windows and Linux runtime verification remains to be done. Linux needs GPUI's native build dependencies (including a C/C++ toolchain, pkg-config, fontconfig, Wayland/X11 development libraries, and a working Vulkan driver). Follow the platform prerequisites in the supplied GPUI Kit repository.
 
 `vendor/gpui-pre-macos` is the Apache-2.0 upstream 0.3.10 crate with three `Option::map_or_default` calls replaced by stable `map_or` equivalents. This avoids an upstream stable-Rust compilation error without modifying the GPUI Kit checkout. See its `ENSO-PATCH.md`.
 

@@ -8,10 +8,19 @@ cd "$(dirname "$0")/.."
 bundle="$1"
 source=macos/quicklook
 version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
-arch=$(uname -m)
-
-CARGO_TARGET_DIR="$PWD/target/quicklook" \
-    cargo build --release --manifest-path "$source/Cargo.toml"
+# The app's architecture: ENSO_TARGET (see bundle-macos.sh), else this Mac's.
+lib="$PWD/target/quicklook/release"
+if [ -n "${ENSO_TARGET:-}" ]; then
+    arch=${ENSO_TARGET%%-*}
+    [ "$arch" = aarch64 ] && arch=arm64
+    lib="$PWD/target/quicklook/$ENSO_TARGET/release"
+    CARGO_TARGET_DIR="$PWD/target/quicklook" \
+        cargo build --release --manifest-path "$source/Cargo.toml" --target "$ENSO_TARGET"
+else
+    arch=$(uname -m)
+    CARGO_TARGET_DIR="$PWD/target/quicklook" \
+        cargo build --release --manifest-path "$source/Cargo.toml"
+fi
 
 appex="$bundle/Contents/PlugIns/EnsoQuickLook.appex"
 rm -rf "$appex"
@@ -25,7 +34,7 @@ xcrun swiftc -O \
     -target "$arch-apple-macos12.0" \
     -import-objc-header "$source/bridge.h" \
     "$source/PreviewProvider.swift" \
-    -L "$PWD/target/quicklook/release" -lenso_quicklook \
+    -L "$lib" -lenso_quicklook \
     -Xlinker -e -Xlinker _NSExtensionMain \
     -o "$appex/Contents/MacOS/EnsoQuickLook"
 
