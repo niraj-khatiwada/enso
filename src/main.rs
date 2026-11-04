@@ -74,6 +74,8 @@ actions!(
         OpenCommandPalette,
         SearchEverything,
         PasteFiles,
+        CopySelected,
+        CutSelected,
         ExportNote,
         DismissExport,
         DismissLightbox,
@@ -409,6 +411,8 @@ struct Busy {
 struct DraggedEntry {
     path: PathBuf,
     directory: bool,
+    /// Everything that moves: the selection when the row is part of it.
+    paths: Vec<PathBuf>,
 }
 
 impl Render for DraggedEntry {
@@ -435,7 +439,34 @@ impl Render for DraggedEntry {
                     .text_color(theme.muted_foreground),
             )
             .child(div().max_w(px(TAB_TITLE_WIDTH)).truncate().child(name))
+            .when(self.paths.len() > 1, |row| {
+                row.child(
+                    div()
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .child(format!("+{}", self.paths.len() - 1)),
+                )
+            })
     }
+}
+
+/// `paths` without the ones inside another of them, in order.
+fn outermost(paths: Vec<PathBuf>) -> Vec<PathBuf> {
+    let mut kept: Vec<PathBuf> = Vec::new();
+    for path in &paths {
+        if !kept.contains(path) && !paths.iter().any(|other| other != path && path.starts_with(other)) {
+            kept.push(path.clone());
+        }
+    }
+    kept
+}
+
+/// Files copied or cut in the sidebar, with the text the clipboard got (all
+/// it keeps on Linux and Windows, where paste recognises it as these files).
+struct CopiedFiles {
+    paths: Vec<PathBuf>,
+    text: String,
+    cut: bool,
 }
 
 struct ClosedTab {
@@ -449,6 +480,11 @@ struct Enso {
     focus: FocusHandle,
     documents: Vec<Document>,
     closed_tabs: Vec<ClosedTab>,
+    /// The files last copied or cut in the sidebar.
+    copied_files: Option<CopiedFiles>,
+    /// Rows picked with Cmd/Ctrl- or Shift-click; two or more make the
+    /// sidebar's selection (one is just `selected`).
+    marked: Vec<PathBuf>,
     active: Option<usize>,
     root: Option<PathBuf>,
     folders: HashMap<PathBuf, Vec<files::Entry>>,
@@ -584,6 +620,8 @@ impl Enso {
             focus,
             documents: Vec::new(),
             closed_tabs: Vec::new(),
+            copied_files: None,
+            marked: Vec::new(),
             active: None,
             root: None,
             folders: HashMap::new(),
@@ -2073,6 +2111,70 @@ impl Enso {
     }
 
     /// The tree row last clicked, if it is still inside the open workspace.
+    /// The sidebar's selection: the picked rows, or the one selected row.
+    /// What's inside a selected folder goes with the folder, not on its own.
+    fn selection(&self) -> Vec<PathBuf> {
+        let Some(root) = &self.root else { return Vec::new() };
+        let picked: Vec<PathBuf> = if self.marked.len() > 1 {
+            self.marked
+                .iter()
+                .filter(|p| *p != root && p.starts_with(root) && p.exists())
+                .cloned()
+                .collect()
+        } else {
+            self.selected_entry().into_iter().collect()
+        };
+        outermost(picked)
+    }
+
+    /// What an action on `path`'s row works on: the whole selection when
+    /// the row is part of it, else just that row.
+    fn selection_with(&self, path: &PathBuf) -> Vec<PathBuf> {
+        if self.marked.len() > 1 && self.marked.contains(path) {
+            self.selection()
+        } else {
+            vec![path.clone()]
+        }
+    }
+
+    /// A Cmd/Ctrl-click (`toggle`) adds the row to the selection or takes it
+    /// out; a Shift-click picks every row from the selected one to it, when
+    /// both are in the same folder. False when the click is a plain one.
+    fn pick_row(&mut self, path: &PathBuf, shift: bool, toggle: bool) -> bool {
+        if toggle {
+            if self.marked.is_empty() {
+                self.marked.extend(self.selected_entry());
+            }
+            if let Some(i) = self.marked.iter().position(|p| p == path) {
+                self.marked.remove(i);
+                if self.selected.as_ref() == Some(path) {
+                    self.selected = self.marked.last().cloned();
+                }
+            } else {
+                self.marked.push(path.clone());
+                self.selected = Some(path.clone());
+            }
+            return true;
+        }
+        if !shift {
+            return false;
+        }
+        let Some(anchor) = self.selected_entry() else { return false };
+        // Ranges stay within one folder.
+        if anchor.parent() != path.parent() {
+            return false;
+        }
+        let Some(siblings) = path.parent().and_then(|p| self.folders.get(p)) else {
+            return false;
+        };
+        let at = |p: &PathBuf| siblings.iter().position(|e| &e.path == p);
+        let (Some(a), Some(b)) = (at(&anchor), at(path)) else { return false };
+        // The selected row stays the anchor, so another Shift-click extends
+        // or shrinks the range from it.
+        self.marked = siblings[a.min(b)..=a.max(b)].iter().map(|e| e.path.clone()).collect();
+        true
+    }
+
     fn selected_entry(&self) -> Option<PathBuf> {
         let root = self.root.as_ref()?;
         self.selected
@@ -2112,23 +2214,70 @@ impl Enso {
         .detach();
     }
 
+    /// Delete several sidebar items at once, after one prompt.
+    fn delete_entries(&mut self, paths: Vec<PathBuf>, window: &mut Window, cx: &mut Context<Self>) {
+        if paths.len() <= 1 {
+            if let Some(path) = paths.into_iter().next() {
+                self.delete_entry(path, window, cx);
+            }
+            return;
+        }
+        if !settings::confirm_delete(cx) {
+            self.trash_entries(paths, cx);
+            return;
+        }
+        let bin = if cfg!(windows) { "Recycle Bin" } else { "Trash" };
+        let receiver = window.prompt(
+            PromptLevel::Warning,
+            &format!("Delete {} items?", paths.len()),
+            Some(&format!("You can restore them from the {bin}.")),
+            &[format!("Move to {bin}").as_str(), "Cancel"],
+            cx,
+        );
+        cx.spawn_in(window, async move |this, cx| {
+            if receiver.await == Ok(0) {
+                let _ = this.update(cx, |this, cx| this.trash_entries(paths, cx));
+            }
+        })
+        .detach();
+    }
+
     /// Move a file or folder to the Trash (Recycle Bin on Windows). Only an
     /// item that can't be recycled is ever deleted outright, and then the
     /// system asks first (Windows) or the move fails and nothing is deleted
     /// (macOS, Linux).
     fn trash_entry(&mut self, path: PathBuf, cx: &mut Context<Self>) {
-        let name = path
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        // On the main thread: Windows' "delete permanently?" dialog needs it.
-        match files::move_to_trash(&path) {
-            Ok(()) => self.forget_entry(&path, cx),
-            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {
-                self.toast(ui::toast::done(SharedString::from(format!("kept:{name}")), format!("Kept “{name}”"), error.to_string()), cx)
+        self.trash_entries(vec![path], cx);
+    }
+
+    /// Trash each item, then say once what went: "Moved “note.md” to the
+    /// Trash", or "Moved 3 items to the Trash".
+    fn trash_entries(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
+        let mut gone = Vec::new();
+        for path in paths {
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            // On the main thread: Windows' "delete permanently?" dialog needs it.
+            match files::move_to_trash(&path) {
+                Ok(()) => {
+                    self.forget_entry(&path, cx);
+                    gone.push(name);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {
+                    self.toast(ui::toast::done(SharedString::from(format!("kept:{name}")), format!("Kept “{name}”"), error.to_string()), cx)
+                }
+                Err(error) => self.message(format!("Could not delete “{name}”: {error}"), true, cx),
             }
-            Err(error) => self.message(format!("Could not delete “{name}”: {error}"), true, cx),
         }
+        let bin = if cfg!(windows) { "Recycle Bin" } else { "Trash" };
+        let message = match gone.as_slice() {
+            [] => return,
+            [name] => format!("Moved “{name}” to the {bin}"),
+            _ => format!("Moved {} items to the {bin}", gone.len()),
+        };
+        self.toast(ui::toast::done("trashed", message, ""), cx);
     }
 
     /// Drop everything that pointed at a file or folder that is gone: its
@@ -2145,6 +2294,7 @@ impl Enso {
         }
         self.folders.retain(|p, _| !p.starts_with(path));
         self.expanded.retain(|p| !p.starts_with(path));
+        self.marked.retain(|p| !p.starts_with(path));
         if self.selected.as_ref().is_some_and(|p| p.starts_with(path)) {
             self.selected = None;
         }
@@ -2227,6 +2377,11 @@ impl Enso {
         if let Some(path) = self.selected.as_ref().and_then(|p| moved(p)) {
             self.selected = Some(path);
         }
+        for path in &mut self.marked {
+            if let Some(new) = moved(path) {
+                *path = new;
+            }
+        }
         for doc in &mut self.documents {
             if let Some(path) = doc.path.as_ref().and_then(|p| moved(p)) {
                 doc.markdown = files::is_markdown(&path);
@@ -2252,22 +2407,48 @@ impl Enso {
     }
 
     /// Drag and drop in the sidebar: move a file or folder into `dir`.
-    fn move_entry(&mut self, path: PathBuf, dir: PathBuf, cx: &mut Context<Self>) {
+    fn move_entry(&mut self, path: PathBuf, dir: PathBuf, cx: &mut Context<Self>) -> Option<PathBuf> {
         self.tree_drop = None;
         // Let go where it already is (or on itself): nothing to do.
         if path.parent() == Some(dir.as_path()) || path == dir {
-            return;
+            return None;
         }
-        match files::move_into(&path, &dir) {
+        let new = match files::move_into(&path, &dir) {
             Ok(new) => {
                 if self.root.as_ref() != Some(&dir) && self.expanded.insert(dir.clone()) {
                     self.load_folder(dir, cx);
                 }
                 self.entry_moved(&path, &new, cx);
-                self.selected = Some(new);
+                self.selected = Some(new.clone());
+                Some(new)
             }
-            Err(error) => self.message(error.to_string(), true, cx),
+            Err(error) => {
+                self.message(error.to_string(), true, cx);
+                None
+            }
+        };
+        cx.notify();
+        new
+    }
+
+    /// Move several sidebar items into `dir`; they stay selected there.
+    fn move_entries(&mut self, paths: Vec<PathBuf>, dir: PathBuf, cx: &mut Context<Self>) {
+        let paths = outermost(paths);
+        if paths.len() == 1 {
+            self.move_entry(paths[0].clone(), dir, cx);
+            return;
         }
+        // Moving a folder into one of the items being moved isn't possible.
+        if paths.iter().any(|p| dir.starts_with(p)) {
+            self.tree_drop = None;
+            self.message("A folder can't be moved into itself.", true, cx);
+            return;
+        }
+        let moved: Vec<PathBuf> = paths
+            .into_iter()
+            .map(|path| self.move_entry(path.clone(), dir.clone(), cx).unwrap_or(path))
+            .collect();
+        self.marked = moved;
         cx.notify();
     }
 
@@ -2334,6 +2515,29 @@ impl Enso {
 
     /// Cmd/Ctrl+V in the sidebar: files copied in Finder go into the selected
     /// folder (or beside the selected file).
+    /// Copy (or cut) the sidebar's selected file or folder, only while the
+    /// sidebar has focus: in the editor or reader the keys work on text as
+    /// usual. The file itself goes on the clipboard, so Finder can paste a
+    /// copy. A cut item fades until it's pasted, which moves it.
+    fn copy_selected(&mut self, cut: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let paths = self.selection();
+        if paths.is_empty() || !self.focus.is_focused(window) {
+            cx.propagate();
+            return;
+        }
+        let text = paths.iter().map(|p| p.to_string_lossy()).collect::<Vec<_>>().join("\n");
+        cx.write_to_clipboard(ClipboardItem {
+            entries: vec![
+                ClipboardEntry::ExternalPaths(ExternalPaths(paths.iter().cloned().collect())),
+                ClipboardEntry::String(ClipboardString::new(text.clone())),
+            ],
+        });
+        // Where the system clipboard keeps only text (Linux, Windows), paste
+        // recognises that text as these files.
+        self.copied_files = Some(CopiedFiles { paths, text, cut });
+        cx.notify();
+    }
+
     fn paste_files(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !self.focus.is_focused(window) {
             cx.propagate();
@@ -2342,8 +2546,9 @@ impl Enso {
         let Some(dir) = self.target_dir() else {
             return;
         };
-        let paths: Vec<PathBuf> = cx
-            .read_from_clipboard()
+        let item = cx.read_from_clipboard();
+        let mut paths: Vec<PathBuf> = item
+            .as_ref()
             .map(|item| {
                 item.entries()
                     .iter()
@@ -2355,6 +2560,19 @@ impl Enso {
                     .collect()
             })
             .unwrap_or_default();
+        // Files copied in the sidebar, on a clipboard that kept only their text.
+        if paths.is_empty()
+            && let Some(copied) = &self.copied_files
+            && item.as_ref().and_then(|i| i.text()).as_deref() == Some(copied.text.as_str())
+        {
+            paths = copied.paths.clone();
+        }
+        // Cut in the sidebar: pasting moves them, once.
+        if let Some(copied) = self.copied_files.take_if(|c| c.cut && c.paths == paths) {
+            self.move_entries(copied.paths, dir, cx);
+            cx.write_to_clipboard(ClipboardItem { entries: Vec::new() });
+            return;
+        }
         if paths.is_empty() {
             cx.propagate();
             return;
@@ -2657,6 +2875,7 @@ impl Render for Enso {
             self.followed_path = active_path.clone();
             if let Some(path) = &active_path {
                 self.selected = Some(path.clone());
+                self.marked.clear();
                 self.reveal_in_tree(path, cx);
             }
         }
@@ -2855,6 +3074,17 @@ impl Render for Enso {
             ));
         }
         let highlighted = self.selected.clone().or_else(|| active_path.clone());
+        // Selected rows: the focus colour while the sidebar has the keyboard
+        // (as Finder does), a neutral tint otherwise. Strong enough to read
+        // at a glance in both modes, never a solid block.
+        let selected_bg = {
+            let dark = cx.theme().mode.is_dark();
+            if self.focus.is_focused(window) {
+                cx.theme().ring.opacity(if dark { 0.30 } else { 0.18 })
+            } else {
+                cx.theme().foreground.opacity(if dark { 0.11 } else { 0.07 })
+            }
+        };
         let switcher = {
             let weak = cx.entity().downgrade();
             let recent = workspaces::recent(cx);
@@ -3146,7 +3376,7 @@ impl Render for Enso {
                             }
                         }))
                         .on_drop(cx.listener(move |this, e: &DraggedEntry, _, cx| {
-                            this.move_entry(e.path.clone(), drop_entry_root.clone(), cx)
+                            this.move_entries(e.paths.clone(), drop_entry_root.clone(), cx)
                         }))
                         .on_drop(cx.listener(move |this, paths: &ExternalPaths, _, cx| {
                             this.copy_into_folder(paths.paths().to_vec(), drop_paths_root.clone(), cx)
@@ -3165,7 +3395,10 @@ impl Render for Enso {
                         let path = entry.path.clone();
                         let menu_path = path.clone();
                         let expanded = self.expanded.contains(&path);
-                        let active = highlighted.as_ref() == Some(&path);
+                        let active = highlighted.as_ref() == Some(&path)
+                            || (self.marked.len() > 1 && self.marked.contains(&path));
+                        // Cut, waiting to be pasted somewhere.
+                        let cut = self.copied_files.as_ref().is_some_and(|c| c.cut && c.paths.contains(&path));
                         let label = path
                             .file_name()
                             .unwrap_or_default()
@@ -3244,7 +3477,11 @@ impl Render for Enso {
                             .relative()
                             .when(!pending, |row| {
                                 row.on_drag(
-                                    DraggedEntry { path: path.clone(), directory: entry.directory },
+                                    DraggedEntry {
+                                        path: path.clone(),
+                                        directory: entry.directory,
+                                        paths: self.selection_with(&path),
+                                    },
                                     |entry, _, _, cx| cx.new(|_| entry.clone()),
                                 )
                             })
@@ -3263,7 +3500,7 @@ impl Render for Enso {
                             .on_drop(cx.listener({
                                 let dir = drop_dir.clone();
                                 move |this, e: &DraggedEntry, _, cx| {
-                                    this.move_entry(e.path.clone(), dir.clone(), cx)
+                                    this.move_entries(e.paths.clone(), dir.clone(), cx)
                                 }
                             }))
                             .on_drop(cx.listener({
@@ -3289,15 +3526,27 @@ impl Render for Enso {
                             .rounded_md()
                             .cursor_pointer()
                             .text_sm()
-                            // Selection is a soft tint; the darker text carries it.
                             .when(active, |row| row.font_weight(FontWeight::MEDIUM))
-                            .when(active || renaming, |row| {
-                                row.bg(theme.secondary.opacity(0.5))
-                            })
-                            .when(!active && !renaming, |row| {
-                                row.text_color(muted)
-                                    .hover(|row| row.bg(theme.secondary.opacity(0.35)))
-                            })
+                            .when(cut, |row| row.opacity(0.5))
+                            .when(!active && !renaming, |row| row.text_color(muted))
+                            .group("tree-row")
+                            // Selection and hover start where the indent guides
+                            // end, at the row's own chevron, and run to its end.
+                            .child(
+                                div()
+                                    .absolute()
+                                    .top_0()
+                                    .bottom_0()
+                                    .left(px(4. + TREE_INDENT * (depth + 1) as f32))
+                                    .right_0()
+                                    .rounded_md()
+                                    .when(active || renaming, |fill| fill.bg(selected_bg))
+                                    .when(!active && !renaming, |fill| {
+                                        fill.group_hover("tree-row", |fill| {
+                                            fill.bg(theme.foreground.opacity(0.05))
+                                        })
+                                    }),
+                            )
                             .children(guides)
                             .child(
                                 div()
@@ -3396,9 +3645,16 @@ impl Render for Enso {
                                 if event.click_count() >= 2 {
                                     return;
                                 }
-                                this.selected = Some(path.clone());
                                 // The tree takes focus, so Rename and Delete
                                 // shortcuts act on the row just clicked.
+                                let modifiers = event.modifiers();
+                                if this.pick_row(&path, modifiers.shift, modifiers.secondary(cx)) {
+                                    this.focus.focus(w, cx);
+                                    cx.notify();
+                                    return;
+                                }
+                                this.marked.clear();
+                                this.selected = Some(path.clone());
                                 this.focus.focus(w, cx);
                                 if entry.directory {
                                     if !this.expanded.remove(&path) {
@@ -3418,7 +3674,10 @@ impl Render for Enso {
                                     }
                                     // Right-clicking a row selects it, as in Finder.
                                     let _ = weak.update(cx, |this, cx| {
-                                        if this.selected.as_ref() != Some(&menu_path) {
+                                        if this.selected.as_ref() != Some(&menu_path)
+                                            && !(this.marked.len() > 1 && this.marked.contains(&menu_path))
+                                        {
+                                            this.marked.clear();
                                             this.selected = Some(menu_path.clone());
                                             cx.notify();
                                         }
@@ -3460,14 +3719,28 @@ impl Render for Enso {
                                                 let path = menu_path.clone();
                                                 move |_, window, cx| {
                                                     let _ = weak.update(cx, |this, cx| {
-                                                        this.delete_entry(path.clone(), window, cx)
+                                                        this.delete_entries(this.selection_with(&path), window, cx)
                                                     });
                                                 }
                                             }),
                                     )
                                 }
                             })
-                    })),
+                    }))
+                    // The space below the rows: a click there selects nothing,
+                    // so a paste or a new file goes in the workspace itself.
+                    .child(
+                        div()
+                            .id("tree-blank")
+                            .flex_grow(1.)
+                            .min_h(px(TREE_ROW_HEIGHT))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.selected = None;
+                                this.marked.clear();
+                                this.focus.focus(window, cx);
+                                cx.notify();
+                            })),
+                    ),
             )
             .child(
                 h_flex().px_3().py_3().child(
@@ -3891,6 +4164,8 @@ impl Render for Enso {
             .on_action(cx.listener(|this, _: &OpenCommandPalette, w, cx| this.open_palette(w, cx)))
             .on_action(cx.listener(|this, _: &SearchEverything, w, cx| this.toggle_content_search(w, cx)))
             .on_action(cx.listener(|this, _: &PasteFiles, w, cx| this.paste_files(w, cx)))
+            .on_action(cx.listener(|this, _: &CopySelected, w, cx| this.copy_selected(false, w, cx)))
+            .on_action(cx.listener(|this, _: &CutSelected, w, cx| this.copy_selected(true, w, cx)))
             .on_action(cx.listener(|this, action: &spellcheck::ReplaceSpelling, w, cx| this.replace_spelling(action, w, cx)))
             .on_action(cx.listener(|this, _: &ExportNote, w, cx| this.open_export(w, cx)))
             .on_action(cx.listener(|this, _: &ToggleLock, _, cx| this.toggle_lock(cx)))
@@ -3935,9 +4210,11 @@ impl Render for Enso {
                 }
             }))
             .on_action(cx.listener(|this, _: &DeleteSelected, w, cx| {
-                match this.selected_entry().filter(|_| this.focus.is_focused(w)) {
-                    Some(path) => this.delete_entry(path, w, cx),
-                    None => cx.propagate(),
+                let picked = this.selection();
+                if picked.is_empty() || !this.focus.is_focused(w) {
+                    cx.propagate();
+                } else {
+                    this.delete_entries(picked, w, cx);
                 }
             }))
             .on_action(cx.listener(|this, _: &ToggleView, window, cx| {
@@ -4062,43 +4339,36 @@ fn bind_view_keys(cx: &mut App) {
         KeyBinding::new("escape", DismissExport, Some("ExportDialog")),
         KeyBinding::new("escape", DismissLightbox, Some("Lightbox")),
         KeyBinding::new(if cfg!(target_os = "macos") { "cmd-shift-t" } else { "ctrl-shift-t" }, ReopenClosedTab, Some("Enso")),
-        KeyBinding::new("ctrl-shift-p", OpenCommandPalette, Some("Enso")),
-        KeyBinding::new("cmd-shift-p", OpenCommandPalette, Some("Enso")),
+        KeyBinding::new(if cfg!(target_os = "macos") { "cmd-shift-p" } else { "ctrl-shift-p" }, OpenCommandPalette, Some("Enso")),
         KeyBinding::new(if cfg!(target_os = "macos") { "cmd-shift-s" } else { "ctrl-shift-s" }, SearchEverything, Some("Enso")),
         // At the window's depth only: in a Markdown editor the same keys are
         // Bold, which its deeper context binds first.
         KeyBinding::new(if cfg!(target_os = "macos") { "cmd-b" } else { "ctrl-b" }, ToggleSidebar, Some("Enso")),
         // Only acts while the sidebar has focus; text fields paste as usual.
         KeyBinding::new(if cfg!(target_os = "macos") { "cmd-v" } else { "ctrl-v" }, PasteFiles, Some("Enso")),
+        KeyBinding::new(if cfg!(target_os = "macos") { "cmd-c" } else { "ctrl-c" }, CopySelected, Some("Enso")),
+        KeyBinding::new(if cfg!(target_os = "macos") { "cmd-x" } else { "ctrl-x" }, CutSelected, Some("Enso")),
     ]);
-    // Bind at the input's context depth too: macOS inputs normally
-    // consume Ctrl+E as end-of-line before a parent action can see it.
+    // Cmd on macOS, Ctrl elsewhere. On macOS, Ctrl+letter belongs to text
+    // fields (Ctrl+E is end of line, Ctrl+A start of line, Ctrl+K delete to
+    // the end), so enso binds none of them there. Bound at the input's depth
+    // too, so a focused editor doesn't keep them.
+    let primary = |mac: &'static str, other: &'static str| if cfg!(target_os = "macos") { mac } else { other };
     for context in ["Enso", "Enso > Input"] {
         cx.bind_keys([
-            KeyBinding::new(if cfg!(target_os = "macos") { "cmd-shift-\\" } else { "ctrl-shift-\\" }, SwapSplitSides, Some(context)),
+            KeyBinding::new(primary("cmd-shift-\\", "ctrl-shift-\\"), SwapSplitSides, Some(context)),
             // Shifted punctuation is delivered as `|` on macOS, consuming
             // Shift. Accept both representations from platform keyboards.
-            KeyBinding::new(if cfg!(target_os = "macos") { "cmd-|" } else { "ctrl-|" }, SwapSplitSides, Some(context)),
-            KeyBinding::new(if cfg!(target_os = "macos") { "cmd-shift-|" } else { "ctrl-shift-|" }, SwapSplitSides, Some(context)),
-            // Control works on macOS as well as Command, like Ctrl+\ for Split.
-            KeyBinding::new("ctrl-shift-\\", SwapSplitSides, Some(context)),
-            KeyBinding::new("ctrl-|", SwapSplitSides, Some(context)),
-            KeyBinding::new("ctrl-shift-|", SwapSplitSides, Some(context)),
-            KeyBinding::new("ctrl-e", ToggleView, Some(context)),
+            KeyBinding::new(primary("cmd-|", "ctrl-|"), SwapSplitSides, Some(context)),
+            KeyBinding::new(primary("cmd-shift-|", "ctrl-shift-|"), SwapSplitSides, Some(context)),
+            KeyBinding::new(primary("cmd-e", "ctrl-e"), ToggleView, Some(context)),
+            KeyBinding::new(primary("cmd-w", "ctrl-w"), CloseFile, Some(context)),
+            KeyBinding::new(primary("cmd-\\", "ctrl-\\"), ToggleSplit, Some(context)),
             // Ctrl+Tab on every platform: on macOS, Cmd+Tab belongs to the
             // system's app switcher, and browsers use Ctrl+Tab there too.
             KeyBinding::new("ctrl-tab", NextTab, Some(context)),
             KeyBinding::new("ctrl-shift-tab", PreviousTab, Some(context)),
-            KeyBinding::new("ctrl-w", CloseFile, Some(context)),
-            KeyBinding::new("ctrl-\\", ToggleSplit, Some(context)),
         ]);
-        if cfg!(target_os = "macos") {
-            cx.bind_keys([
-                KeyBinding::new("cmd-e", ToggleView, Some(context)),
-                KeyBinding::new("cmd-w", CloseFile, Some(context)),
-                KeyBinding::new("cmd-\\", ToggleSplit, Some(context)),
-            ]);
-        }
     }
 }
 
@@ -4471,8 +4741,7 @@ fn main() {
             lock::init(cx);
             cx.on_action(|_: &OpenSettings, cx| settings::open(cx));
             cx.bind_keys([
-                KeyBinding::new("cmd-,", OpenSettings, None),
-                KeyBinding::new("ctrl-,", OpenSettings, None),
+                KeyBinding::new(if cfg!(target_os = "macos") { "cmd-," } else { "ctrl-," }, OpenSettings, None),
             ]);
             macro_rules! shortcut {
                 ($key:literal, $action:expr) => {
@@ -4509,9 +4778,7 @@ fn main() {
                 ]
             });
             cx.bind_keys([
-                KeyBinding::new("ctrl-shift-n", NewFolder, Some("Enso")),
-                #[cfg(target_os = "macos")]
-                KeyBinding::new("cmd-shift-n", NewFolder, Some("Enso")),
+                KeyBinding::new(if cfg!(target_os = "macos") { "cmd-shift-n" } else { "ctrl-shift-n" }, NewFolder, Some("Enso")),
             ]);
             bind_view_keys(cx);
             bind_markdown_keys(cx);
@@ -4675,7 +4942,7 @@ mod transition_tests {
             draw(cx, handle);
         }
         for _ in 0..4 {
-            cx.simulate_keystrokes(handle, "ctrl-w");
+            cx.simulate_keystrokes(handle, if cfg!(target_os = "macos") { "cmd-w" } else { "ctrl-w" });
             cx.run_until_parked();
             draw(cx, handle);
         }
@@ -4723,7 +4990,7 @@ mod transition_tests {
         }
         // Close all three from the keyboard, the last one open first.
         for _ in 0..3 {
-            cx.simulate_keystrokes(handle, "ctrl-w");
+            cx.simulate_keystrokes(handle, if cfg!(target_os = "macos") { "cmd-w" } else { "ctrl-w" });
             cx.run_until_parked();
             draw(cx, handle);
         }
@@ -4943,6 +5210,170 @@ mod transition_tests {
         cx.update(|cx| view.update(cx, |app, _| app.selected = Some(root.join("deep"))));
         draw(cx, handle);
         cx.update(|cx| assert_eq!(view.read(cx).selected.as_ref(), Some(&root.join("deep"))));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn the_sidebar_copies_and_pastes_files_only_while_it_has_focus(cx: &mut TestAppContext) {
+        cx.update(|cx| { gpui_kit::init(cx); bind_view_keys(cx); });
+        let root = std::env::temp_dir().join(format!("enso-copy-paste-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("folder")).unwrap();
+        std::fs::write(root.join("note.md"), "note").unwrap();
+        let (handle, view) = cx.update(|cx| gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+            cx.new(|cx| {
+                let mut app = Enso::new(window, cx);
+                app.open_folder(root.clone(), cx);
+                app.add_document(Some(root.join("note.md")), "note".into(), None, window, cx);
+                app.mode = Mode::Edit;
+                app
+            })
+        }).unwrap());
+        cx.run_until_parked();
+        draw(cx, handle);
+        let (copy, paste) = if cfg!(target_os = "macos") { ("cmd-c", "cmd-v") } else { ("ctrl-c", "ctrl-v") };
+        let clipboard_files = |cx: &mut TestAppContext| -> Vec<PathBuf> {
+            cx.update(|cx| cx.read_from_clipboard()).map_or(Vec::new(), |item| {
+                item.entries().iter().filter_map(|e| match e {
+                    gpui_kit::ClipboardEntry::ExternalPaths(p) => Some(p.paths().to_vec()),
+                    _ => None,
+                }).flatten().collect()
+            })
+        };
+        // The note is selected in the sidebar, but the editor has focus: the
+        // keys are the editor's, and no file is copied.
+        cx.update(|cx| view.update(cx, |app, _| app.selected = Some(root.join("note.md"))));
+        cx.simulate_keystrokes(handle, copy);
+        cx.run_until_parked();
+        assert!(clipboard_files(cx).is_empty());
+        // Clicked in the sidebar (it has focus): the file is copied.
+        cx.update_window(handle, |_, w, cx| view.update(cx, |app, cx| app.focus.focus(w, cx))).unwrap();
+        draw(cx, handle);
+        cx.simulate_keystrokes(handle, copy);
+        cx.run_until_parked();
+        assert_eq!(clipboard_files(cx), vec![root.join("note.md")]);
+        // Pasted on a folder: copied into it; pasted again, a numbered copy.
+        cx.update(|cx| view.update(cx, |app, _| app.selected = Some(root.join("folder"))));
+        for _ in 0..2 {
+            cx.simulate_keystrokes(handle, paste);
+            cx.run_until_parked();
+        }
+        assert_eq!(std::fs::read_to_string(root.join("folder/note.md")).unwrap(), "note");
+        assert!(root.join("folder/note 2.md").is_file());
+        // A folder copies too, beside itself when pasted on itself.
+        cx.update(|cx| view.update(cx, |app, _| app.selected = Some(root.join("folder"))));
+        cx.simulate_keystrokes(handle, copy);
+        cx.update(|cx| view.update(cx, |app, _| app.selected = Some(root.join("note.md"))));
+        cx.simulate_keystrokes(handle, paste);
+        cx.run_until_parked();
+        assert!(root.join("folder 2/note 2.md").is_file());
+        // Copied and pasted on itself: a copy inside it, made once (not a
+        // copy that keeps copying itself).
+        cx.update(|cx| view.update(cx, |app, _| app.selected = Some(root.join("folder"))));
+        cx.simulate_keystrokes(handle, copy);
+        cx.simulate_keystrokes(handle, paste);
+        cx.run_until_parked();
+        assert!(root.join("folder/folder/note.md").is_file());
+        assert!(!root.join("folder/folder/folder").exists());
+        std::fs::remove_dir_all(root.join("folder/folder")).unwrap();
+        // Cut fades the row; pasting moves it (its tab follows), once.
+        let cut = if cfg!(target_os = "macos") { "cmd-x" } else { "ctrl-x" };
+        cx.update(|cx| view.update(cx, |app, _| app.selected = Some(root.join("note.md"))));
+        cx.simulate_keystrokes(handle, cut);
+        assert!(cx.update(|cx| view.read(cx).copied_files.as_ref().is_some_and(|c| c.cut)));
+        assert!(root.join("note.md").is_file());
+        cx.update(|cx| view.update(cx, |app, _| app.selected = Some(root.join("folder 2"))));
+        cx.simulate_keystrokes(handle, paste);
+        cx.run_until_parked();
+        // "folder 2" already has a note.md and a note 2.md: both kept.
+        assert!(!root.join("note.md").exists() && root.join("folder 2/note 3.md").is_file());
+        assert_eq!(std::fs::read_to_string(root.join("folder 2/note.md")).unwrap(), "note");
+        cx.update(|cx| {
+            let app = view.read(cx);
+            assert_eq!(app.documents[0].path.as_ref(), Some(&root.join("folder 2/note 3.md")));
+            assert!(app.copied_files.is_none());
+        });
+        cx.simulate_keystrokes(handle, paste);
+        cx.run_until_parked();
+        assert!(!root.join("folder 2/note 4.md").exists());
+        draw(cx, handle);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn several_sidebar_items_select_and_move_together(cx: &mut TestAppContext) {
+        cx.update(|cx| { gpui_kit::init(cx); bind_view_keys(cx); });
+        let root = std::env::temp_dir().join(format!("enso-multi-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::create_dir_all(root.join("target")).unwrap();
+        for name in ["a.md", "b.md", "c.md", "sub/d.md"] {
+            std::fs::write(root.join(name), name).unwrap();
+        }
+        let (handle, view) = cx.update(|cx| gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+            cx.new(|cx| {
+                let mut app = Enso::new(window, cx);
+                app.open_folder(root.clone(), cx);
+                app.expanded.insert(root.join("sub"));
+                app.load_folder(root.join("sub"), cx);
+                app
+            })
+        }).unwrap());
+        cx.run_until_parked();
+        cx.update_window(handle, |_, w, cx| view.update(cx, |app, cx| app.focus.focus(w, cx))).unwrap();
+        draw(cx, handle);
+        let selection = |cx: &mut TestAppContext| cx.update(|cx| view.read(cx).selection());
+        let p = |name: &str| root.join(name);
+        // Shift-click from a.md to c.md picks the three; across folders it doesn't.
+        cx.update(|cx| view.update(cx, |app, _| {
+            app.selected = Some(p("a.md"));
+            assert!(app.pick_row(&p("c.md"), true, false));
+            assert!(!app.pick_row(&p("sub/d.md"), true, false));
+        }));
+        assert_eq!(selection(cx), vec![p("a.md"), p("b.md"), p("c.md")]);
+        // Shift-click again shrinks the range from the same anchor.
+        cx.update(|cx| view.update(cx, |app, _| assert!(app.pick_row(&p("b.md"), true, false))));
+        assert_eq!(selection(cx), vec![p("a.md"), p("b.md")]);
+        // Cmd/Ctrl-click adds a row from another folder, and takes one out.
+        cx.update(|cx| view.update(cx, |app, _| {
+            app.pick_row(&p("sub/d.md"), false, true);
+            app.pick_row(&p("c.md"), false, true);
+            app.pick_row(&p("c.md"), false, true);
+        }));
+        assert_eq!(selection(cx), vec![p("a.md"), p("b.md"), p("sub/d.md")]);
+        // A row in the selection drags all of it; one outside drags alone.
+        cx.update(|cx| {
+            let app = view.read(cx);
+            assert_eq!(app.selection_with(&p("b.md")).len(), 3);
+            assert_eq!(app.selection_with(&p("c.md")), vec![p("c.md")]);
+        });
+        // Cut and pasted on a folder: all three move.
+        let (cut, paste) = if cfg!(target_os = "macos") { ("cmd-x", "cmd-v") } else { ("ctrl-x", "ctrl-v") };
+        cx.simulate_keystrokes(handle, cut);
+        cx.update(|cx| view.update(cx, |app, _| { app.marked.clear(); app.selected = Some(p("target")); }));
+        cx.simulate_keystrokes(handle, paste);
+        cx.run_until_parked();
+        for name in ["target/a.md", "target/b.md", "target/d.md"] {
+            assert!(p(name).is_file(), "{name}");
+        }
+        assert!(!p("a.md").exists() && !p("sub/d.md").exists() && p("c.md").is_file());
+        assert_eq!(selection(cx).len(), 3);
+        // A folder and something inside it: the folder alone goes.
+        cx.update(|cx| view.update(cx, |app, _| {
+            app.marked = vec![p("target"), p("target/a.md")];
+        }));
+        assert_eq!(selection(cx), vec![p("target")]);
+        // Deleting several asks once, for all of them.
+        cx.update(|cx| view.update(cx, |app, _| app.marked = vec![p("c.md"), p("target/b.md")]));
+        let _ = handle.update(cx, |_, window, cx| {
+            view.update(cx, |app, cx| app.delete_entries(app.selection(), window, cx))
+        });
+        cx.run_until_parked();
+        assert!(cx.has_pending_prompt());
+        cx.simulate_prompt_answer("Cancel");
+        cx.run_until_parked();
+        assert!(p("c.md").is_file() && p("target/b.md").is_file());
+        draw(cx, handle);
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -5260,18 +5691,49 @@ mod transition_tests {
 
     #[gpui_kit::test]
     fn ctrl_shift_backslash_swaps_the_split_sides(cx: &mut TestAppContext) {
-        // Control as well as Command on macOS, as with Ctrl+\ for Split; the
-        // shifted key also arrives as `|` from some keyboards.
+        // Cmd on macOS, Ctrl elsewhere; the shifted key also arrives as `|`
+        // from some keyboards. On macOS, Ctrl keys are left to text fields.
         cx.update(|cx| {
             bind_view_keys(cx);
             let keymap = cx.key_bindings();
             let keymap = keymap.borrow();
-            for typed in ["ctrl-shift-\\", "ctrl-|"] {
-                let keystroke = gpui_kit::Keystroke::parse(typed).unwrap();
-                let bound = keymap
+            let swaps = |typed: &'static str| {
+                let keystroke = gpui_kit::Keystroke::parse(typed).map_err(|e| e.to_string()).unwrap();
+                keymap
                     .bindings_for_action(&super::SwapSplitSides)
-                    .any(|binding| binding.match_keystrokes(&[keystroke.clone()]) == Some(false));
-                assert!(bound, "{typed} doesn't swap the split sides");
+                    .any(|binding| binding.match_keystrokes(&[keystroke.clone()]) == Some(false))
+            };
+            let typed = if cfg!(target_os = "macos") {
+                ["cmd-shift-\\", "cmd-|"]
+            } else {
+                ["ctrl-shift-\\", "ctrl-|"]
+            };
+            for typed in typed {
+                assert!(swaps(typed), "{typed} doesn't swap the split sides");
+            }
+            if cfg!(target_os = "macos") {
+                assert!(!swaps("ctrl-shift-\\") && !swaps("ctrl-|"));
+            }
+        });
+    }
+
+    #[gpui_kit::test]
+    fn macos_leaves_control_letters_to_text_fields(cx: &mut TestAppContext) {
+        if !cfg!(target_os = "macos") {
+            return;
+        }
+        cx.update(|cx| {
+            bind_view_keys(cx);
+            let keymap = cx.key_bindings();
+            let keymap = keymap.borrow();
+            // Only tab cycling uses Control on macOS.
+            for binding in keymap.bindings() {
+                let keys = binding.keystrokes();
+                if let [key] = keys
+                    && key.modifiers().control
+                {
+                    assert!(key.key() == "tab", "Ctrl+{} is bound on macOS", key.key());
+                }
             }
         });
     }
@@ -5534,11 +5996,11 @@ mod transition_tests {
         });
         draw(cx, handle);
         // The first press closes the tab, the window stays.
-        cx.simulate_keystrokes(handle, "ctrl-w");
+        cx.simulate_keystrokes(handle, if cfg!(target_os = "macos") { "cmd-w" } else { "ctrl-w" });
         cx.run_until_parked();
         assert!(cx.update(|cx| cx.windows().contains(&handle)));
         // With no tabs left, the next one closes the window.
-        cx.simulate_keystrokes(handle, "ctrl-w");
+        cx.simulate_keystrokes(handle, if cfg!(target_os = "macos") { "cmd-w" } else { "ctrl-w" });
         cx.run_until_parked();
         assert!(!cx.update(|cx| cx.windows().contains(&handle)));
     }
@@ -5764,7 +6226,7 @@ mod transition_tests {
         draw(cx, handle);
         for iteration in 0..4 {
             let started = std::time::Instant::now();
-            cx.simulate_keystrokes(handle, "ctrl-e");
+            cx.simulate_keystrokes(handle, if cfg!(target_os = "macos") { "cmd-e" } else { "ctrl-e" });
             draw(cx, handle);
             if iteration == 0 {
                 eprintln!("First Edit transition: {:?}", started.elapsed());
@@ -5798,7 +6260,7 @@ mod transition_tests {
             })
             .unwrap();
             draw(cx, handle);
-            cx.simulate_keystrokes(handle, "ctrl-e");
+            cx.simulate_keystrokes(handle, if cfg!(target_os = "macos") { "cmd-e" } else { "ctrl-e" });
             draw(cx, handle);
             cx.update_window(handle, |_, window, cx| {
                 let state = view.read(cx);
@@ -5826,7 +6288,7 @@ mod transition_tests {
             })
             .unwrap();
         }
-        cx.simulate_keystrokes(handle, "ctrl-\\");
+        cx.simulate_keystrokes(handle, if cfg!(target_os = "macos") { "cmd-\\" } else { "ctrl-\\" });
         draw(cx, handle);
         cx.update(|cx| {
             let state = view.read(cx);
@@ -5902,7 +6364,7 @@ mod transition_tests {
                 "click at {cursor} outside preview {range:?}"
             );
         });
-        cx.simulate_keystrokes(handle, "ctrl-\\");
+        cx.simulate_keystrokes(handle, if cfg!(target_os = "macos") { "cmd-\\" } else { "ctrl-\\" });
         draw(cx, handle);
         cx.update(|cx| assert!(view.read(cx).mode == Mode::Read));
     }
@@ -5994,7 +6456,7 @@ mod transition_tests {
             })
         })
         .unwrap();
-        cx.simulate_keystrokes(handle, "ctrl-w");
+        cx.simulate_keystrokes(handle, if cfg!(target_os = "macos") { "cmd-w" } else { "ctrl-w" });
         draw(cx, handle);
         cx.update(|cx| {
             assert_eq!(view.read(cx).documents.len(), 1);
@@ -6004,7 +6466,7 @@ mod transition_tests {
         // After resolving the conflict, the final shortcut closes the tab,
         // leaving the application window and an empty document list alive.
         std::fs::write(&paths[1], "edited-1").unwrap();
-        cx.simulate_keystrokes(handle, "ctrl-w");
+        cx.simulate_keystrokes(handle, if cfg!(target_os = "macos") { "cmd-w" } else { "ctrl-w" });
         draw(cx, handle);
         assert_eq!(std::fs::read_to_string(&paths[1]).unwrap(), "my edit");
         cx.update(|cx| {

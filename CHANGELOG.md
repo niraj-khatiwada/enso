@@ -5,7 +5,11 @@
 Enhancements:
 
 - Ctrl + Tab moves to the next tab and Ctrl + Shift + Tab to the previous one, on every platform.
-- Ctrl + Shift + \ swaps the sides of Split on macOS too, like Ctrl + \ opens it.
+- On macOS, every shortcut uses Cmd, and Control keys are left to text editing (Ctrl + E moves to the end of the line again). Tabs still cycle with Ctrl + Tab, as in browsers.
+- Backspace in the insert menu with nothing typed closes it and puts the cursor back where it was; opened with `/`, the slash is erased too.
+- Copy a file or folder in the sidebar with Cmd/Ctrl + C and paste it into any folder with Cmd/Ctrl + V, while the sidebar has focus. On macOS, copied files paste in Finder too. A folder can be pasted into itself, as a copy inside it. Cmd/Ctrl + X cuts instead, and pasting moves the item.
+- Select several files and folders in the sidebar with Cmd + click (Ctrl + click on Windows and Linux), or Shift + click for a range within one folder; copy, cut, drag and delete them together.
+- Moving a file into a folder that already has one by that name keeps both, numbering the moved one, instead of refusing.
 
 ### 1.0.0
 

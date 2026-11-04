@@ -281,35 +281,16 @@ pub fn move_into(path: &Path, dir: &Path) -> io::Result<PathBuf> {
             "A folder can't be moved into itself.",
         ));
     }
-    if fs::symlink_metadata(&target).is_ok() {
-        return Err(io::Error::new(
-            io::ErrorKind::AlreadyExists,
-            format!("“{}” already has an item with that name.", folder_name(dir)),
-        ));
-    }
+    // A name already taken there: both are kept, the moved one numbered.
+    let target = free_name(path, dir);
     fs::rename(path, &target)?;
     Ok(target)
 }
 
-fn folder_name(dir: &Path) -> String {
-    dir.file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| dir.display().to_string())
-}
-
-/// Copy a file or folder (from Finder, say) into `dir`. A name already taken
-/// gets a number, as Finder does: "Note 2.md".
-pub fn copy_into(source: &Path, dir: &Path) -> io::Result<PathBuf> {
-    let name = source
-        .file_name()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "This item can't be copied."))?;
-    if source.is_dir() && dir.starts_with(source) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "A folder can't be copied into itself.",
-        ));
-    }
-    let name = Path::new(name);
+/// `source`'s name in `dir`, or the first free numbered one: "note 2.md",
+/// "folder 2".
+fn free_name(source: &Path, dir: &Path) -> PathBuf {
+    let name = Path::new(source.file_name().unwrap_or_default());
     let stem = name.file_stem().unwrap_or_default().to_string_lossy();
     let extension = name.extension().map(|e| format!(".{}", e.to_string_lossy()));
     let mut target = dir.join(name);
@@ -321,6 +302,31 @@ pub fn copy_into(source: &Path, dir: &Path) -> io::Result<PathBuf> {
             dir.join(format!("{stem} {n}{}", extension.as_deref().unwrap_or("")))
         };
         n += 1;
+    }
+    target
+}
+
+/// Copy a file or folder (from Finder, say) into `dir`. A name already taken
+/// gets a number, as Finder does: "Note 2.md".
+pub fn copy_into(source: &Path, dir: &Path) -> io::Result<PathBuf> {
+    source
+        .file_name()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "This item can't be copied."))?;
+    let target = free_name(source, dir);
+    // Into itself (or a folder inside it): copied whole beside it first, under
+    // a hidden name, then moved in, so the copy never copies itself again.
+    if source.is_dir() && dir.starts_with(source) {
+        let parent = source.parent().unwrap_or(dir);
+        let staging = (0..)
+            .map(|n| parent.join(format!(".enso-copy-{}-{n}", std::process::id())))
+            .find(|p| fs::symlink_metadata(p).is_err())
+            .expect("a free name");
+        if let Err(error) = copy_recursive(source, &staging) {
+            let _ = fs::remove_dir_all(&staging);
+            return Err(error);
+        }
+        fs::rename(&staging, &target)?;
+        return Ok(target);
     }
     copy_recursive(source, &target)?;
     Ok(target)
@@ -437,18 +443,26 @@ mod tests {
         fs::create_dir_all(root.join("b")).unwrap();
         fs::write(root.join("note.md"), "x").unwrap();
         fs::write(root.join("b/note.md"), "taken").unwrap();
-        // Same name already there: refused, nothing lost.
-        assert!(move_into(&root.join("note.md"), &root.join("b")).is_err());
+        // Same name already there: both kept, the moved one numbered.
+        let moved = move_into(&root.join("note.md"), &root.join("b")).unwrap();
+        assert_eq!(moved, root.join("b/note 2.md"));
         assert_eq!(fs::read_to_string(root.join("b/note.md")).unwrap(), "taken");
+        assert_eq!(fs::read_to_string(&moved).unwrap(), "x");
         // A folder can't go inside itself.
         assert!(move_into(&root.join("a"), &root.join("a/inner")).is_err());
-        let moved = move_into(&root.join("note.md"), &root.join("a")).unwrap();
-        assert_eq!(moved, root.join("a/note.md"));
+        let moved = move_into(&moved, &root.join("a")).unwrap();
+        assert_eq!(moved, root.join("a/note 2.md"));
         // Copies take a number when the name is taken, folders included.
-        assert_eq!(copy_into(&moved, &root.join("b")).unwrap(), root.join("b/note 2.md"));
+        assert_eq!(copy_into(&root.join("b/note.md"), &root.join("b")).unwrap(), root.join("b/note 2.md"));
         assert_eq!(copy_into(&root.join("a"), &root.join("b")).unwrap(), root.join("b/a"));
-        assert!(root.join("b/a/inner").is_dir() && root.join("b/a/note.md").is_file());
+        assert!(root.join("b/a/inner").is_dir() && root.join("b/a/note 2.md").is_file());
         assert_eq!(copy_into(&root.join("a"), &root.join("b")).unwrap(), root.join("b/a 2"));
+        // A folder copied into itself, or deeper inside itself: copied once.
+        assert_eq!(copy_into(&root.join("a"), &root.join("a")).unwrap(), root.join("a/a"));
+        assert!(root.join("a/a/inner").is_dir() && !root.join("a/a/a").exists());
+        assert_eq!(copy_into(&root.join("a"), &root.join("a/inner")).unwrap(), root.join("a/inner/a"));
+        assert!(root.join("a/inner/a/a/note 2.md").is_file() && !root.join("a/inner/a/inner/a").exists());
+        assert!(fs::read_dir(&root).unwrap().all(|e| !e.unwrap().file_name().to_string_lossy().starts_with(".enso-copy")));
         fs::remove_dir_all(root).unwrap();
     }
 

@@ -631,6 +631,33 @@ impl Enso {
         }
     }
 
+    /// Backspace (or Delete) in the insert menu's empty search closes it and
+    /// puts the cursor back where it was. Opened by typing `/`, the slash goes
+    /// too, as the key would have erased it in the editor. Returns whether it
+    /// was the insert menu with nothing typed.
+    fn erase_empty_insert_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let Some(palette) = self.palette.as_ref() else {
+            return false;
+        };
+        if palette.anchor.is_none() || palette.search.is_some() || !palette.state.read(cx).query(cx).is_empty() {
+            return false;
+        }
+        let slash = palette
+            .replace_slash
+            .then(|| palette.target.clone())
+            .flatten();
+        self.close_palette(window, cx);
+        if let Some((editor, range)) = slash {
+            editor.update(cx, |state, cx| {
+                if state.value().get(range.clone()) == Some("/") {
+                    state.set_selected_range(range, cx);
+                    state.replace("", window, cx);
+                }
+            });
+        }
+        true
+    }
+
     fn confirm_palette(
         &mut self,
         section: usize,
@@ -1085,6 +1112,10 @@ impl Enso {
                     if event.keystroke.key == "escape" {
                         cx.stop_propagation();
                         this.close_palette(window, cx);
+                    } else if matches!(event.keystroke.key.as_str(), "backspace" | "delete")
+                        && this.erase_empty_insert_menu(window, cx)
+                    {
+                        cx.stop_propagation();
                     }
                 }))
                 .child(
@@ -1917,6 +1948,46 @@ mod ui_tests {
             assert!(app.expanded.contains(&root.join("notes")));
         });
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn backspace_on_an_empty_insert_menu_closes_it_and_erases_the_slash(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            super::super::bind_view_keys(cx);
+            bind_markdown_keys(cx);
+        });
+        let (handle, view) = cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| {
+                    let mut app = Enso::new(window, cx);
+                    app.add_document(Some(PathBuf::from("slash.md")), "".into(), None, window, cx);
+                    app.mode = Mode::Edit;
+                    app
+                })
+            })
+            .unwrap()
+        });
+        draw(cx, handle);
+        let editor = cx.update(|cx| view.read(cx).documents[0].editor.clone());
+        cx.update_window(handle, |_, window, cx| editor.focus_handle(cx).focus(window, cx)).unwrap();
+        draw(cx, handle);
+        cx.simulate_keystrokes(handle, "/");
+        draw(cx, handle);
+        assert!(cx.update(|cx| view.read(cx).palette.is_some()));
+        // With a query, Backspace edits the query and the menu stays.
+        cx.simulate_input(handle, "ta");
+        cx.simulate_keystrokes(handle, "backspace backspace");
+        draw(cx, handle);
+        assert!(cx.update(|cx| view.read(cx).palette.is_some()));
+        // Empty: it closes, the slash goes, and typing lands in the editor.
+        cx.simulate_keystrokes(handle, "backspace");
+        draw(cx, handle);
+        assert!(cx.update(|cx| view.read(cx).palette.is_none()));
+        assert_eq!(cx.update(|cx| editor.read(cx).value().to_string()), "");
+        cx.simulate_input(handle, "hi");
+        draw(cx, handle);
+        assert_eq!(cx.update(|cx| editor.read(cx).value().to_string()), "hi");
     }
 
     #[gpui_kit::test]
