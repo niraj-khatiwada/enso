@@ -1,5 +1,11 @@
 # Changelog
 
+### 1.1.0
+
+Enhancements:
+
+- Ctrl + Tab moves to the next tab and Ctrl + Shift + Tab to the previous one, on every platform.
+
 ### 1.0.0
 
 Features:

@@ -65,6 +65,8 @@ actions!(
         ToggleSplit,
         SwapSplitSides,
         ToggleSidebar,
+        NextTab,
+        PreviousTab,
         NewFolder,
         RenameSelected,
         DeleteSelected,
@@ -752,6 +754,20 @@ impl Enso {
         if let Some(path) = doc.path.clone() {
             lock::set_locked(&path, locked, cx);
         }
+        cx.notify();
+    }
+
+    /// Move to the next tab (`step` 1) or the previous one (-1), wrapping
+    /// around at either end, as clicking it would.
+    pub(crate) fn cycle_tab(&mut self, step: isize, cx: &mut Context<Self>) {
+        let count = self.documents.len() as isize;
+        if count < 2 {
+            return;
+        }
+        let current = self.active.unwrap_or(0) as isize;
+        self.active = Some((current + step).rem_euclid(count) as usize);
+        self.selected = None;
+        self.refocus = true;
         cx.notify();
     }
 
@@ -3879,6 +3895,8 @@ impl Render for Enso {
             .on_action(cx.listener(|this, _: &ExportNote, w, cx| this.open_export(w, cx)))
             .on_action(cx.listener(|this, _: &ToggleLock, _, cx| this.toggle_lock(cx)))
             .on_action(cx.listener(|this, _: &ToggleSidebar, _, cx| this.toggle_sidebar(cx)))
+            .on_action(cx.listener(|this, _: &NextTab, _, cx| this.cycle_tab(1, cx)))
+            .on_action(cx.listener(|this, _: &PreviousTab, _, cx| this.cycle_tab(-1, cx)))
             .on_action(cx.listener(|this, _: &CopyRichText, _, cx| {
                 let images = this.export_choice.images;
                 this.copy_rich_text(images, cx)
@@ -4063,6 +4081,10 @@ fn bind_view_keys(cx: &mut App) {
             KeyBinding::new(if cfg!(target_os = "macos") { "cmd-|" } else { "ctrl-|" }, SwapSplitSides, Some(context)),
             KeyBinding::new(if cfg!(target_os = "macos") { "cmd-shift-|" } else { "ctrl-shift-|" }, SwapSplitSides, Some(context)),
             KeyBinding::new("ctrl-e", ToggleView, Some(context)),
+            // Ctrl+Tab on every platform: on macOS, Cmd+Tab belongs to the
+            // system's app switcher, and browsers use Ctrl+Tab there too.
+            KeyBinding::new("ctrl-tab", NextTab, Some(context)),
+            KeyBinding::new("ctrl-shift-tab", PreviousTab, Some(context)),
             KeyBinding::new("ctrl-w", CloseFile, Some(context)),
             KeyBinding::new("ctrl-\\", ToggleSplit, Some(context)),
         ]);
@@ -5230,6 +5252,43 @@ mod transition_tests {
         draw(cx, handle);
         assert!(cx.update(|cx| view.read(cx).lightbox.is_none()));
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn ctrl_tab_cycles_through_the_tabs(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            bind_view_keys(cx);
+            super::bind_markdown_keys(cx);
+        });
+        let (handle, view) = cx.update(|cx| gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+            cx.new(|cx| {
+                let mut app = Enso::new(window, cx);
+                for name in ["a.md", "b.md", "c.md"] {
+                    app.add_document(Some(PathBuf::from(name)), "text".into(), None, window, cx);
+                }
+                app.active = Some(0);
+                app
+            })
+        }).unwrap());
+        draw(cx, handle);
+        let active = |cx: &mut TestAppContext| cx.update(|cx| view.read(cx).active);
+        cx.simulate_keystrokes(handle, "ctrl-tab");
+        draw(cx, handle);
+        assert_eq!(active(cx), Some(1));
+        // Back past the first tab wraps around to the last.
+        cx.simulate_keystrokes(handle, "ctrl-shift-tab ctrl-shift-tab");
+        draw(cx, handle);
+        assert_eq!(active(cx), Some(2));
+        // In the editor too, without typing anything.
+        cx.update(|cx| view.update(cx, |app, cx| { app.mode = Mode::Edit; cx.notify(); }));
+        draw(cx, handle);
+        let editor = cx.update(|cx| view.read(cx).documents[2].editor.clone());
+        cx.update_window(handle, |_, window, cx| editor.focus_handle(cx).focus(window, cx)).unwrap();
+        cx.simulate_keystrokes(handle, "ctrl-tab");
+        draw(cx, handle);
+        assert_eq!(active(cx), Some(0));
+        assert_eq!(cx.update(|cx| editor.read(cx).value().to_string()), "text");
     }
 
     #[gpui_kit::test]
