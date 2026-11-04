@@ -9,7 +9,7 @@ export const LATEST_RELEASE_URL = `${REPO_URL}/releases/latest`
 interface GitHubRelease {
   tag_name: string
   html_url: string
-  assets: Array<{ name: string; browser_download_url: string; size: number }>
+  assets: Array<{ name: string; browser_download_url: string }>
 }
 
 export interface Download {
@@ -17,8 +17,6 @@ export interface Download {
   label: string
   file: string
   href: string
-  /** Size in MB, when the release reports it */
-  size?: number
 }
 
 /** One kind of package (a disk image, an installer, a .deb…), in each architecture built */
@@ -94,7 +92,6 @@ export async function getPlatforms(): Promise<{ version: string; releaseUrl: str
       label,
       file,
       href: found?.browser_download_url ?? LATEST_RELEASE_URL,
-      size: found ? Math.round(found.size / 1024 / 1024) : undefined,
     }
   }
 

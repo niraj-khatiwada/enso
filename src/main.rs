@@ -17,7 +17,6 @@ mod links;
 mod wiki;
 mod markdown_edit;
 mod media;
-mod onboarding;
 mod outline;
 mod palette;
 mod reader;
@@ -754,32 +753,6 @@ impl Enso {
                 settings::watch_system(window),
             ],
         }
-    }
-
-    fn open_first_launch_sample(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let task = cx.background_executor().spawn(async { onboarding::load() });
-        cx.spawn_in(window, async move |this, cx| {
-            let result = task.await;
-            let _ = this.update_in(cx, |this, window, cx| match result {
-                Ok(Some((path, source))) => {
-                    // A file opened while initialization was pending wins focus.
-                    let active = this.active;
-                    let mode = this.mode;
-                    this.add_document(Some(path), source, None, window, cx);
-                    if active.is_some() {
-                        this.active = active;
-                        this.mode = mode;
-                    }
-                }
-                Ok(None) => {}
-                Err(error) => this.message(
-                    format!("Could not create Get Started.md: {error}"),
-                    true,
-                    cx,
-                ),
-            });
-        })
-        .detach();
     }
 
     fn set_mode(&mut self, mode: Mode, window: &mut Window, cx: &mut Context<Self>) {
@@ -5121,9 +5094,7 @@ fn main() {
                             cx,
                         )
                     }),
-                    None => open_enso_window(cx, |app, window, cx| {
-                        app.open_first_launch_sample(window, cx)
-                    }),
+                    None => open_enso_window(cx, |_, _, _| {}),
                 }
             }
             check_for_updates(cx);

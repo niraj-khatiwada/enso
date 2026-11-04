@@ -33,7 +33,7 @@ const movements: {
     title: "Write",
     line: "Plain text, gently helped.",
     items: [
-      { title: "Live Preview", text: "Write Markdown and watch the page take shape as you type, right beside the source." },
+      { title: "Live Preview", text: "Write markdown and watch the page take shape as you type, right beside the source." },
       { title: "Command Palette", text: "Every action in one search, found by name or everyday words like “todo” or “photo”." },
       { title: "Slash Menu", text: "Type / on an empty line for tables, images, diagrams, footnotes and more." },
     ],
@@ -99,7 +99,7 @@ const facts = [
             A little space <br class="br-wide" />for your thoughts.
           </h1>
           <p class="hero-lede" data-rise style="--delay:.16s">
-            Enso is a quiet, fast, native Markdown workspace. Read your notes like a book, write in plain text, and keep
+            Enso is a quiet, fast, native markdown workspace. Read your notes like a book, write in plain text, and keep
             every page an ordinary file on your computer.
           </p>
           <div class="hero-actions" data-rise style="--delay:.24s">
@@ -138,7 +138,7 @@ const facts = [
       <section class="quiet container">
         <p class="display quiet-text" data-rise>
           No Electron, no Webview, No Account. <span>enso is native software, written in Rust, and your notes stay plain
-          Markdown in folders you already own.</span>
+          markdown in folders you already own.</span>
         </p>
         <dl class="facts">
           {
@@ -250,7 +250,6 @@ const facts = [
                         <span class="file-label">{row.label}</span>
                         <span class="file-name">
                           {row.ext}
-                          {row.files[0].size && ` · ${row.files[0].size} MB`}
                         </span>
                         <Icon name="arrowDown" size={15} />
                       </a>
@@ -260,7 +259,7 @@ const facts = [
                         <span class="file-name">{row.ext.slice(1) === row.label ? "" : row.ext}</span>
                         <span class="file-archs">
                           {row.files.map((f) => (
-                            <a href={f.href} title={f.size ? `${f.file} · ${f.size} MB` : f.file}>
+                            <a href={f.href} title={f.file}>
                               {f.label}
                             </a>
                           ))}

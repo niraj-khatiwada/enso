@@ -66,4 +66,22 @@ mod tests {
         assert!(html.contains("<img src=\"a.png\" width=\"100%\" />"));
         assert!(!html.contains("title: x"));
     }
+
+    #[test]
+    fn preserves_pasted_image_attributes_for_quicklook_attachments() {
+        let image = r#"<img src=".assets/images/photo.jpg" alt="Local reference photograph for the field journal" width="17.9%" style="display: block; margin-left: auto; margin-right: auto;" />"#;
+        let html = render(&format!("# Workspace guide\n\n{image}\n\n## Choose a trail\n"));
+        assert!(html.contains(image));
+        assert!(!html.contains("&lt;img"));
+    }
+
+    #[test]
+    fn renders_markdown_images_but_keeps_code_examples_literal() {
+        let html = render(
+            "![Photo](.assets/images/photo.jpg)\n\n```html\n<img src=\"example.jpg\" />\n```\n",
+        );
+        assert!(html.contains(r#"<img src=".assets/images/photo.jpg" alt="Photo" />"#));
+        assert!(html.contains("&lt;img src=&quot;example.jpg&quot; /&gt;"));
+        assert!(!html.contains(r#"<img src="example.jpg""#));
+    }
 }
