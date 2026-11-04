@@ -1,3 +1,7 @@
+// Release builds on Windows open as a window, without a console behind it;
+// debug builds keep the console for their log messages.
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 mod app_icon;
 mod brand;
 mod diagram;
