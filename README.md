@@ -193,6 +193,8 @@ The source editor also has ⌘F find, ⌘⇧F replace, ⌘] / ⌘[ to indent and
 
 `rust-toolchain.toml` pins the Rust version; rustup downloads it on the first build.
 
+With Xcode 26 or later the app gets the layered icon that follows the macOS 26 Dock styles (default, dark, clear and tinted). Older Xcode versions fall back to a flat icon.
+
 ### 2. Get the code
 
 ```sh

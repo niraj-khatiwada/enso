@@ -30,6 +30,22 @@ rm -rf "$bundle"
 mkdir -p "$bundle/Contents/MacOS" "$bundle/Contents/Resources"
 cp "$binary" "$bundle/Contents/MacOS/enso"
 cp assets/enso.icns "$bundle/Contents/Resources/enso.icns"
+icon_name=""
+if xcrun actool assets/enso.icon \
+    --compile "$bundle/Contents/Resources" \
+    --app-icon enso \
+    --platform macosx \
+    --target-device mac \
+    --minimum-deployment-target 11.0 \
+    --output-partial-info-plist "$PWD/target/icon-info.plist" \
+    --output-format human-readable-text >/dev/null 2>&1 \
+    && [ -f "$bundle/Contents/Resources/Assets.car" ]; then
+    icon_name="<key>CFBundleIconName</key><string>enso</string>"
+else
+    rm -f "$bundle/Contents/Resources/Assets.car"
+    cp assets/enso.icns "$bundle/Contents/Resources/enso.icns"
+    echo "Xcode 26 or later is needed for the layered macOS 26 icon; using the flat icon." >&2
+fi
 cat > "$bundle/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -38,7 +54,8 @@ cat > "$bundle/Contents/Info.plist" <<PLIST
 <key>CFBundleDisplayName</key><string>enso</string>
 <key>CFBundleIdentifier</key><string>app.enso.markdown</string>
 <key>CFBundleExecutable</key><string>enso</string>
-<key>CFBundleIconFile</key><string>enso.icns</string>
+<key>CFBundleIconFile</key><string>enso</string>
+$icon_name
 <key>CFBundlePackageType</key><string>APPL</string>
 <key>CFBundleShortVersionString</key><string>$version</string>
 <key>CFBundleVersion</key><string>$version</string>

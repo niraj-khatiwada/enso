@@ -45,6 +45,11 @@ jobs:
       - name: Credentials for the gpui-base fork
         shell: bash
         run: git config --global url."https://x-access-token:${{ github.token }}@github.com/viai957/enso".insteadOf "https://github.com/viai957/enso"
+      - name: Use the newest Xcode
+        run: |
+          xcode=$(ls -d /Applications/Xcode_*.app | grep -vi beta | sort -V | tail -n 1)
+          sudo xcode-select -s "$xcode"
+          xcodebuild -version
       - uses: dtolnay/rust-toolchain@1.97.0
         with:
           targets: aarch64-apple-darwin, x86_64-apple-darwin
