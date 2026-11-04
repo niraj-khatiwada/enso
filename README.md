@@ -16,6 +16,19 @@
   </picture>
 </p>
 
+## Download
+
+| Your computer | Download | Then |
+|---|---|---|
+| **Mac** (Apple silicon or Intel) | [enso-macos.dmg](../../releases/latest/download/enso-macos.dmg) | Open it and drag **enso** onto **Applications**. |
+| **Windows** | [enso-windows-x64-setup.exe](../../releases/latest/download/enso-windows-x64-setup.exe) | Run it and follow the steps. |
+| **Ubuntu, Debian, Mint, Pop!_OS** | [enso-linux-amd64.deb](../../releases/latest/download/enso-linux-amd64.deb) | Double-click it and choose **Install**. |
+| **Other Linux** | [enso-linux-x86_64.AppImage](../../releases/latest/download/enso-linux-x86_64.AppImage) | Right-click › Properties › allow running as a program, then double-click it. |
+
+Windows on ARM, ARM Linux, portable Windows zips and older versions are on the [releases page](../../releases).
+
+**First launch.** If your Mac says it can't check enso for malicious software, open **System Settings › Privacy & Security** and click **Open Anyway**. If Windows shows "Windows protected your PC", click **More info › Run anyway**. You only need to do this once.
+
 ## Write in the page
 
 Open any Markdown file and you see it typeset: headings, emphasis, lists, task lists, quotes, tables, code blocks, links and images. Click anywhere and type. There's no preview pane: the page you read is the page you edit, and the Markdown behind it changes only where you typed.
@@ -168,7 +181,7 @@ Typing is built to fit inside a 120 Hz frame on documents of hundreds of kilobyt
 
 The source editor also has ⌘F find, ⌘⇧F replace, ⌘] / ⌘[ to indent and outdent lines, and ⌥⌘↑ / ⌥⌘↓ to add cursors.
 
-## Install on macOS
+## Build from source on macOS
 
 ### 1. One-time setup
 
@@ -179,6 +192,8 @@ The source editor also has ⌘F find, ⌘⇧F replace, ⌘] / ⌘[ to indent and
 | Install Rust, then open a new terminal | `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \| sh` |
 
 `rust-toolchain.toml` pins the Rust version; rustup downloads it on the first build.
+
+With Xcode 26 or later the app gets the layered icon that follows the macOS 26 Dock styles (default, dark, clear and tinted). Older Xcode versions fall back to a flat icon.
 
 ### 2. Get the code
 
@@ -228,7 +243,27 @@ On Windows and Linux, `cargo run` works the same way once GPUI's build dependenc
 
 On the first launch without arguments, enso opens an editable `Get Started.md` from its application data folder.
 
-`.github/workflows/release.yml` builds release packages from the Actions tab: a macOS disk image for Apple silicon, Windows zips for x64 and ARM64, and Linux tarballs for x64 and ARM64. On Linux, unpack the tarball and run `./install.sh` to add enso to the app launcher.
+## Releasing
+
+Releases follow the version in `Cargo.toml` and are published from version tags (`v1.2.3`, or `v1.2.3-beta.1` for a pre-release).
+
+```sh
+make release VERSION=1.2.3
+```
+
+From an up-to-date, clean `main`, this sets the version, runs the tests, commits "Release v1.2.3", tags `v1.2.3` and pushes. The tag starts `.github/workflows/release.yml`, which builds every package and publishes the release with download instructions and the changes since the previous tag:
+
+| File | For |
+|---|---|
+| `enso-macos.dmg` | macOS 11 or later, Apple silicon and Intel in one app, with the Quick Look preview |
+| `enso-windows-x64-setup.exe`, `enso-windows-arm64-setup.exe` | Windows 10 and 11: per-user install, Start menu entry, optional desktop icon and `.md` association, uninstaller |
+| `enso-windows-*-portable.zip` | Windows without installing |
+| `enso-linux-amd64.deb`, `enso-linux-arm64.deb` | Ubuntu 22.04 or later and other Debian-based systems |
+| `enso-linux-x86_64.AppImage`, `enso-linux-aarch64.AppImage` | Any recent Linux distribution |
+
+File names don't change between versions, so `releases/latest/download/<file>` always links to the newest one. Running the workflow by hand from the Actions tab builds the same files into a private draft release for testing.
+
+To sign and notarize the Mac app, so it opens without a warning, add these repository secrets (Settings › Secrets and variables › Actions): `MACOS_CERTIFICATE` (a Developer ID Application certificate exported as .p12, base64-encoded), `MACOS_CERTIFICATE_PASSWORD`, `APPLE_ID`, `APPLE_TEAM_ID` and `APPLE_APP_PASSWORD` (an app-specific password). Without them the app is signed ad hoc and macOS asks once on first launch.
 
 ## Platforms
 
