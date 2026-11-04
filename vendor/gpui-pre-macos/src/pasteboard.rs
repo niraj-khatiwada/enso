@@ -169,7 +169,11 @@ impl Pasteboard {
             [ClipboardEntry::Image(image)] => {
                 self.write_image(image);
             }
-            [ClipboardEntry::ExternalPaths(_)] => {}
+            // enso: files copied in the app, for Finder (and enso) to paste.
+            [ClipboardEntry::ExternalPaths(paths)]
+            | [ClipboardEntry::ExternalPaths(paths), ClipboardEntry::String(_)] => {
+                self.write_paths(paths);
+            }
             _ => {
                 // Agus NB: We're currently only writing string entries to the clipboard when we have more than one.
                 //
@@ -219,6 +223,28 @@ impl Pasteboard {
                     .setData_forType(Some(&metadata_bytes), &self.metadata_type);
             }
         }
+    }
+
+    /// Files in Finder's file-copy format (the one `read` takes them back
+    /// from), with their paths as text for text editors.
+    fn write_paths(&self, paths: &ExternalPaths) {
+        self.inner.clearContents();
+        let names: Vec<Retained<NSString>> = paths
+            .paths()
+            .iter()
+            .map(|path| NSString::from_str(&path.to_string_lossy()))
+            .collect();
+        let list = NSArray::from_retained_slice(&names);
+        #[expect(
+            deprecated,
+            reason = "Preserve the existing file-copy pasteboard format"
+        )]
+        unsafe {
+            self.inner.setPropertyList_forType(&list, NSFilenamesPboardType);
+        }
+        let text: Vec<String> = paths.paths().iter().map(|p| p.to_string_lossy().into_owned()).collect();
+        self.inner
+            .setString_forType(&NSString::from_str(&text.join("\n")), unsafe { NSPasteboardTypeString });
     }
 
     fn write_image(&self, image: &Image) {

@@ -1582,7 +1582,7 @@ checksum = "66b7e2430c6dff6a955451e2cfc438f09cea1965a9d6f87f7e3b90decc014099"
 
 [[package]]
 name = "enso"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "arboard",
  "base64 0.22.1",
@@ -1597,6 +1597,7 @@ dependencies = [
  "gpui-pre",
  "image",
  "krilla",
+ "latex-rust",
  "libloading",
  "markdown",
  "memmap2",
@@ -3705,6 +3706,15 @@ dependencies = [
  "euclid",
  "polycool",
  "smallvec",
+]
+
+[[package]]
+name = "latex-rust"
+version = "2.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f8094b939c8af51f9c7d08256ffa607b743e24d466d9a0ccc602dc748c911e54"
+dependencies = [
+ "ttf-parser",
 ]
 
 [[package]]

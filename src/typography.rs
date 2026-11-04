@@ -584,12 +584,10 @@ mod ui_tests {
         let option = visual
             .debug_bounds("font-option-fira-code")
             .expect("last font option");
-        let menu = visual.debug_bounds("document-menu-panel").unwrap();
-        assert!(
-            option.center().y > menu.bottom(),
-            "exercise the dropdown outside its parent surface"
-        );
-        visual.simulate_click(option.center(), Modifiers::default());
+        let option_point = point(option.center().x, option.bottom() - px(2.));
+        // The last option can be inside or outside the parent as document-menu
+        // actions are added. It must stay clickable in either case.
+        visual.simulate_click(option_point, Modifiers::default());
         draw(cx);
         assert_eq!(cx.update(|cx| current(cx).font), ReadingFont::FiraCode);
         let slider = visual

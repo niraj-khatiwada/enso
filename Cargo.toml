@@ -1,6 +1,6 @@
 [package]
 name = "enso"
-version = "1.0.0"
+version = "1.1.0"
 edition = "2024"
 description = "A quiet, native Markdown workspace"
 license = "MIT"
@@ -76,6 +76,7 @@ resvg = { version = "0.46", default-features = false, features = ["text", "syste
 # rather than a bundled TLS stack.
 ureq = { version = "3.5", default-features = false, features = ["native-tls-no-default"] }
 bytes = "1"
+latex-rust = { version = "=2.1.1", default-features = false, features = ["std"] }
 
 # Moving deleted files to the Trash: the trash crate on macOS and Linux;
 # Windows goes through the shell itself (see files::move_to_trash).
@@ -93,7 +94,7 @@ arboard = { version = "3.7", default-features = false, features = ["wayland-data
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62.2", features = ["Win32_Globalization", "Win32_System_Com"] }
-windows-sys = { version = "0.61", features = ["Win32_UI_Shell", "Win32_Foundation"] }
+windows-sys = { version = "0.61", features = ["Win32_UI_Shell", "Win32_Foundation", "Win32_Storage_FileSystem"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"

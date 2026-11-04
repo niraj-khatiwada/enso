@@ -5,6 +5,7 @@ use gpui_kit::{prelude::FluentBuilder, *};
 use std::{ops::Range, path::PathBuf, sync::Arc};
 
 const SECTION_BYTES: usize = 2048;
+const EXTENSION_BYTES: usize = 16 * 1024;
 pub const LARGE_DOCUMENT_BYTES: usize = 256 * 1024;
 /// Where text starts in the reading view, matching where GPUI Kit's editor
 /// draws it with line numbers off (6 px padding + 6 px gutter margin across,
@@ -16,6 +17,33 @@ pub const TEXT_INSET_Y: f32 = 8.;
 /// front, which stalls on files this big. Below it, long lines wrap like the
 /// reading view does.
 pub const NO_WRAP_BYTES: usize = 4 * 1024 * 1024;
+
+/// Look ahead only at extension openers, within a fixed parsing budget.
+fn extension_end(source: &str, offset: usize) -> Option<usize> {
+    let rest = &source[offset..];
+    let first = rest.split_inclusive('\n').next()?;
+    let trimmed = first.trim();
+    if trimmed.starts_with("$$") {
+        if trimmed.len() > 4 && trimmed[2..].contains("$$") { return Some(offset + first.len()); }
+        let mut bytes = first.len();
+        for line in rest[first.len()..].split_inclusive('\n') {
+            bytes += line.len();
+            if bytes > EXTENSION_BYTES { return None; }
+            if line.trim_start().starts_with("$$") { return Some(offset + bytes); }
+        }
+    } else if let Some(marker) = trimmed.strip_prefix("> [!") {
+        let end = marker.find(']')?;
+        crate::callout::Kind::parse(&marker[..end])?;
+        let mut bytes = first.len();
+        for line in rest[first.len()..].split_inclusive('\n') {
+            if !line.trim_start().starts_with('>') { break; }
+            bytes += line.len();
+            if bytes > EXTENSION_BYTES { return None; }
+        }
+        return Some(offset + bytes);
+    }
+    None
+}
 
 pub struct Section {
     range: Range<usize>,
@@ -30,6 +58,18 @@ pub struct LargeReader {
     base: Option<PathBuf>,
     cursor_anchor: Option<usize>,
     controls: Option<(WeakEntity<crate::Enso>, EntityId)>,
+    /// A highlighted match (a search jump, Find): its section is drawn from a
+    /// state of its own, which can carry highlights; the others stay plain.
+    highlight: Option<Highlight>,
+}
+
+struct Highlight {
+    section: usize,
+    /// In the section's own text (prefix included).
+    ranges: Vec<Range<usize>>,
+    color: Hsla,
+    state: Entity<gpui_kit::component::text::TextViewState>,
+    applied: bool,
 }
 
 impl LargeReader {
@@ -40,11 +80,23 @@ impl LargeReader {
         let mut offset = 0;
         let mut fence: Option<(char, usize, String)> = None;
         let mut prefix = String::new();
+        let mut protected_end = 0;
         for line in source.split_inclusive('\n') {
+            if offset >= protected_end && fence.is_none() {
+                if let Some(end) = extension_end(source, offset) {
+                    // Keep an equation or small callout in one parsing unit.
+                    if offset > start {
+                        sections.push(Section { range: start..offset, prefix, suffix: String::new() });
+                        prefix = String::new();
+                        start = offset;
+                    }
+                    protected_end = end;
+                }
+            }
             // Flush before the next line exceeds the synchronous parsing budget.
             // Prefer paragraph boundaries below, but never require an enormous
             // paragraph or a single long line to be laid out as one element.
-            if offset > start && offset - start + line.len() > SECTION_BYTES {
+            if offset >= protected_end && offset > start && offset - start + line.len() > SECTION_BYTES {
                 let suffix = fence
                     .as_ref()
                     .map(|(c, n, _)| format!("\n{}\n", c.to_string().repeat(*n)))
@@ -87,7 +139,7 @@ impl LargeReader {
                 }
             }
             let end = offset + line.len();
-            while end - start > SECTION_BYTES {
+            while offset >= protected_end && end - start > SECTION_BYTES {
                 let mut boundary = start + SECTION_BYTES;
                 while !source.is_char_boundary(boundary) {
                     boundary -= 1;
@@ -108,7 +160,7 @@ impl LargeReader {
                 start = boundary;
             }
             offset = end;
-            if offset - start >= SECTION_BYTES / 2 && line.trim().is_empty() && fence.is_none() {
+            if offset >= protected_end && offset - start >= SECTION_BYTES / 2 && line.trim().is_empty() && fence.is_none() {
                 sections.push(Section {
                     range: start..offset,
                     prefix,
@@ -144,6 +196,44 @@ impl LargeReader {
         cx.notify();
     }
 
+    pub fn source(&self) -> Arc<String> {
+        self.source.clone()
+    }
+
+    /// Highlight `ranges` of the source in `color` (those in the first one's
+    /// section) and scroll to the first.
+    pub fn highlight(&mut self, ranges: Vec<Range<usize>>, color: Hsla, cx: &mut Context<Self>) {
+        let Some(first) = ranges.first().cloned() else { return };
+        self.reveal_source(first.start, cx);
+        let Some(index) = self.sections.iter().position(|s| s.range.contains(&first.start)) else {
+            return;
+        };
+        let section = &self.sections[index];
+        let local = ranges
+            .iter()
+            .filter(|r| section.range.contains(&r.start))
+            .map(|r| {
+                let end = r.end.min(section.range.end);
+                section.prefix.len() + r.start - section.range.start..section.prefix.len() + end - section.range.start
+            })
+            .collect();
+        let text = format!("{}{}{}", section.prefix, &self.source[section.range.clone()], section.suffix);
+        let state = cx.new(|cx| gpui_kit::component::text::TextViewState::markdown(&text, cx));
+        self.highlight = Some(Highlight { section: index, ranges: local, color, state, applied: false });
+        cx.notify();
+    }
+
+    pub fn clear_highlight(&mut self, cx: &mut Context<Self>) {
+        if self.highlight.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    #[cfg(all(test, feature = "ui-tests"))]
+    pub fn highlight_painted(&self) -> bool {
+        self.highlight.as_ref().is_some_and(|h| h.applied)
+    }
+
     #[cfg(all(test, feature = "ui-tests"))]
     pub fn visible_source_range(&self) -> Option<Range<usize>> {
         self.sections
@@ -159,7 +249,7 @@ impl LargeReader {
     pub fn replace(&mut self, source: Arc<String>, sections: Vec<Section>, cx: &mut Context<Self>) {
         let offset = self.list.logical_scroll_top();
         self.list
-            .reset_with_uniform_height(sections.len(), px(900.));
+            .reset_with_uniform_height(sections.len() + 1, px(900.));
         self.list.scroll_to(offset);
         self.source = source;
         self.sections = Arc::new(sections);
@@ -169,12 +259,15 @@ impl LargeReader {
         cx.notify();
     }
 
+    pub fn set_base(&mut self, base: Option<PathBuf>, cx: &mut Context<Self>) {
+        self.base = base; self.list.remeasure(); cx.notify();
+    }
     pub fn set_controls(&mut self, owner: WeakEntity<crate::Enso>, editor: EntityId) {
         self.controls = Some((owner, editor));
     }
 
     pub fn new(source: Arc<String>, sections: Vec<Section>, base: Option<PathBuf>) -> Self {
-        let list = ListState::new(sections.len(), ListAlignment::Top, px(400.))
+        let list = ListState::new(sections.len() + 1, ListAlignment::Top, px(400.))
             .with_uniform_item_height(px(900.));
         Self {
             source,
@@ -183,18 +276,45 @@ impl LargeReader {
             base,
             cursor_anchor: None,
             controls: None,
+            highlight: None,
         }
     }
 }
 
 impl Render for LargeReader {
-    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Paint the highlight once its section's text has been parsed.
+        if let Some(highlight) = self.highlight.as_mut().filter(|h| !h.applied) {
+            let rendered = highlight.state.read(cx).rendered_text();
+            if rendered.source().is_empty() {
+                window.request_animation_frame();
+            } else {
+                highlight.applied = true;
+                let color = highlight.color;
+                let painted: Vec<_> = highlight
+                    .ranges
+                    .iter()
+                    .filter_map(|r| rendered.range_for_source(r.clone()))
+                    .map(|r| gpui_kit::component::text::RangeHighlight::new(r, color))
+                    .collect();
+                highlight.state.update(cx, |state, cx| {
+                    let _ = state.set_range_highlights(painted, cx);
+                });
+            }
+        }
+        let highlighted = self.highlight.as_ref().map(|h| (h.section, h.state.clone()));
         let source = self.source.clone();
         let sections = self.sections.clone();
         let base = self.base.clone();
         let controls = self.controls.clone();
         let last = sections.len().saturating_sub(1);
         let content = list(self.list.clone(), move |index, _, cx| {
+            if index == sections.len() {
+                return div().pl(px(TEXT_INSET_X)).pr_4().child(
+                    controls.as_ref().and_then(|(owner, editor)| owner.update(cx, |app, cx| app.linked_from(*editor, cx)).ok())
+                        .unwrap_or_else(|| div().into_any_element())
+                ).into_any_element();
+            }
             let section = &sections[index];
             let text = format!(
                 "{}{}{}",
@@ -203,7 +323,7 @@ impl Render for LargeReader {
                 section.suffix
             );
             let image_base = base.clone();
-            let link_base = base.clone();
+            let link_controls = controls.clone();
             div()
                 .w_full()
                 .min_h(px(24.))
@@ -213,10 +333,13 @@ impl Render for LargeReader {
                 // Breathing room above the first section and below the last;
                 // part of the list, so it scrolls away with the text.
                 .when(index == 0, |d| d.pt(px(TEXT_INSET_Y)))
-                .when(index == last, |d| d.pb_8())
+                .when(index == last, |d| d.pb(px(TEXT_INSET_Y)))
                 .child(
                     div().w_full().child(
-                        TextView::markdown(("section", index), text)
+                        match &highlighted {
+                            Some((section, state)) if *section == index => TextView::new(state),
+                            _ => TextView::markdown(("section", index), text),
+                        }
                             .map(|view| crate::typography::style(view, cx))
                             .map(|view| {
                                 if let Some((owner, editor)) = &controls {
@@ -238,23 +361,15 @@ impl Render for LargeReader {
                                 let source = uri.to_string();
                                 if !source.contains(':') {
                                     if let Some(base) = &image_base {
-                                        return ImageSource::from(base.join(source));
+                                        return ImageSource::from(base.join(crate::links::decode(&source)));
                                     }
                                 }
                                 ImageSource::from(uri.clone())
                             })
-                            .on_link_click(move |url, event, _, cx| {
-                                if event.is_right_click() {
-                                    return;
-                                }
-                                if url.starts_with("https://")
-                                    || url.starts_with("http://")
-                                    || url.starts_with("mailto:")
-                                {
-                                    cx.open_url(url);
-                                } else if !url.contains(':') && !url.starts_with('#') {
-                                    if let Some(base) = &link_base {
-                                        cx.reveal_path(&base.join(url.as_ref()));
+                            .on_link_click(move |url, event, window, cx| {
+                                if !event.is_right_click() {
+                                    if let Some((owner, editor)) = &link_controls {
+                                        let _ = owner.update(cx, |app, cx| app.follow_note_link(*editor, url, window, cx));
                                     }
                                 }
                             }),
@@ -324,5 +439,22 @@ mod tests {
             read,
             total
         );
+    }
+}
+
+#[cfg(test)]
+mod extension_tests {
+    #[test]
+    fn large_readers_keep_equations_and_callouts_whole() {
+        let math = format!("$$\n{}\n$$\n", "x + ".repeat(600) + "y");
+        let callout = format!("> [!NOTE]\n{}", "> A paragraph.\n".repeat(190));
+        let source = "text\n\n".repeat(400) + &math + "\n" + &callout + "\nAfter.\n";
+        let sections = super::LargeReader::index(&source);
+        let restored: String = sections.iter().map(|s| &source[s.range.clone()]).collect();
+        assert_eq!(restored, source);
+        for block in [&math, &callout] {
+            let start = source.find(block.as_str()).unwrap();
+            assert!(sections.iter().any(|s| s.range.start <= start && s.range.end >= start + block.len()));
+        }
     }
 }

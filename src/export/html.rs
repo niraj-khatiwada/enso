@@ -31,8 +31,9 @@ pub fn body(source: &str, base: Option<&Path>, images: &mut Images) -> String {
             ..markdown::CompileOptions::gfm()
         },
     };
-    let html = markdown::to_html_with_options(source, &options)
-        .unwrap_or_else(|_| format!("<pre>{}</pre>", escape(source)));
+    let source = super::markup::extensions(source, matches!(images, Images::Inline { .. }));
+    let html = markdown::to_html_with_options(&source, &options)
+        .unwrap_or_else(|_| format!("<pre>{}</pre>", escape(&source)));
     let inline = matches!(images, Images::Inline { .. });
     diagrams(&rewrite_images(&marks(&html), base, images), inline)
 }
@@ -386,7 +387,7 @@ fn percent_decode(text: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-fn escape(text: &str) -> String {
+pub(super) fn escape(text: &str) -> String {
     text.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
 }
 
@@ -421,6 +422,22 @@ li > input[type="checkbox"] { margin-right: 0.5em; }
 .diagram svg { max-width: 100%; height: auto; }
 mark { background: #fef08a; color: inherit; padding: 0 0.15em; border-radius: 3px; }
 .footnotes { font-size: 0.875em; color: var(--muted); border-top: 1px solid var(--line); margin-top: 3em; }
+.callout-note { --callout-accent:#0969da; --callout-bg:#f3f7fc; }
+.callout-tip { --callout-accent:#1a7f37; --callout-bg:#f0f6f1; }
+.callout-important { --callout-accent:#8250df; --callout-bg:#f6f3fc; }
+.callout-warning { --callout-accent:#9a6700; --callout-bg:#f8f5ed; }
+.callout-caution { --callout-accent:#cf222e; --callout-bg:#fcf0f0; }
+.callout > :last-child { margin-bottom:0; }
+.math-svg svg { display:block; width:100%; height:100%; }
+.math-block { overflow-x:auto; }
+.math-block .math-svg { max-width:100%; }
+@media (prefers-color-scheme: dark) {
+ .callout-note { --callout-accent:#4493f8; --callout-bg:#182332; }
+ .callout-tip { --callout-accent:#3fb950; --callout-bg:#19281c; }
+ .callout-important { --callout-accent:#a371f7; --callout-bg:#251e30; }
+ .callout-warning { --callout-accent:#d29922; --callout-bg:#2c2519; }
+ .callout-caution { --callout-accent:#f85149; --callout-bg:#2e1c1b; }
+}
 @media print { article { padding: 0; max-width: none; } a { color: inherit; } pre, blockquote, table, img { break-inside: avoid; } }
 "#;
 

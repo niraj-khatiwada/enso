@@ -557,6 +557,7 @@ impl SettingsWindow {
             .child(page_header("General", "How enso behaves on this device.", theme.muted_foreground))
             .child(
                 h_flex().gap_4().items_center().justify_between().py_3()
+                    .border_b_1().border_color(theme.border)
                     .child(v_flex().gap_0p5()
                         .child(div().text_sm().font_weight(FontWeight::MEDIUM).child("Check for Updates"))
                         .child(div().text_xs().text_color(theme.muted_foreground).child(
@@ -568,6 +569,17 @@ impl SettingsWindow {
                             let _ = weak.update(cx, |this, cx| { this.error = error; cx.notify(); });
                         })),
             )
+            .child({
+                let weak = cx.entity().downgrade();
+                h_flex().gap_4().items_center().justify_between().py_3()
+                    .child(div().text_sm().font_weight(FontWeight::MEDIUM).child("Confirm Before Deleting Files & Folders"))
+                    .child(Switch::new("confirm-delete").checked(confirm_delete(cx))
+                        .accessibility_label("Confirm Before Deleting Files & Folders")
+                        .on_change(move |on, _, cx| {
+                            let error = set_confirm_delete(*on, cx).err().map(|e| format!("Could not save general settings: {e}"));
+                            let _ = weak.update(cx, |this, cx| { this.error = error; cx.notify(); });
+                        }))
+            })
     }
 
     fn appearance_page(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -738,7 +750,6 @@ impl SettingsWindow {
             .child({
                 let weak = cx.entity().downgrade();
                 h_flex().gap_4().items_center().justify_between().py_3()
-                    .border_b_1().border_color(theme.border)
                     .child(v_flex().gap_0p5()
                         .child(div().text_sm().font_weight(FontWeight::MEDIUM).child("Load Web Images"))
                         .child(div().text_xs().text_color(theme.muted_foreground).child(
@@ -747,17 +758,6 @@ impl SettingsWindow {
                         .accessibility_label("Load Web Images")
                         .on_change(move |on, _, cx| {
                             let error = set_web_images(*on, cx).err().map(|e| format!("Could not save editor settings: {e}"));
-                            let _ = weak.update(cx, |this, cx| { this.error = error; cx.notify(); });
-                        }))
-            })
-            .child({
-                let weak = cx.entity().downgrade();
-                h_flex().gap_4().items_center().justify_between().py_3()
-                    .child(div().text_sm().font_weight(FontWeight::MEDIUM).child("Confirm Before Deleting Files & Folders"))
-                    .child(Switch::new("confirm-delete").checked(confirm_delete(cx))
-                        .accessibility_label("Confirm Before Deleting Files & Folders")
-                        .on_change(move |on, _, cx| {
-                            let error = set_confirm_delete(*on, cx).err().map(|e| format!("Could not save editor settings: {e}"));
                             let _ = weak.update(cx, |this, cx| { this.error = error; cx.notify(); });
                         }))
             })

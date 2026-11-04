@@ -123,6 +123,8 @@ enum Choice {
     Export,
     CopyRichText,
     ToggleLock,
+    TogglePin,
+    FocusMode,
     RenameFile,
     DeleteFile,
 }
@@ -162,6 +164,8 @@ impl Choice {
             Self::Export => "export".into(),
             Self::CopyRichText => "copy-rich-text".into(),
             Self::ToggleLock => "lock-page".into(),
+            Self::TogglePin => "pin-tab".into(),
+            Self::FocusMode => "focus-mode".into(),
             Self::RenameFile => "rename-file".into(),
             Self::DeleteFile => "delete-file".into(),
         }
@@ -197,6 +201,8 @@ impl Choice {
             Self::Export => Box::new(ExportNote),
             Self::CopyRichText => Box::new(CopyRichText),
             Self::ToggleLock => Box::new(ToggleLock),
+            Self::TogglePin => Box::new(TogglePin),
+            Self::FocusMode => Box::new(ToggleFocusMode),
             _ => return None,
         })
     }
@@ -446,6 +452,14 @@ impl Enso {
                 Some("⇧N"),
             ));
         }
+        if let Some(index) = self.active {
+            app.push(entry(
+                if self.documents[index].pinned { "Unpin Tab" } else { "Pin Tab" },
+                &["pin", "unpin", "keep", "favorite", "note", "tab"],
+                Choice::TogglePin,
+                None,
+            ));
+        }
         if self.active.is_some_and(|i| self.documents[i].markdown) {
             app.extend([
                 entry(
@@ -474,6 +488,12 @@ impl Enso {
                     },
                     &["lock", "unlock", "read only", "protect", "freeze", "edit"],
                     Choice::ToggleLock,
+                    None,
+                ),
+                entry(
+                    if self.focus_mode { "Exit Focus Mode" } else { "Focus Mode" },
+                    &["zen", "distraction free", "writing", "typewriter", "calm", "hide"],
+                    Choice::FocusMode,
                     None,
                 ),
                 entry(
@@ -631,6 +651,33 @@ impl Enso {
         }
     }
 
+    /// Backspace (or Delete) in the insert menu's empty search closes it and
+    /// puts the cursor back where it was. Opened by typing `/`, the slash goes
+    /// too, as the key would have erased it in the editor. Returns whether it
+    /// was the insert menu with nothing typed.
+    fn erase_empty_insert_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let Some(palette) = self.palette.as_ref() else {
+            return false;
+        };
+        if palette.anchor.is_none() || palette.search.is_some() || !palette.state.read(cx).query(cx).is_empty() {
+            return false;
+        }
+        let slash = palette
+            .replace_slash
+            .then(|| palette.target.clone())
+            .flatten();
+        self.close_palette(window, cx);
+        if let Some((editor, range)) = slash {
+            editor.update(cx, |state, cx| {
+                if state.value().get(range.clone()) == Some("/") {
+                    state.set_selected_range(range, cx);
+                    state.replace("", window, cx);
+                }
+            });
+        }
+        true
+    }
+
     fn confirm_palette(
         &mut self,
         section: usize,
@@ -648,7 +695,7 @@ impl Enso {
         };
         if matches!(choice, Choice::SearchEverything) {
             self.remember_command(&choice, cx);
-            self.start_content_search(window, cx);
+            self.start_content_search(String::new(), window, cx);
             return;
         }
         if matches!(choice, Choice::Table) {
@@ -719,6 +766,8 @@ impl Enso {
             Choice::Settings => settings::open(cx),
             Choice::Export => self.open_export(window, cx),
             Choice::ToggleLock => self.toggle_lock(cx),
+            Choice::TogglePin => self.toggle_pin(cx),
+            Choice::FocusMode => self.toggle_focus_mode(window, cx),
             Choice::RenameFile => {
                 if let Some(path) = self.active.and_then(|i| self.documents[i].path.clone()) {
                     self.rename_file(path, window, cx);
@@ -1050,7 +1099,52 @@ impl Enso {
                 .collect();
             let weak = cx.entity().downgrade();
             let cancel = weak.clone();
+            // Nothing matched: what was typed may be in a note instead.
+            let offer = self.root.is_some() && anchor.is_none();
+            let searcher = weak.clone();
+            let theme = cx.theme().clone();
             command
+                .empty(move |state, _, cx| {
+                    let query = state.query(cx).trim().to_string();
+                    if !offer || query.is_empty() {
+                        return div()
+                            .p_4()
+                            .text_sm()
+                            .text_color(theme.muted_foreground)
+                            .child("No results found.")
+                            .into_any_element();
+                    }
+                    let searcher = searcher.clone();
+                    div()
+                        .p_1p5()
+                        .child(
+                            h_flex()
+                                .id("search-notes-instead")
+                                .h(px(36.))
+                                .px_2()
+                                .gap_2()
+                                .items_center()
+                                .rounded_md()
+                                .cursor_pointer()
+                                .bg(theme.foreground.opacity(0.05))
+                                .hover(|row| row.bg(theme.foreground.opacity(0.08)))
+                                .child(Icon::new(IconName::Search).size_4().text_color(theme.muted_foreground))
+                                .child(
+                                    h_flex()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .gap_1()
+                                        .text_sm()
+                                        .child(div().flex_shrink_0().text_color(theme.muted_foreground).child("Search Notes for"))
+                                        .child(div().min_w_0().truncate().font_weight(FontWeight::MEDIUM).child(format!("“{query}”"))),
+                                )
+                                .child(div().text_xs().text_color(theme.muted_foreground).child("↵"))
+                                .on_click(move |_, window, cx| {
+                                    let _ = searcher.update(cx, |this, cx| this.search_notes_instead(window, cx));
+                                }),
+                        )
+                        .into_any_element()
+                })
                 .on_confirm(move |index, window, cx| {
                     if let Some(&section) = sections.get(index.section) {
                         let _ = weak.update(cx, |this, cx| {
@@ -1081,10 +1175,22 @@ impl Enso {
                     MouseButton::Left,
                     cx.listener(|this, _, window, cx| this.close_palette(window, cx)),
                 )
+                // Enter with no command matching: search the notes instead.
+                .capture_action(cx.listener(
+                    |this, _: &gpui_kit::base::actions::Confirm, window, cx| {
+                        if this.search_notes_instead(window, cx) {
+                            cx.stop_propagation();
+                        }
+                    },
+                ))
                 .capture_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                     if event.keystroke.key == "escape" {
                         cx.stop_propagation();
                         this.close_palette(window, cx);
+                    } else if matches!(event.keystroke.key.as_str(), "backspace" | "delete")
+                        && this.erase_empty_insert_menu(window, cx)
+                    {
+                        cx.stop_propagation();
                     }
                 }))
                 .child(
@@ -1134,16 +1240,40 @@ impl Enso {
         if self.palette.is_none() {
             self.open_palette(window, cx);
         }
-        self.start_content_search(window, cx);
+        self.start_content_search(String::new(), window, cx);
     }
 
     /// Switch the open palette to searching inside the workspace's notes.
-    fn start_content_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// The main palette matched no command: search the notes for what was
+    /// typed, keeping it in the field. False when there's nothing to offer.
+    fn search_notes_instead(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let Some(palette) = self.palette.as_ref() else { return false };
+        if self.root.is_none() || palette.search.is_some() || palette.anchor.is_some() {
+            return false;
+        }
+        let state = palette.state.read(cx);
+        let query = state.query(cx).trim().to_string();
+        if query.is_empty() || state.matched_count() > 0 {
+            return false;
+        }
+        self.remember_command(&Choice::SearchEverything, cx);
+        self.start_content_search(query, window, cx);
+        true
+    }
+
+    /// `query` carries over what was typed (from the palette's "Search Notes
+    /// for …" row); it runs as soon as the notes are listed.
+    fn start_content_search(&mut self, query: String, window: &mut Window, cx: &mut Context<Self>) {
         let Some(root) = self.root.clone() else {
             return;
         };
         let state = cx.new(|cx| CommandState::new(window, cx));
-        state.update(cx, |state, cx| state.focus(window, cx));
+        state.update(cx, |state, cx| {
+            if !query.is_empty() {
+                state.set_query(query.clone(), window, cx);
+            }
+            state.focus(window, cx);
+        });
         let Some(palette) = self.palette.as_mut() else {
             return;
         };
@@ -1156,7 +1286,7 @@ impl Enso {
         palette.search = Some(ContentSearch {
             root: root.clone(),
             files: None,
-            query: String::new(),
+            query,
             hits: Vec::new(),
             searching: false,
             cancel: Default::default(),
@@ -1357,7 +1487,7 @@ impl Enso {
             return;
         };
         self.close_palette(window, cx);
-        self.open_path_at(hit.path, hit.offset, window, cx);
+        self.open_path_at(hit.path, hit.offset, hit.matches, window, cx);
     }
 }
 
@@ -1397,6 +1527,8 @@ fn is_insert(choice: &Choice) -> bool {
             | Choice::Export
             | Choice::CopyRichText
             | Choice::ToggleLock
+            | Choice::TogglePin
+            | Choice::FocusMode
             | Choice::RenameFile
             | Choice::DeleteFile
     )
@@ -1638,6 +1770,54 @@ mod ui_tests {
     }
 
     #[gpui_kit::test]
+    fn no_matching_command_offers_to_search_the_notes_with_the_same_words(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            cx.set_global(super::History::default());
+            bind_view_keys(cx);
+            bind_markdown_keys(cx);
+        });
+        let root = std::env::temp_dir().join(format!("enso-palette-offer-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("zoo.md");
+        std::fs::write(&path, "# Zoo\n\nA zebra quilt hangs here.\n").unwrap();
+        let (handle, view) = cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| {
+                    let mut app = Enso::new(window, cx);
+                    app.root = Some(root.clone());
+                    app
+                })
+            })
+            .unwrap()
+        });
+        draw(cx, handle);
+        let palette = if cfg!(target_os = "macos") { "cmd-shift-p" } else { "ctrl-shift-p" };
+        cx.simulate_keystrokes(handle, palette);
+        draw(cx, handle);
+        cx.simulate_input(handle, "zebra quilt");
+        draw(cx, handle);
+        cx.update(|cx| {
+            let palette = view.read(cx).palette.as_ref().unwrap();
+            assert!(palette.search.is_none());
+            assert_eq!(palette.state.read(cx).matched_count(), 0);
+        });
+        // Enter takes the words into a search of the notes, still typed.
+        cx.simulate_keystrokes(handle, "enter");
+        cx.executor().advance_clock(std::time::Duration::from_millis(500));
+        draw(cx, handle);
+        cx.update(|cx| {
+            let palette = view.read(cx).palette.as_ref().unwrap();
+            assert_eq!(palette.state.read(cx).query(cx).as_ref(), "zebra quilt");
+            let search = palette.search.as_ref().unwrap();
+            assert_eq!(search.query, "zebra quilt");
+            assert_eq!(search.hits.len(), 1);
+            assert_eq!(search.hits[0].path, path);
+        });
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[gpui_kit::test]
     fn search_everything_finds_lines_and_opens_at_the_match(cx: &mut TestAppContext) {
         cx.update(|cx| {
             gpui_kit::init(cx);
@@ -1684,8 +1864,10 @@ mod ui_tests {
             assert!(app.palette.is_none());
             let doc = &app.documents[app.active.unwrap()];
             assert_eq!(doc.path.as_ref(), Some(&path));
-            let cursor = doc.editor.read(cx).cursor();
-            assert_eq!(&text[cursor..cursor + 4], "blue");
+            // The match is selected, so it's plain to see.
+            let selected = doc.editor.read(cx).selected_range();
+            // Both words, from the first to the last.
+            assert_eq!(&text[selected], "blue umbrella");
         });
         // The shortcut closes the search again.
         cx.simulate_keystrokes(handle, key);
@@ -1917,6 +2099,46 @@ mod ui_tests {
             assert!(app.expanded.contains(&root.join("notes")));
         });
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn backspace_on_an_empty_insert_menu_closes_it_and_erases_the_slash(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            super::super::bind_view_keys(cx);
+            bind_markdown_keys(cx);
+        });
+        let (handle, view) = cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| {
+                    let mut app = Enso::new(window, cx);
+                    app.add_document(Some(PathBuf::from("slash.md")), "".into(), None, window, cx);
+                    app.mode = Mode::Edit;
+                    app
+                })
+            })
+            .unwrap()
+        });
+        draw(cx, handle);
+        let editor = cx.update(|cx| view.read(cx).documents[0].editor.clone());
+        cx.update_window(handle, |_, window, cx| editor.focus_handle(cx).focus(window, cx)).unwrap();
+        draw(cx, handle);
+        cx.simulate_keystrokes(handle, "/");
+        draw(cx, handle);
+        assert!(cx.update(|cx| view.read(cx).palette.is_some()));
+        // With a query, Backspace edits the query and the menu stays.
+        cx.simulate_input(handle, "ta");
+        cx.simulate_keystrokes(handle, "backspace backspace");
+        draw(cx, handle);
+        assert!(cx.update(|cx| view.read(cx).palette.is_some()));
+        // Empty: it closes, the slash goes, and typing lands in the editor.
+        cx.simulate_keystrokes(handle, "backspace");
+        draw(cx, handle);
+        assert!(cx.update(|cx| view.read(cx).palette.is_none()));
+        assert_eq!(cx.update(|cx| editor.read(cx).value().to_string()), "");
+        cx.simulate_input(handle, "hi");
+        draw(cx, handle);
+        assert_eq!(cx.update(|cx| editor.read(cx).value().to_string()), "hi");
     }
 
     #[gpui_kit::test]

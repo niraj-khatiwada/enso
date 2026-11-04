@@ -82,6 +82,20 @@ Production Build:
 
 Releases are built by `.github/workflows/release.yml` (Actions → Release → Run workflow) into a draft GitHub Release, with its notes from [CHANGELOG.md](./CHANGELOG.md).
 
+### Callouts and math
+
+GitHub-style `> [!NOTE]`, `> [!TIP]`, `> [!IMPORTANT]`, `> [!WARNING]` and `> [!CAUTION]` blocks render as quiet tinted panels. Obsidian-style custom titles are supported too.
+
+Write inline math as `$x^2$` and display equations between `$$` lines. Fractions, roots, integrals, sums and matrices render natively and offline. HTML exports include self-contained SVG; PDF exports draw the equations as vector paths. Callout formatting is preserved in both formats. Unsupported equations keep their source visible.
+
+### Linked notes
+
+Type `[[` in Edit or Split view to search for another note in the current workspace. Use ↑/↓ and Enter or Tab to insert it, or click a suggestion. `[[Note.md|Display name]]` gives a link a different label; folder paths distinguish notes with the same name. New links include the file extension; older extensionless links remain supported.
+
+Click a link in Read view to open its note. **Linked from** at the end of a note lists the notes that refer to it. The workspace watcher scans new and changed notes regardless of whether they arrive through enso, a file manager, or sync. It updates links for detected moves and renames, rebases copies when their origin can be identified, and repairs broken local paths with a unique workspace match. Ambiguous targets are left unchanged. Code examples and web URLs are left alone.
+
+Link indexing and repairs run in the background. The index retains destinations and byte ranges, reparses only changed notes, and uses reverse references to find affected files. Large closed notes are rewritten through a temporary file without constructing a second full copy in memory.
+
 ### FAQs
 <details>
 <summary>

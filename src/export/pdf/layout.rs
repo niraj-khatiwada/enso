@@ -7,7 +7,7 @@ use super::fonts::{Face, Fonts, Variant};
 use crate::export::html::local_path;
 use crate::rich::{Alignment, EditableTable, TableSyntax, html_picture};
 use markdown::mdast::{AlignKind, Node};
-use std::{collections::HashMap, path::Path};
+use std::{collections::HashMap, path::Path, sync::Arc};
 
 pub type Rgb = (u8, u8, u8);
 
@@ -66,6 +66,7 @@ pub struct Frag {
     pub text: String,
     pub face: &'static Face,
     pub style: Style,
+    pub math: Option<Arc<crate::math::Formula>>,
 }
 
 pub enum Marker {
@@ -115,6 +116,8 @@ pub struct Row {
 
 pub enum Item {
     Line(Line),
+    Formula { x:f32,width:f32,height:f32,formula:Arc<crate::math::Formula> },
+    Callout { panel:Panel,accent:Rgb,item:Box<Item> },
     Space { height: f32, bars: Vec<f32>, panel: Option<Panel> },
     Rule { x: f32, width: f32 },
     Image { x: f32, width: f32, height: f32, image: krilla::image::Image },
@@ -125,6 +128,8 @@ impl Item {
     pub fn height(&self) -> f32 {
         match self {
             Item::Line(line) => line.height,
+            Item::Formula { height, .. } => *height,
+            Item::Callout { item, .. } => item.height(),
             Item::Space { height, .. } => *height,
             Item::Rule { .. } => 16.,
             Item::Image { height, .. } => *height,
@@ -133,9 +138,16 @@ impl Item {
     }
 }
 
+impl Item {
+    pub fn spacer(&self)->bool{match self{Self::Space{..}=>true,Self::Callout{item,..}=>item.spacer(),_=>false}}
+    pub fn line(&self)->Option<&Line>{match self {Self::Line(line)=>Some(line),Self::Callout{item,..}=>item.line(),_=>None}}
+    pub fn keep_with_next(&self)->bool{match self{Self::Line(l)=>l.keep_with_next,Self::Row(r)=>r.header,Self::Callout{panel,item,..}=>panel.round_top || item.keep_with_next(),_=>false}}
+}
+
 /// Inline content before it's wrapped into lines.
 enum Inline {
     Text(String, Style),
+    Math(Arc<crate::math::Formula>,Style),
     Break,
     Image { src: String, alt: String, width: String, alignment: Alignment },
 }
@@ -252,6 +264,7 @@ impl<'a> Layout<'a> {
             }
             Node::ThematicBreak(_) => self.items.push(Item::Rule { x: frame.x, width: frame.width }),
             Node::Blockquote(q) => {
+                if let Some(callout)=crate::callout::Callout::parse(node){self.callout(callout,frame);return;}
                 let inner = Frame {
                     x: frame.x + QUOTE_INDENT,
                     width: (frame.width - QUOTE_INDENT).max(40.),
@@ -266,7 +279,16 @@ impl<'a> Layout<'a> {
                 }
             }
             Node::Code(code) => self.code_block(&code.value, frame),
-            Node::Math(math) => self.code_block(&math.value, frame),
+            Node::Math(math) => {
+                match crate::math::render(&math.value,true,false){
+                    Ok(formula)=>{
+                        let scale=(BODY/16.).min(frame.width/formula.width.max(1.)).min(self.max_image_height/formula.height.max(1.));
+                        let (width,height)=(formula.width*scale,formula.height*scale);
+                        self.items.push(Item::Formula{x:frame.x+(frame.width-width)/2.,width,height,formula});
+                    }
+                    Err(_)=>self.code_block(&math.value,frame),
+                }
+            },
             Node::List(list) => self.list(list, frame, 0),
             Node::Table(table) => {
                 let rows: Vec<Vec<Vec<Inline>>> = table
@@ -299,6 +321,22 @@ impl<'a> Layout<'a> {
                     self.paragraph(inlines, frame, None);
                 }
             }
+        }
+    }
+
+    fn callout(&mut self,callout:crate::callout::Callout,frame:&Frame){
+        let start=self.items.len();
+        let inner=Frame{x:frame.x+12.,width:(frame.width-24.).max(40.),color:TEXT,..frame.clone()};
+        self.space(9.,&inner);
+        let style=Style{variant:Variant{bold:true,..Variant::default()},color:callout.kind.rgb(),..Style::default()};
+        let title_start=self.items.len();
+        self.paragraph(vec![Inline::Text(callout.title,style)],&inner,None);
+        for item in &mut self.items[title_start..]{if let Item::Line(line)=item{line.keep_with_next=!callout.children.is_empty();}}
+        self.space(5.,&inner);self.blocks(&callout.children,&inner);self.space(9.,&inner);
+        let items=self.items.drain(start..).collect::<Vec<_>>();let last=items.len().saturating_sub(1);
+        for (i,item) in items.into_iter().enumerate(){
+            self.items.push(Item::Callout{panel:Panel{x:frame.x,width:frame.width,color:callout.kind.tint(),round_top:i==0,round_bottom:i==last},
+                accent:callout.kind.rgb(),item:Box::new(item)});
         }
     }
 
@@ -448,6 +486,9 @@ impl<'a> Layout<'a> {
         let mut line = 0f32;
         let mut word = 0f32;
         for inline in inlines {
+            if let Inline::Math(math,style)=inline{
+                let width=math.width*style.size/16.;line+=width;word=word.max(width);
+            }
             if let Inline::Text(text, style) = inline {
                 let face = self.fonts.face(style.variant);
                 line += self.fonts.width(text, face, style.size);
@@ -634,7 +675,10 @@ impl<'a> Layout<'a> {
                     ..style
                 },
             )),
-            Node::InlineMath(math) => out.push(Inline::Text(format!("${}$", math.value), style)),
+            Node::InlineMath(math) => match crate::math::render(&math.value,false,false){
+                Ok(formula)=>out.push(Inline::Math(formula,style)),
+                Err(_)=>out.push(Inline::Text(format!("${}$",math.value),style)),
+            },
             Node::Break(_) => out.push(Inline::Break),
             Node::Link(link) => {
                 let s = link_style(&style, &link.url);
@@ -787,6 +831,7 @@ impl<'a> Layout<'a> {
             /// A line may start here.
             can_break: bool,
             hard_break: bool,
+            math: Option<Arc<crate::math::Formula>>,
         }
         let mut pieces: Vec<Piece> = Vec::new();
         for inline in &inlines {
@@ -798,7 +843,14 @@ impl<'a> Layout<'a> {
                     trailing: 0.,
                     can_break: true,
                     hard_break: true,
+                    math: None,
                 }),
+                Inline::Math(formula,style)=>{
+                    let mut style=style.clone();
+                    let width=formula.width*style.size/16.;
+                    if width>frame.width {style.size*=frame.width/width;}
+                    pieces.push(Piece{text:String::new(),width:formula.width*style.size/16.,style,trailing:0.,can_break:true,hard_break:false,math:Some(formula.clone())});
+                }
                 Inline::Text(text, style) => {
                     let face = self.fonts.face(style.variant);
                     let mut last = 0;
@@ -827,6 +879,7 @@ impl<'a> Layout<'a> {
                             can_break: i > 0
                                 || pieces.last().is_none_or(|p| p.text.ends_with(char::is_whitespace) || p.hard_break),
                             hard_break: false,
+                            math: None,
                         });
                     }
                 }
@@ -847,7 +900,7 @@ impl<'a> Layout<'a> {
                 lines.push(Vec::new());
                 used = 0.;
             }
-            if piece.width - piece.trailing > frame.width {
+            if piece.math.is_none() && piece.width - piece.trailing > frame.width {
                 // A word wider than the line (a long URL): split it.
                 let face = self.fonts.face(piece.style.variant);
                 let mut rest = piece.text.as_str();
@@ -862,6 +915,7 @@ impl<'a> Layout<'a> {
                         trailing: 0.,
                         can_break: true,
                         hard_break: false,
+                        math: None,
                     });
                     used += width;
                     rest = tail;
@@ -878,7 +932,7 @@ impl<'a> Layout<'a> {
         let default_size = inlines
             .iter()
             .find_map(|i| match i {
-                Inline::Text(_, s) => Some(s.size),
+                Inline::Text(_, s) | Inline::Math(_,s) => Some(s.size),
                 _ => None,
             })
             .unwrap_or(BODY);
@@ -886,7 +940,9 @@ impl<'a> Layout<'a> {
             let mut frags = Vec::new();
             let mut x = frame.x;
             for piece in &pieces {
-                let placed = self.frags(&piece.text, &piece.style, x);
+                let placed=if let Some(formula)=&piece.math{
+                    vec![Frag{x,width:piece.width,text:String::new(),face:self.fonts.face(piece.style.variant),style:piece.style.clone(),math:Some(formula.clone())}]
+                }else{self.frags(&piece.text,&piece.style,x)};
                 x += placed.iter().map(|f| f.width).sum::<f32>();
                 frags.extend(placed);
             }
@@ -909,8 +965,8 @@ impl<'a> Layout<'a> {
                 frag.x += shift;
             }
             let size = frags.iter().map(|f| f.style.size).fold(default_size, f32::max);
-            let ascent = frags.iter().map(|f| f.face.ascent * f.style.size).fold(0., f32::max);
-            let descent = frags.iter().map(|f| f.face.descent * f.style.size).fold(0., f32::max);
+            let ascent = frags.iter().map(|f| f.math.as_ref().map_or(f.face.ascent*f.style.size,|m|m.baseline*f.style.size/16.)).fold(0., f32::max);
+            let descent = frags.iter().map(|f| f.math.as_ref().map_or(f.face.descent*f.style.size,|m|(m.height-m.baseline).max(0.)*f.style.size/16.)).fold(0., f32::max);
             let (ascent, descent) = if frags.is_empty() {
                 let face = self.fonts.face(Variant::default());
                 (face.ascent * size, face.descent * size)
@@ -941,7 +997,7 @@ impl<'a> Layout<'a> {
             .map(|(face, range)| {
                 let text = text[range].to_string();
                 let width = face.width(&text, style.size);
-                let frag = Frag { x, width, text, face, style: style.clone() };
+                let frag = Frag { x, width, text, face, style: style.clone(), math:None };
                 x += width;
                 frag
             })
@@ -1113,6 +1169,7 @@ fn clone_inlines(inlines: &[Inline]) -> Vec<Inline> {
         .iter()
         .map(|i| match i {
             Inline::Text(t, s) => Inline::Text(t.clone(), s.clone()),
+            Inline::Math(m,s)=>Inline::Math(m.clone(),s.clone()),
             Inline::Break => Inline::Break,
             Inline::Image { src, alt, width, alignment } => Inline::Image {
                 src: src.clone(),

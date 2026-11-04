@@ -1,6 +1,7 @@
 //! Exporting a note: native PDF, portable HTML folders, and rich text.
 
 pub mod html;
+mod markup;
 pub mod pdf;
 
 use super::*;

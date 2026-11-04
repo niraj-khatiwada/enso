@@ -182,21 +182,38 @@ pub fn decorate(
     source_offset: usize,
     prefix_len: usize,
 ) -> TextView {
+    decorate_mapped(view, owner, editor_id, base, crate::wiki::SourceMap::offset(source_offset, prefix_len))
+}
+pub(crate) fn decorate_mapped(
+    view: TextView, owner: WeakEntity<Enso>, editor_id: EntityId,
+    base: Option<PathBuf>, mapping: Arc<crate::wiki::SourceMap>,
+) -> TextView {
     let inline = InlineImages {
         owner: owner.clone(),
         editor_id,
         base: base.clone(),
-        offset: source_offset,
-        prefix: prefix_len,
+        mapping: mapping.clone(),
     };
     let image_owner = owner.clone();
     let table_owner = owner.clone();
     let task_owner = owner.clone();
     let task_base = base.clone();
     let diagram_owner = owner.clone();
-    view.plugin(inline)
+    let wiki = crate::wiki::WikiBlocks { owner: owner.clone(), editor: editor_id, base: base.clone(), mapping: mapping.clone() };
+    let footer_owner = owner.clone();
+    let image_mapping = mapping.clone();
+    let task_mapping = mapping.clone();
+    let callouts = crate::callout::Plugin { owner: owner.clone(), editor: editor_id, base: base.clone(), mapping: mapping.clone() };
+    view.plugin(inline).plugin(wiki).plugin(callouts).plugin(crate::math::InlineMath)
         .markdown_block_parser(|node, context| {
             let source = context.node_source(node)?;
+            if matches!(node, Node::Html(_)) && source.trim() == "<!--enso-backlinks-->" {
+                return Some(MarkdownNode::new("enso-backlinks", ()).markdown(source.to_owned()));
+            }
+            if let Node::Math(math) = node {
+                return Some(MarkdownNode::new("enso-math", crate::math::Equation::new(&math.value, true))
+                    .text(math.value.clone()).markdown(source.to_owned()));
+            }
             if let Node::Code(code) = node {
                 if crate::diagram::is_mermaid(code.lang.as_deref()) {
                     return Some(
@@ -220,6 +237,13 @@ pub fn decorate(
                     .markdown(source.to_owned()),
             )
         })
+        .markdown_block_renderer("enso-math", |node, _, cx| {
+            crate::math::block(node.data::<crate::math::Equation>().unwrap(), cx)
+        })
+        .markdown_block_renderer("enso-backlinks", move |_, _, cx| {
+            footer_owner.update(cx, |app, cx| app.linked_from(editor_id, cx))
+                .unwrap_or_else(|_| div().into_any_element())
+        })
         .markdown_block_renderer("enso-mermaid", move |node, _, cx| {
             let block = node.data::<MermaidBlock>().unwrap();
             render_mermaid(&block.source, diagram_owner.clone(), cx)
@@ -230,8 +254,7 @@ pub fn decorate(
                 image_owner.clone(),
                 editor_id,
                 base.clone(),
-                source_offset,
-                prefix_len,
+                image_mapping.clone(),
                 window,
                 cx,
             )
@@ -250,8 +273,7 @@ pub fn decorate(
                     let owner = task_owner.clone();
                     let marker = item
                         .marker
-                        .and_then(|start| start.checked_sub(prefix_len))
-                        .map(|start| start + source_offset);
+                        .and_then(|start| task_mapping.point(start));
                     row = row.child(
                         div()
                             .h(line_height)
@@ -283,16 +305,15 @@ pub fn decorate(
                 }
                 let mut body = v_flex().flex_1().min_w_0();
                 for (j, (source, start)) in item.children.iter().enumerate() {
-                    if let Some(start) = start.checked_sub(prefix_len) {
-                        body = body.child(decorate(
+                    {
+                        body = body.child(decorate_mapped(
                             TextView::markdown(("task-body", i * 1000 + j), source.clone())
                                 .w_full()
                                 .selectable(true),
                             task_owner.clone(),
                             editor_id,
                             task_base.clone(),
-                            source_offset + start,
-                            0,
+                            task_mapping.child(*start),
                         ));
                     }
                 }
@@ -304,7 +325,7 @@ pub fn decorate(
             let range = table
                 .span
                 .clone()
-                .and_then(|r| shifted_range(r, source_offset, prefix_len));
+                .and_then(|r| mapping.range(r));
             let owner = table_owner.clone();
             // Only offer the editor for tables it can write back: HTML with
             // merged cells or captions is edited in Edit mode.
@@ -602,8 +623,7 @@ struct InlineImages {
     owner: WeakEntity<Enso>,
     editor_id: EntityId,
     base: Option<PathBuf>,
-    offset: usize,
-    prefix: usize,
+    mapping: Arc<crate::wiki::SourceMap>,
 }
 impl MarkdownPlugin for InlineImages {
     fn name(&self) -> &str {
@@ -627,8 +647,7 @@ impl MarkdownPlugin for InlineImages {
             self.owner.clone(),
             self.editor_id,
             self.base.clone(),
-            self.offset,
-            self.prefix,
+            self.mapping.clone(),
             window,
             cx,
         )
@@ -663,8 +682,7 @@ fn render_picture(
     owner: WeakEntity<Enso>,
     editor_id: EntityId,
     base: Option<PathBuf>,
-    offset: usize,
-    prefix: usize,
+    mapping: Arc<crate::wiki::SourceMap>,
     window: &mut Window,
     cx: &mut App,
 ) -> AnyElement {
@@ -674,7 +692,7 @@ fn render_picture(
     let source = if !picture.src.contains(':') {
         ImageSource::from(
             base.as_ref()
-                .map(|b| b.join(&picture.src))
+                .map(|b| b.join(crate::links::decode(&picture.src)))
                 .unwrap_or_else(|| PathBuf::from(&picture.src)),
         )
     } else {
@@ -694,7 +712,7 @@ fn render_picture(
         .unwrap_or(1.);
     let range = node
         .source_range()
-        .and_then(|r| shifted_range(r, offset, prefix));
+        .and_then(|r| mapping.range(r));
     let expected = node.as_markdown().to_owned();
     let preview = cx
         .try_global::<ResizeState>()
@@ -1100,12 +1118,6 @@ impl Enso {
     }
 }
 
-fn shifted_range(range: Range<usize>, offset: usize, prefix: usize) -> Option<Range<usize>> {
-    if range.start < prefix {
-        return None;
-    }
-    Some(range.start - prefix + offset..range.end - prefix + offset)
-}
 struct Target {
     editor: Entity<EditorState>,
     range: Range<usize>,

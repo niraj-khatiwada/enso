@@ -1,5 +1,38 @@
 # Changelog
 
+### 1.1.0
+
+Features:
+
+- **Pinned Notes**: Pin a tab from its right-click menu, the document's **⋯** menu or the command palette. Pinned tabs stay first, show a pin icon, and reopen pinned with the workspace. Unpin a tab before closing it; Cmd/Ctrl + W and the close button cannot remove pinned tabs.
+- **Wiki Links and Backlinks**: Type `[[` to find another note in the workspace, select it with the keyboard or mouse, and click the link in Read view to open it. A **Linked from** list at the end of each note shows its incoming links. New links include the file extension; existing extensionless links and custom labels remain supported.
+- **Callouts**: GitHub-style Note, Tip, Important, Warning and Caution blocks render as calm, tinted panels. Obsidian-style custom titles are supported, and the panels carry into HTML and PDF exports.
+- **Math**: Inline `$…$` and display `$$…$$` equations render natively and offline, including fractions, roots, sums, integrals and matrices. HTML exports contain self-contained SVG, and PDFs draw equations as sharp vector paths, even with image export disabled.
+
+Enhancements:
+
+- Ctrl + Tab moves to the next tab and Ctrl + Shift + Tab to the previous one, on every platform.
+- On macOS, every shortcut uses Cmd, and Control keys are left to text editing (Ctrl + E moves to the end of the line again). Tabs still cycle with Ctrl + Tab, as in browsers.
+- Backspace in the insert menu with nothing typed closes it and puts the cursor back where it was; opened with `/`, the slash is erased too.
+- Copy a file or folder in the sidebar with Cmd/Ctrl + C and paste it into any folder with Cmd/Ctrl + V, while the sidebar has focus. On macOS, copied files paste in Finder too. A folder can be pasted into itself, as a copy inside it. Cmd/Ctrl + X cuts instead, and pasting moves the item.
+- Select several files and folders in the sidebar with Cmd + click (Ctrl + click on Windows and Linux), or Shift + click for a range within one folder; copy, cut, drag and delete them together.
+- When no command matches in the command palette, Search Notes for what you typed is offered; press Enter and the same words search every note.
+- Search everything finds text in large notes too: files over 4 MB are searched straight from disk, without slowing the search down.
+- Find in Read view: Cmd/Ctrl + F opens a find bar over the page, highlights every match, and steps through them with Enter and Shift + Enter. The editor keeps its own Find and Replace.
+- Opening a search result selects the match in the editor and highlights it in the reader for a few seconds, so it's easy to spot.
+- Focus Mode (Cmd/Ctrl + Shift + Enter, the command palette, or the document's **⋯** menu): the sidebar, tabs, outline and word count step away and the page sits in a centred column. While writing, the line with the cursor stays in the middle of the view and the other paragraphs fade. Escape leaves it.
+- Pasting a web address over selected words turns them into a link.
+- Moving a file into a folder that already has one by that name keeps both, numbering the moved one, instead of refusing.
+- F2 renames the selected file or folder on every platform; Enter still works on macOS.
+- The word count sits in a compact pill at the bottom-right instead of a full-width status bar, giving the document more room.
+- Large-document reading keeps bounded equations and callouts together instead of splitting them between rendered sections.
+
+Bug Fixes:
+
+- Moving or copying notes rebases relative image and file paths; renaming a note updates links that point to it.
+- The workspace watcher checks arriving and changed notes regardless of whether they came through enso, a file manager, or sync. Broken local paths are repaired when a unique target can be identified; ambiguous matches are left unchanged.
+- Link repairs preserve unsaved edits and leave code examples, web addresses and footnote text intact. Unchanged large notes are not repeatedly scanned.
+
 ### 1.0.0
 
 Features:
