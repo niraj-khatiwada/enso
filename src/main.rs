@@ -7,6 +7,7 @@ mod brand;
 mod diagram;
 mod export;
 mod files;
+mod find;
 mod http;
 mod lock;
 mod markdown_edit;
@@ -74,6 +75,7 @@ actions!(
         OpenCommandPalette,
         SearchEverything,
         PasteFiles,
+        FindInPage,
         CopySelected,
         CutSelected,
         ExportNote,
@@ -538,6 +540,10 @@ struct Enso {
     /// A cursor position to show once its document is laid out: the
     /// document, the byte offset, and frames left to wait.
     pending_jump: Option<(EntityId, usize, u8)>,
+    /// The match a search result opened at, highlighted once it's shown.
+    pending_flash: Option<(EntityId, Vec<std::ops::Range<usize>>)>,
+    flash_task: Option<Task<()>>,
+    page_find: Option<find::PageFind>,
     /// While a tab is dragged: where it came from and the tab it's over.
     dragging_tab: Option<usize>,
     tab_drop: Option<usize>,
@@ -660,6 +666,9 @@ impl Enso {
             _disk_watch: Self::watch_disk(window, cx),
             search_cache: Default::default(),
             pending_jump: None,
+            pending_flash: None,
+            flash_task: None,
+            page_find: None,
             dragging_tab: None,
             tab_drop: None,
             tree_drop: None,
@@ -1347,18 +1356,22 @@ impl Enso {
         .detach();
     }
 
-    /// Open `path` (or switch to its tab) with the cursor at byte `offset`.
+    /// Open `path` (or switch to its tab) with the cursor at byte `offset`,
+    /// `matches` (what a search found) highlighted for a moment.
     fn open_path_at(
         &mut self,
         path: PathBuf,
         offset: usize,
+        matches: Vec<std::ops::Range<usize>>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         if let Some(index) = self.documents.iter().position(|d| d.path.as_ref() == Some(&path)) {
             self.active = Some(index);
             self.refocus = true;
-            self.pending_jump = Some((self.documents[index].editor.entity_id(), offset, 120));
+            let id = self.documents[index].editor.entity_id();
+            self.pending_jump = Some((id, offset, 120));
+            self.pending_flash = (!matches.is_empty()).then(|| (id, matches));
             cx.notify();
             return;
         }
@@ -1384,6 +1397,7 @@ impl Enso {
                     this.add_document(Some(path), text, sections, window, cx);
                     if let Some(doc) = this.active.and_then(|i| this.documents.get(i)) {
                         this.pending_jump = Some((doc.editor.entity_id(), offset, 120));
+                        this.pending_flash = (!matches.is_empty()).then(|| (doc.editor.entity_id(), matches));
                     }
                 }
                 Err(error) => this.message(error.to_string(), true, cx),
@@ -1408,7 +1422,13 @@ impl Enso {
             || (doc.preview_loaded && !doc.preview.read(cx).rendered_text().source().is_empty());
         if ready || frames == 0 {
             self.pending_jump = None;
-            cx.defer_in(window, move |this, window, cx| this.jump_to_heading(id, offset, window, cx));
+            let flash = self.pending_flash.take().filter(|(of, _)| *of == id).map(|(_, range)| range);
+            cx.defer_in(window, move |this, window, cx| {
+                this.jump_to_heading(id, offset, window, cx);
+                if let Some(range) = flash {
+                    this.flash_match(id, range, cx);
+                }
+            });
         } else {
             self.pending_jump = Some((id, offset, frames - 1));
             window.request_animation_frame();
@@ -2871,6 +2891,16 @@ impl Render for Enso {
         let sidebar_width = self.sidebar_width;
 
         let active_path = self.active.and_then(|i| self.documents[i].path.clone());
+        // Find belongs to the reading view of the tab it was opened in.
+        let active_id = self.active.map(|i| self.documents[i].editor.entity_id());
+        if let Some(find) = self.page_find.take_if(|f| self.mode == Mode::Edit || Some(f.editor_id) != active_id) {
+            if let Some(doc) = self.documents.iter().find(|d| d.editor.entity_id() == find.editor_id) {
+                match &doc.large_reader {
+                    Some(reader) => reader.update(cx, |reader, cx| reader.clear_highlight(cx)),
+                    None => doc.preview.update(cx, |view, cx| view.clear_range_highlights(cx)),
+                }
+            }
+        }
         if active_path != self.followed_path {
             self.followed_path = active_path.clone();
             if let Some(path) = &active_path {
@@ -3916,6 +3946,14 @@ impl Render for Enso {
                     );
                 }
             }
+            // Find, over the reading view it searches.
+            if let Some(pane) = reading_pane.take() {
+                let finding = self.page_find.as_ref().is_some_and(|f| f.editor_id == document.editor.entity_id());
+                reading_pane = Some(match self.page_find_bar(cx).filter(|_| finding) {
+                    Some(bar) => h_flex().relative().flex_1().min_w_0().h_full().child(pane).child(bar).into_any_element(),
+                    None => pane,
+                });
+            }
             // Read and Edit have independent element paths. Only Split owns
             // resizable state, so switching modes never reuses panel zero for
             // a different kind of document view or its cached draw state.
@@ -4164,6 +4202,7 @@ impl Render for Enso {
             .on_action(cx.listener(|this, _: &OpenCommandPalette, w, cx| this.open_palette(w, cx)))
             .on_action(cx.listener(|this, _: &SearchEverything, w, cx| this.toggle_content_search(w, cx)))
             .on_action(cx.listener(|this, _: &PasteFiles, w, cx| this.paste_files(w, cx)))
+            .on_action(cx.listener(|this, _: &FindInPage, w, cx| this.open_page_find(w, cx)))
             .on_action(cx.listener(|this, _: &CopySelected, w, cx| this.copy_selected(false, w, cx)))
             .on_action(cx.listener(|this, _: &CutSelected, w, cx| this.copy_selected(true, w, cx)))
             .on_action(cx.listener(|this, action: &spellcheck::ReplaceSpelling, w, cx| this.replace_spelling(action, w, cx)))
@@ -4348,6 +4387,8 @@ fn bind_view_keys(cx: &mut App) {
         KeyBinding::new(if cfg!(target_os = "macos") { "cmd-v" } else { "ctrl-v" }, PasteFiles, Some("Enso")),
         KeyBinding::new(if cfg!(target_os = "macos") { "cmd-c" } else { "ctrl-c" }, CopySelected, Some("Enso")),
         KeyBinding::new(if cfg!(target_os = "macos") { "cmd-x" } else { "ctrl-x" }, CutSelected, Some("Enso")),
+        // The editor binds the same keys closer in, for its own Find.
+        KeyBinding::new(if cfg!(target_os = "macos") { "cmd-f" } else { "ctrl-f" }, FindInPage, Some("Enso")),
     ]);
     // Cmd on macOS, Ctrl elsewhere. On macOS, Ctrl+letter belongs to text
     // fields (Ctrl+E is end of line, Ctrl+A start of line, Ctrl+K delete to
@@ -5374,6 +5415,112 @@ mod transition_tests {
         cx.run_until_parked();
         assert!(p("c.md").is_file() && p("target/b.md").is_file());
         draw(cx, handle);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn find_in_the_reader_counts_steps_and_closes(cx: &mut TestAppContext) {
+        cx.update(|cx| { gpui_kit::init(cx); bind_view_keys(cx); super::bind_markdown_keys(cx); });
+        let source = "# Fruit\n\nAn **apple** pie, an apple tart.\n\nApples everywhere.\n";
+        let (handle, view) = cx.update(|cx| gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+            cx.new(|cx| {
+                let mut app = Enso::new(window, cx);
+                app.add_document(Some(PathBuf::from("fruit.md")), source.into(), None, window, cx);
+                app.mode = Mode::Read;
+                app
+            })
+        }).unwrap());
+        for _ in 0..3 { draw(cx, handle); cx.run_until_parked(); }
+        let find = if cfg!(target_os = "macos") { "cmd-f" } else { "ctrl-f" };
+        cx.simulate_keystrokes(handle, find);
+        draw(cx, handle);
+        cx.simulate_input(handle, "apple");
+        draw(cx, handle);
+        let state = |cx: &mut TestAppContext| cx.update(|cx| {
+            view.read(cx).page_find.as_ref().map(|f| (f.matches.len(), f.current))
+        });
+        // The rendered text is searched: "**apple**" counts, and so does "Apples".
+        assert_eq!(state(cx), Some((3, 0)));
+        cx.simulate_keystrokes(handle, "enter");
+        assert_eq!(state(cx), Some((3, 1)));
+        cx.simulate_keystrokes(handle, "shift-enter shift-enter");
+        assert_eq!(state(cx), Some((3, 2)));
+        cx.simulate_keystrokes(handle, "escape");
+        draw(cx, handle);
+        assert_eq!(state(cx), None);
+        // In Edit, the keys are the editor's own Find.
+        cx.update(|cx| view.update(cx, |app, _| app.mode = Mode::Edit));
+        draw(cx, handle);
+        cx.update_window(handle, |_, window, cx| {
+            let editor = view.read(cx).documents[0].editor.clone();
+            editor.focus_handle(cx).focus(window, cx);
+        }).unwrap();
+        cx.simulate_keystrokes(handle, find);
+        draw(cx, handle);
+        assert_eq!(state(cx), None);
+    }
+
+    #[gpui_kit::test]
+    fn find_in_a_large_note_paints_the_current_match(cx: &mut TestAppContext) {
+        cx.update(|cx| { gpui_kit::init(cx); bind_view_keys(cx); });
+        let filler = "An ordinary line of a very long book.\n\n".repeat(8_000);
+        let source = format!("{filler}Title: The Adventures of Sherlock Holmes\n\n{filler}");
+        assert!(source.len() >= reader::LARGE_DOCUMENT_BYTES);
+        let sections = reader::LargeReader::index(&source);
+        let (handle, view) = cx.update(|cx| gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+            cx.new(|cx| {
+                let mut app = Enso::new(window, cx);
+                app.add_document(Some(PathBuf::from("big.md")), source.clone(), Some(sections), window, cx);
+                app.mode = Mode::Read;
+                app
+            })
+        }).unwrap());
+        for _ in 0..3 { draw(cx, handle); cx.run_until_parked(); }
+        let find = if cfg!(target_os = "macos") { "cmd-f" } else { "ctrl-f" };
+        cx.simulate_keystrokes(handle, find);
+        draw(cx, handle);
+        cx.simulate_input(handle, "sherlock");
+        for _ in 0..6 { draw(cx, handle); cx.run_until_parked(); }
+        cx.update(|cx| {
+            let app = view.read(cx);
+            assert_eq!(app.page_find.as_ref().unwrap().matches.len(), 1);
+            let reader = app.documents[0].large_reader.as_ref().unwrap().read(cx);
+            assert!(reader.highlight_painted());
+        });
+    }
+
+    #[gpui_kit::test]
+    fn a_search_result_selects_and_highlights_its_match(cx: &mut TestAppContext) {
+        cx.update(|cx| { gpui_kit::init(cx); bind_view_keys(cx); });
+        let root = std::env::temp_dir().join(format!("enso-flash-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("trip.md");
+        let text = "# Trip\n\nPack the blue umbrella.\n";
+        std::fs::write(&path, text).unwrap();
+        let (handle, view) = cx.update(|cx| gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+            cx.new(|cx| {
+                let mut app = Enso::new(window, cx);
+                app.open_folder(root.clone(), cx);
+                app.mode = Mode::Split;
+                app
+            })
+        }).unwrap());
+        cx.run_until_parked();
+        let offset = text.find("blue").unwrap();
+        let _ = handle.update(cx, |_, window, cx| {
+            view.update(cx, |app, cx| app.open_path_at(path.clone(), offset, vec![offset..offset + 4], window, cx))
+        });
+        for _ in 0..6 { cx.run_until_parked(); draw(cx, handle); }
+        cx.update(|cx| {
+            let app = view.read(cx);
+            let editor = app.documents[0].editor.read(cx);
+            assert_eq!(editor.selected_range(), offset..offset + 4);
+            assert!(app.flash_task.is_some());
+        });
+        // A few seconds later the highlight goes, the selection stays.
+        cx.executor().advance_clock(std::time::Duration::from_secs(4));
+        cx.run_until_parked();
         std::fs::remove_dir_all(root).unwrap();
     }
 

@@ -30,6 +30,18 @@ pub struct LargeReader {
     base: Option<PathBuf>,
     cursor_anchor: Option<usize>,
     controls: Option<(WeakEntity<crate::Enso>, EntityId)>,
+    /// A highlighted match (a search jump, Find): its section is drawn from a
+    /// state of its own, which can carry highlights; the others stay plain.
+    highlight: Option<Highlight>,
+}
+
+struct Highlight {
+    section: usize,
+    /// In the section's own text (prefix included).
+    ranges: Vec<Range<usize>>,
+    color: Hsla,
+    state: Entity<gpui_kit::component::text::TextViewState>,
+    applied: bool,
 }
 
 impl LargeReader {
@@ -144,6 +156,44 @@ impl LargeReader {
         cx.notify();
     }
 
+    pub fn source(&self) -> Arc<String> {
+        self.source.clone()
+    }
+
+    /// Highlight `ranges` of the source in `color` (those in the first one's
+    /// section) and scroll to the first.
+    pub fn highlight(&mut self, ranges: Vec<Range<usize>>, color: Hsla, cx: &mut Context<Self>) {
+        let Some(first) = ranges.first().cloned() else { return };
+        self.reveal_source(first.start, cx);
+        let Some(index) = self.sections.iter().position(|s| s.range.contains(&first.start)) else {
+            return;
+        };
+        let section = &self.sections[index];
+        let local = ranges
+            .iter()
+            .filter(|r| section.range.contains(&r.start))
+            .map(|r| {
+                let end = r.end.min(section.range.end);
+                section.prefix.len() + r.start - section.range.start..section.prefix.len() + end - section.range.start
+            })
+            .collect();
+        let text = format!("{}{}{}", section.prefix, &self.source[section.range.clone()], section.suffix);
+        let state = cx.new(|cx| gpui_kit::component::text::TextViewState::markdown(&text, cx));
+        self.highlight = Some(Highlight { section: index, ranges: local, color, state, applied: false });
+        cx.notify();
+    }
+
+    pub fn clear_highlight(&mut self, cx: &mut Context<Self>) {
+        if self.highlight.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    #[cfg(all(test, feature = "ui-tests"))]
+    pub fn highlight_painted(&self) -> bool {
+        self.highlight.as_ref().is_some_and(|h| h.applied)
+    }
+
     #[cfg(all(test, feature = "ui-tests"))]
     pub fn visible_source_range(&self) -> Option<Range<usize>> {
         self.sections
@@ -183,12 +233,33 @@ impl LargeReader {
             base,
             cursor_anchor: None,
             controls: None,
+            highlight: None,
         }
     }
 }
 
 impl Render for LargeReader {
-    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Paint the highlight once its section's text has been parsed.
+        if let Some(highlight) = self.highlight.as_mut().filter(|h| !h.applied) {
+            let rendered = highlight.state.read(cx).rendered_text();
+            if rendered.source().is_empty() {
+                window.request_animation_frame();
+            } else {
+                highlight.applied = true;
+                let color = highlight.color;
+                let painted: Vec<_> = highlight
+                    .ranges
+                    .iter()
+                    .filter_map(|r| rendered.range_for_source(r.clone()))
+                    .map(|r| gpui_kit::component::text::RangeHighlight::new(r, color))
+                    .collect();
+                highlight.state.update(cx, |state, cx| {
+                    let _ = state.set_range_highlights(painted, cx);
+                });
+            }
+        }
+        let highlighted = self.highlight.as_ref().map(|h| (h.section, h.state.clone()));
         let source = self.source.clone();
         let sections = self.sections.clone();
         let base = self.base.clone();
@@ -216,7 +287,10 @@ impl Render for LargeReader {
                 .when(index == last, |d| d.pb_8())
                 .child(
                     div().w_full().child(
-                        TextView::markdown(("section", index), text)
+                        match &highlighted {
+                            Some((section, state)) if *section == index => TextView::new(state),
+                            _ => TextView::markdown(("section", index), text),
+                        }
                             .map(|view| crate::typography::style(view, cx))
                             .map(|view| {
                                 if let Some((owner, editor)) = &controls {

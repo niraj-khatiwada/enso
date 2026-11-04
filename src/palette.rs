@@ -1465,7 +1465,7 @@ impl Enso {
             return;
         };
         self.close_palette(window, cx);
-        self.open_path_at(hit.path, hit.offset, window, cx);
+        self.open_path_at(hit.path, hit.offset, hit.matches, window, cx);
     }
 }
 
@@ -1840,8 +1840,10 @@ mod ui_tests {
             assert!(app.palette.is_none());
             let doc = &app.documents[app.active.unwrap()];
             assert_eq!(doc.path.as_ref(), Some(&path));
-            let cursor = doc.editor.read(cx).cursor();
-            assert_eq!(&text[cursor..cursor + 4], "blue");
+            // The match is selected, so it's plain to see.
+            let selected = doc.editor.read(cx).selected_range();
+            // Both words, from the first to the last.
+            assert_eq!(&text[selected], "blue umbrella");
         });
         // The shortcut closes the search again.
         cx.simulate_keystrokes(handle, key);

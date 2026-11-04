@@ -39,6 +39,9 @@ pub struct Hit {
     pub line: String,
     /// Byte ranges of the matched words within `line`.
     pub ranges: Vec<Range<usize>>,
+    /// What matched, in the file: the query as typed when the line holds it
+    /// so, otherwise each word. Highlighted when the result is opened.
+    pub matches: Vec<Range<usize>>,
 }
 
 /// File texts from earlier searches, with the stamp they were read at.
@@ -100,6 +103,38 @@ fn search_large(path: &Path, terms: &[String], sensitive: bool, cancel: &AtomicB
     search_text(path, text, terms, sensitive, cancel, hits);
 }
 
+/// Every place `query` occurs in `text`, at most `limit`: ignoring case
+/// unless the query has a capital, as the notes search does. For Find in a
+/// note.
+pub fn find_all(text: &str, query: &str, limit: usize) -> Vec<Range<usize>> {
+    let mut found = Vec::new();
+    if query.is_empty() {
+        return found;
+    }
+    let sensitive = query.chars().any(char::is_uppercase);
+    if !sensitive && query.is_ascii() {
+        let needle = query.to_ascii_lowercase();
+        let bytes = text.as_bytes();
+        let mut at = 0;
+        while found.len() < limit
+            && let Some(i) = find_ascii_folded(&bytes[at..], needle.as_bytes())
+        {
+            found.push(at + i..at + i + needle.len());
+            at += i + needle.len();
+        }
+        return found;
+    }
+    // Lowercasing that changes byte lengths (rare letters) would shift the
+    // ranges, so such text is matched as it is.
+    let folded = (!sensitive).then(|| text.to_lowercase()).filter(|f| f.len() == text.len());
+    let needle = if sensitive { query.to_string() } else { query.to_lowercase() };
+    let hay = folded.as_deref().unwrap_or(text);
+    hay.match_indices(needle.as_str())
+        .take(limit)
+        .map(|(i, m)| i..i + m.len())
+        .collect()
+}
+
 /// Where `needle` (already lowercase ASCII) is in `hay`, ignoring ASCII case,
 /// without lowercasing a copy of the line.
 fn find_ascii_folded(hay: &[u8], needle: &[u8]) -> Option<usize> {
@@ -157,6 +192,21 @@ fn search_text(
             continue;
         }
         ranges.sort_by_key(|r| r.start);
+        // The words together, as typed ("sherlock holmes"), when they're so.
+        let phrase = terms.join(" ");
+        let together = if terms.len() > 1 {
+            if ascii {
+                find_ascii_folded(haystack.as_bytes(), phrase.as_bytes())
+            } else {
+                haystack.find(phrase.as_str())
+            }
+        } else {
+            None
+        };
+        let matches = match together {
+            Some(at) => vec![start + at..start + at + phrase.len()],
+            None => ranges.iter().map(|r| start + r.start..start + r.end).collect(),
+        };
         let first = ranges[0].start;
         let (shown, shift) = excerpt(line, first);
         let ranges = ranges
@@ -172,6 +222,7 @@ fn search_text(
             offset: start + first,
             line: shown,
             ranges,
+            matches,
         });
         if hits.len() >= PER_FILE {
             return;
@@ -266,6 +317,15 @@ mod tests {
     }
 
     #[test]
+    fn results_record_the_phrase_or_each_word() {
+        let text = "x\nThe Adventures of Sherlock Holmes\nHolmes, said Sherlock\n";
+        let found = hits(text, "sherlock holmes");
+        let spans = |hit: &Hit| hit.matches.iter().map(|r| &text[r.clone()]).collect::<Vec<_>>();
+        assert_eq!(spans(&found[0]), ["Sherlock Holmes"]);
+        assert_eq!(spans(&found[1]), ["Holmes", "Sherlock"]);
+    }
+
+    #[test]
     fn case_is_ignored_until_the_query_has_a_capital() {
         assert_eq!(hits("Rust and rust\n", "rust").len(), 1);
         assert_eq!(hits("rust only\n", "Rust").len(), 0);
@@ -298,6 +358,17 @@ mod tests {
         // Not kept in memory.
         assert!(cache.0.lock().unwrap().is_empty());
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn find_all_lists_every_place_in_order() {
+        let text = "Sherlock met sherlock; SHERLOCK left.";
+        let found = find_all(text, "sherlock", 10);
+        assert_eq!(found.iter().map(|r| &text[r.clone()]).collect::<Vec<_>>(), ["Sherlock", "sherlock", "SHERLOCK"]);
+        assert_eq!(find_all(text, "Sherlock", 10).len(), 1);
+        assert_eq!(find_all(text, "sherlock", 2).len(), 2);
+        assert!(find_all(text, "", 10).is_empty());
+        assert_eq!(find_all("Ärger und ärger", "ärger", 10).len(), 2);
     }
 
     #[test]
