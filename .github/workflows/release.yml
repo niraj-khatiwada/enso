@@ -150,9 +150,10 @@ jobs:
             libxkbcommon-dev libxkbcommon-x11-dev libxcb1-dev libx11-xcb-dev \
             libvulkan-dev libssl-dev libzstd-dev dpkg-dev file
       - uses: dtolnay/rust-toolchain@stable
+      # Keyed by runner image too: a cache built on another Ubuntu doesn't load.
       - uses: Swatinem/rust-cache@v2
         with:
-          key: ${{ matrix.arch }}
+          key: ${{ matrix.arch }}-${{ matrix.runner }}
       - name: Packaging tools
         run: cargo install --locked cargo-deb cargo-generate-rpm
       - run: cargo build --release --locked
