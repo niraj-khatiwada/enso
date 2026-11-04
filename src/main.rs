@@ -1,16 +1,33 @@
+// Release builds on Windows open as a window, without a console behind it;
+// debug builds keep the console for their log messages.
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 mod app_icon;
 mod brand;
+mod diagram;
+mod export;
 mod files;
+mod http;
+mod lock;
 mod markdown_edit;
+mod media;
 mod onboarding;
+mod outline;
+mod palette;
 mod reader;
+mod rich;
+mod search;
+mod session;
 mod settings;
+mod spellcheck;
 mod stats;
+mod typography;
+mod ui;
+mod update;
 mod workspaces;
 
 use gpui_kit::assets::IconName;
-use gpui_kit::base::{Transition, transition};
-#[cfg(all(test, feature = "ui-tests"))]
+use gpui_kit::base::{ResizeHandleContext, ResizeHandleState, Transition, transition};
 extern crate gpui_kit as gpui;
 use gpui_kit::component::{
     ActiveTheme, Disableable, Icon, Sizable, TitleBar,
@@ -20,11 +37,14 @@ use gpui_kit::component::{
     menu::{ContextMenuExt, PopupMenuItem},
     tooltip::Tooltip,
     popover::Popover,
-    resizable::{HandleEdge, h_resizable, resizable_panel, resize_handle},
+    resizable::{
+        HandleEdge, h_resizable, resizable_panel, resize_handle, resize_handle_appearance,
+    },
     text::{RenderedText, TextView, TextViewState},
     v_flex,
 };
 use gpui_kit::{prelude::FluentBuilder, *};
+use ui::SurfaceExt as _;
 use std::{
     collections::{HashMap, HashSet},
     path::PathBuf,
@@ -39,13 +59,28 @@ actions!(
         OpenFolder,
         NewFile,
         CloseFile,
+        ReopenClosedTab,
         Save,
         ToggleView,
         ToggleSplit,
+        SwapSplitSides,
+        ToggleSidebar,
         NewFolder,
         RenameSelected,
         DeleteSelected,
-        Quit
+        Quit,
+        OpenCommandPalette,
+        SearchEverything,
+        PasteFiles,
+        ExportNote,
+        DismissExport,
+        DismissLightbox,
+        ToggleLock,
+        CopyRichText,
+        DismissCommandPalette,
+        DismissRichControls,
+        OpenInsertMenu,
+        OpenSelectionInsertMenu
     ]
 );
 
@@ -91,6 +126,7 @@ struct Document {
     /// Whether `preview` holds this document's rendered Markdown. Only the few
     /// most recently viewed documents keep it; see `Enso::warm_documents`.
     preview_loaded: bool,
+    outline: Vec<outline::Heading>,
     /// When this document was last the active one (`Enso::view_clock`).
     last_viewed: u64,
     saved: Arc<String>,
@@ -99,6 +135,7 @@ struct Document {
     large_reader: Option<Entity<reader::LargeReader>>,
     stats: String,
     _stats_task: Option<Task<()>>,
+    spellcheck: Option<Entity<spellcheck::Spellcheck>>,
     last_reader_cursor: Option<usize>,
     last_preview_text: Option<RenderedText>,
     _preview_task: Option<Task<()>>,
@@ -107,6 +144,15 @@ struct Document {
     saving: bool,
     close_after_save: bool,
     markdown: bool,
+    /// The file's modified time and size when enso last matched it with
+    /// `saved`; `None` until the first check. See `Enso::check_disk`.
+    disk_stamp: Option<(std::time::SystemTime, u64)>,
+    /// A "changed on disk" question is open for this document.
+    disk_prompt: bool,
+    /// Locked: readable, not changeable (see `lock`).
+    locked: bool,
+    /// The file was gone at the last check (already reported).
+    missing: bool,
     _subscriptions: Vec<Subscription>,
 }
 impl Document {
@@ -270,24 +316,158 @@ impl Render for SidebarResize {
     }
 }
 
+/// The note's top-level blocks as source ranges, in the order the reader
+/// lists them (one list item each): the same parser, with the reader's
+/// options.
+fn top_level_blocks(source: &str) -> Vec<std::ops::Range<usize>> {
+    let mut options = markdown::ParseOptions::gfm();
+    options.constructs.math_flow = true;
+    options.constructs.math_text = true;
+    let Ok(tree) = markdown::to_mdast(source, &options) else {
+        return Vec::new();
+    };
+    tree.children()
+        .into_iter()
+        .flatten()
+        .filter_map(|node| node.position().map(|p| p.start.offset..p.end.offset))
+        .collect()
+}
+
+/// The source offset under `point` in a reader: the block whose rows it's
+/// on, then the line within that block at the same fraction of its height.
+fn source_at_point(source: &str, list: &ListState, point: Point<Pixels>) -> Option<usize> {
+    let blocks = top_level_blocks(source);
+    // A reader that split the note differently can't be mapped this way.
+    if blocks.len() != list.item_count() {
+        return None;
+    }
+    let first = list.logical_scroll_top().item_ix;
+    for ix in first..blocks.len() {
+        let bounds = list.bounds_for_item(ix)?;
+        if point.y > bounds.bottom() {
+            continue;
+        }
+        let block = blocks[ix].clone();
+        let fraction = ((point.y - bounds.top()) / bounds.size.height.max(px(1.))).clamp(0., 1.);
+        let text = &source[block.clone()];
+        let lines: Vec<usize> = std::iter::once(0)
+            .chain(text.match_indices('\n').map(|(i, _)| i + 1))
+            .filter(|&i| i < text.len())
+            .collect();
+        let line = ((fraction * lines.len() as f32) as usize).min(lines.len().saturating_sub(1));
+        return Some(block.start + lines.get(line).copied().unwrap_or(0));
+    }
+    None
+}
+
+/// A tab being dragged along the tab strip. `from` is where it started; the
+/// drag preview is the tab's name in a pill.
+#[derive(Clone)]
+struct DraggedTab {
+    from: usize,
+    title: SharedString,
+}
+
+impl Render for DraggedTab {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        div()
+            .h(px(28.))
+            .px_2p5()
+            .flex()
+            .items_center()
+            .rounded_md()
+            .text_sm()
+            .bg(theme.secondary)
+            .text_color(theme.foreground)
+            .opacity(0.9)
+            .max_w(px(TAB_TITLE_WIDTH))
+            .truncate()
+            .child(self.title.clone())
+    }
+}
+
+/// A toast on screen, or leaving it.
+struct ToastEntry {
+    toast: ui::toast::Toast,
+    /// Which showing this is: an autohide timer only ends its own.
+    serial: u64,
+    leaving: bool,
+}
+
+/// Background work under way (see `Enso::busy`). Toasts that report its
+/// outcome use the same `id`, so they replace its spinner.
+struct Busy {
+    id: SharedString,
+    done: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// A sidebar entry being dragged; the preview is its icon and name.
+#[derive(Clone)]
+struct DraggedEntry {
+    path: PathBuf,
+    directory: bool,
+}
+
+impl Render for DraggedEntry {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        let name = self
+            .path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        h_flex()
+            .h(px(TREE_ROW_HEIGHT))
+            .px_2()
+            .gap_1p5()
+            .items_center()
+            .rounded_md()
+            .text_sm()
+            .bg(theme.secondary)
+            .text_color(theme.foreground)
+            .opacity(0.9)
+            .child(
+                Icon::new(if self.directory { IconName::Folder } else { IconName::File })
+                    .size_4()
+                    .text_color(theme.muted_foreground),
+            )
+            .child(div().max_w(px(TAB_TITLE_WIDTH)).truncate().child(name))
+    }
+}
+
+struct ClosedTab {
+    path: Option<PathBuf>,
+    // Unsaved notes have no file to reload. Saved files stay lightweight.
+    source: Option<String>,
+    workspace: Option<PathBuf>,
+}
+
 struct Enso {
     focus: FocusHandle,
     documents: Vec<Document>,
+    closed_tabs: Vec<ClosedTab>,
     active: Option<usize>,
     root: Option<PathBuf>,
     folders: HashMap<PathBuf, Vec<files::Entry>>,
+    /// Each listed folder's modified time when it was read: adding, removing
+    /// or renaming an entry moves it, which is when the listing is redone.
+    folder_stamps: HashMap<PathBuf, std::time::SystemTime>,
     expanded: HashSet<PathBuf>,
     mode: Mode,
     previous_mode: Mode,
-    status: String,
     error: bool,
-    /// Whether the last error is still on the status bar; it hides itself.
-    error_shown: bool,
-    _error_task: Option<Task<()>>,
     naming: Option<NewEntry>,
     filename: Entity<InputState>,
     /// The tree row last clicked, file or folder; new entries go beside it.
     selected: Option<PathBuf>,
+    palette: Option<palette::Palette>,
+    controls: Option<rich::Controls>,
+    closing_controls: Option<rich::Controls>,
+    image_resize: Option<rich::ImageResize>,
+    outline_hover: Option<(EntityId, f32)>,
+    outline_bounds: Arc<std::sync::Mutex<Bounds<Pixels>>>,
+    closing_palette: Option<palette::Palette>,
     switcher_open: bool,
     switcher_hovered: bool,
     window_handle: AnyWindowHandle,
@@ -296,7 +476,10 @@ struct Enso {
     closing: Option<CloseTarget>,
     sidebar_open: bool,
     sidebar_width: Pixels,
-    focus_after_close: bool,
+    /// The active tab changed (opened, reopened, switched to or closed): the
+    /// keyboard follows it on the next frame. Left on a tab that's no longer
+    /// shown, keys would reach nothing, not even app shortcuts like Reopen.
+    refocus: bool,
     hovered_tab: Option<EntityId>,
     /// The tab strip's scroll position, and the tab last scrolled into view.
     tab_scroll: ScrollHandle,
@@ -304,6 +487,39 @@ struct Enso {
     /// Counts document switches, to tell which documents were viewed last.
     view_clock: u64,
     warmed_doc: Option<EntityId>,
+    /// The active file the sidebar last followed: switching to another one
+    /// (a tab, the palette, a link) selects and reveals its row.
+    followed_path: Option<PathBuf>,
+    /// The workspace session last saved from this window, and whether the
+    /// saved one is still being reopened (and must not be overwritten yet).
+    saved_session: Option<(PathBuf, session::Session)>,
+    restoring_session: bool,
+    _disk_watch: Task<()>,
+    /// Note texts kept between "Search everything" queries.
+    search_cache: Arc<search::Cache>,
+    /// A cursor position to show once its document is laid out: the
+    /// document, the byte offset, and frames left to wait.
+    pending_jump: Option<(EntityId, usize, u8)>,
+    /// While a tab is dragged: where it came from and the tab it's over.
+    dragging_tab: Option<usize>,
+    tab_drop: Option<usize>,
+    /// While a file, folder or Finder item is dragged over the sidebar: the
+    /// folder it would land in.
+    tree_drop: Option<PathBuf>,
+    /// Where the pointer was when a row last claimed the drop, so the list
+    /// behind the rows doesn't take it back for the workspace root.
+    tree_drop_point: Option<Point<Pixels>>,
+    /// The Export dialog while open (and while it fades out), and the
+    /// format and image choice it last ran with.
+    export_dialog: Option<export::ExportDialog>,
+    closing_export: Option<export::ExportDialog>,
+    export_choice: export::ExportChoice,
+    toasts: Vec<ToastEntry>,
+    /// A picture shown full size (and the one fading out), with the focus
+    /// that takes Escape.
+    lightbox: Option<(media::Lightbox, FocusHandle)>,
+    closing_lightbox: Option<(media::Lightbox, FocusHandle)>,
+    toast_serial: u64,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -353,38 +569,68 @@ impl Enso {
                 for doc in &this.documents {
                     doc.editor
                         .update(cx, |editor, cx| editor.set_line_number(on, window, cx));
+                    doc.preview.update(cx, |preview, cx| preview.invalidate_inline_layout(cx));
+                    if let Some(reader) = &doc.large_reader {
+                        reader.update(cx, |reader, cx| reader.refresh_layout(cx));
+                    }
                 }
+                if !settings::document_outline(cx) { this.outline_hover = None; }
+                // The split view's side order is a preference too.
+                cx.notify();
             });
         Self {
             focus,
             documents: Vec::new(),
+            closed_tabs: Vec::new(),
             active: None,
             root: None,
             folders: HashMap::new(),
+            folder_stamps: HashMap::new(),
             expanded: HashSet::new(),
             mode: Mode::Read,
             previous_mode: Mode::Read,
-            status: "A little space for your thoughts.".into(),
             error: false,
-            error_shown: false,
-            _error_task: None,
             naming: None,
             filename,
             selected: None,
+            palette: None,
+            controls: None,
+            closing_controls: None,
+            image_resize: None,
+            outline_hover: None,
+            outline_bounds: Arc::new(std::sync::Mutex::new(Bounds::default())),
+            closing_palette: None,
             switcher_open: false,
             switcher_hovered: false,
             window_handle,
             renaming: None,
             rename_input,
             closing: None,
-            sidebar_open: true,
+            sidebar_open: settings::sidebar_open(cx),
             sidebar_width: px(248.),
-            focus_after_close: false,
+            refocus: false,
             hovered_tab: None,
             tab_scroll: ScrollHandle::new(),
             scrolled_to_tab: None,
             view_clock: 0,
             warmed_doc: None,
+            followed_path: None,
+            saved_session: None,
+            restoring_session: false,
+            _disk_watch: Self::watch_disk(window, cx),
+            search_cache: Default::default(),
+            pending_jump: None,
+            dragging_tab: None,
+            tab_drop: None,
+            tree_drop: None,
+            tree_drop_point: None,
+            export_dialog: None,
+            closing_export: None,
+            export_choice: Default::default(),
+            toasts: Vec::new(),
+            lightbox: None,
+            closing_lightbox: None,
+            toast_serial: 0,
             _subscriptions: vec![
                 subscription,
                 rename_subscription,
@@ -492,6 +738,84 @@ impl Enso {
         }
     }
 
+    /// Whether the note behind `editor_id` is locked.
+    pub(crate) fn is_locked(&self, editor_id: EntityId) -> bool {
+        self.documents.iter().any(|d| d.editor.entity_id() == editor_id && d.locked)
+    }
+
+    /// Lock or unlock a note: its editor turns read-only, and every way of
+    /// changing it from enso checks `is_editable` (or `is_locked`) first.
+    fn set_locked(&mut self, index: usize, locked: bool, cx: &mut Context<Self>) {
+        let doc = &mut self.documents[index];
+        doc.locked = locked;
+        doc.editor.update(cx, |editor, cx| editor.set_readonly(locked, cx));
+        if let Some(path) = doc.path.clone() {
+            lock::set_locked(&path, locked, cx);
+        }
+        cx.notify();
+    }
+
+    /// Collapse or expand the sidebar, and remember it for every window and
+    /// session.
+    pub(crate) fn toggle_sidebar(&mut self, cx: &mut Context<Self>) {
+        self.sidebar_open = !self.sidebar_open;
+        if let Err(error) = settings::set_sidebar_open(self.sidebar_open, cx) {
+            eprintln!("enso: couldn't remember the sidebar: {error}");
+        }
+        cx.notify();
+    }
+
+    /// Lock Page / Unlock Page, for the active note.
+    pub(crate) fn toggle_lock(&mut self, cx: &mut Context<Self>) {
+        let Some(index) = self.active else {
+            return;
+        };
+        let locked = !self.documents[index].locked;
+        self.set_locked(index, locked, cx);
+        let title = self.documents[index].title();
+        let toast = if locked {
+            ui::toast::done("page-lock", "Page locked", title)
+        } else {
+            ui::toast::done("page-lock", "Page unlocked", title)
+        };
+        self.toast(toast, cx);
+    }
+
+    /// The reader was clicked at `position`: put the editor's caret on the
+    /// source behind it, so Split's editor scrolls there (and Edit opens
+    /// there). A drag follows its selection's start, exactly; a plain click
+    /// finds the block under the pointer and the line within it.
+    fn reader_clicked(&mut self, editor_id: EntityId, position: Point<Pixels>, cx: &mut Context<Self>) {
+        let Some(index) = self.documents.iter().position(|d| d.editor.entity_id() == editor_id) else {
+            return;
+        };
+        let doc = &self.documents[index];
+        if !doc.markdown || !doc.editor_loaded || !doc.preview_loaded {
+            return;
+        }
+        let preview = doc.preview.read(cx);
+        let offset = preview.selected_source_range().map(|r| r.start).or_else(|| {
+            let rendered = preview.rendered_text();
+            source_at_point(rendered.source(), preview.list_state(), position)
+        });
+        let Some(offset) = offset else {
+            return;
+        };
+        let doc = &mut self.documents[index];
+        // The editor's caret moving would reveal it in the reader again;
+        // the reader is already there.
+        doc.last_reader_cursor = Some(offset);
+        doc.editor.update(cx, |editor, cx| {
+            let text = editor.text().clone();
+            let mut at = offset.min(text.len());
+            while at > 0 && !text.is_char_boundary(at) {
+                at -= 1;
+            }
+            editor.set_selected_range(at..at, cx);
+        });
+        cx.notify();
+    }
+
     fn reveal_editor_cursor(&mut self, index: usize, cx: &mut Context<Self>) {
         let doc = &mut self.documents[index];
         if !doc.markdown || !doc.editor_loaded {
@@ -561,14 +885,11 @@ impl Enso {
             }) else {
                 return;
             };
-            let count = cx
+            let (count, headings) = cx
                 .background_executor()
                 .spawn(async move {
-                    if let Some(rope) = rope {
-                        stats::word_count(rope.chars())
-                    } else {
-                        stats::word_count(saved.chars())
-                    }
+                    let source = rope.map(|r| r.to_string()).unwrap_or_else(||saved.as_ref().clone());
+                    (stats::word_count(source.chars()), outline::headings(&source))
                 })
                 .await;
             let _ = this.update(cx, |this, cx| {
@@ -578,30 +899,144 @@ impl Enso {
                     .find(|doc| doc.editor.entity_id() == editor_id && doc.revision == revision)
                 {
                     doc.stats = stats::label(count);
+                    doc.outline = headings;
                     cx.notify();
                 }
             });
         }));
     }
 
+    /// Report an error (as a toast), or note that things are fine again.
+    /// `error` stays set until the next fine message: quitting relies on it
+    /// to know whether auto-save failed. Messages that aren't errors show
+    /// nothing; confirmations use `toast` directly.
     fn message(&mut self, message: impl Into<String>, error: bool, cx: &mut Context<Self>) {
-        self.status = message.into();
+        let message = message.into();
         self.error = error;
-        self.error_shown = error;
-        // Errors fade from the bar after a while; `error` itself stays set,
-        // since quitting relies on it to know auto-save failed.
-        self._error_task = error.then(|| {
+        if error && !message.is_empty() {
+            self.toast(ui::toast::error(message), cx);
+        }
+        cx.notify();
+    }
+
+    /// Show a toast; one with the same id is replaced in place.
+    fn toast(&mut self, toast: ui::toast::Toast, cx: &mut Context<Self>) {
+        self.toast_serial += 1;
+        let serial = self.toast_serial;
+        let id = toast.id.clone();
+        let autohide = toast.autohide;
+        match self.toasts.iter_mut().find(|t| t.toast.id == id) {
+            Some(entry) => {
+                entry.toast = toast;
+                entry.serial = serial;
+                entry.leaving = false;
+            }
+            None => {
+                self.toasts.push(ToastEntry { toast, serial, leaving: false });
+                // At most four at once: the oldest gives way.
+                let showing = self.toasts.iter().filter(|t| !t.leaving).count();
+                if showing > 4 {
+                    if let Some(oldest) = self.toasts.iter_mut().find(|t| !t.leaving) {
+                        oldest.leaving = true;
+                    }
+                }
+            }
+        }
+        if autohide {
             cx.spawn(async move |this, cx| {
-                cx.background_executor()
-                    .timer(std::time::Duration::from_secs(5))
-                    .await;
+                cx.background_executor().timer(std::time::Duration::from_secs(4)).await;
                 let _ = this.update(cx, |this, cx| {
-                    this.error_shown = false;
-                    cx.notify();
+                    if let Some(entry) = this.toasts.iter_mut().find(|t| t.serial == serial) {
+                        entry.leaving = true;
+                        cx.notify();
+                    }
                 });
             })
-        });
+            .detach();
+        }
         cx.notify();
+    }
+
+    fn dismiss_toast(&mut self, id: &SharedString, cx: &mut Context<Self>) {
+        if let Some(entry) = self.toasts.iter_mut().find(|t| t.toast.id == *id) {
+            entry.leaving = true;
+            cx.notify();
+        }
+    }
+
+    /// The toasts, stacked at the bottom middle of the window, newest last.
+    fn toast_layer(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if self.toasts.is_empty() {
+            return None;
+        }
+        let easing = cx.theme().motion_tokens().easing_move.clone();
+        let mut shown = Vec::new();
+        let mut gone = Vec::new();
+        for entry in &self.toasts {
+            let presence = transition(
+                ElementId::from((ElementId::from(entry.toast.id.clone()), "toast")),
+                if entry.leaving { 0.0_f32 } else { 1.0 },
+                Transition::new(std::time::Duration::from_millis(220)).easing(easing.clone()),
+                window,
+                cx,
+            )
+            .clamp(0., 1.);
+            if entry.leaving && presence <= 0.001 {
+                gone.push(entry.serial);
+                continue;
+            }
+            let weak = cx.entity().downgrade();
+            let id = entry.toast.id.clone();
+            shown.push(ui::toast::render(
+                &entry.toast,
+                presence,
+                move |_, cx| {
+                    let _ = weak.update(cx, |this, cx| this.dismiss_toast(&id, cx));
+                },
+                cx,
+            ));
+        }
+        if !gone.is_empty() {
+            self.toasts.retain(|t| !gone.contains(&t.serial));
+        }
+        Some(
+            v_flex()
+                .absolute()
+                .left_0()
+                .right_0()
+                .bottom(px(36.))
+                .px_4()
+                .gap_2()
+                .items_center()
+                .children(shown)
+                .into_any_element(),
+        )
+    }
+
+    /// Work has started in the background: if it's still going after a
+    /// moment, a spinner toast says so (quick work shows nothing). Pass the
+    /// result to `finish`.
+    fn busy(&mut self, id: impl Into<SharedString>, text: impl Into<SharedString>, cx: &mut Context<Self>) -> Busy {
+        let busy = Busy { id: id.into(), done: Default::default() };
+        let (id, done, text) = (busy.id.clone(), busy.done.clone(), text.into());
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(std::time::Duration::from_millis(250)).await;
+            if !done.load(std::sync::atomic::Ordering::SeqCst) {
+                let _ = this.update(cx, |this, cx| this.toast(ui::toast::working(id, text), cx));
+            }
+        })
+        .detach();
+        busy
+    }
+
+    /// The work behind `busy` is over: its spinner (if it came up) gives way
+    /// to `then`, or just goes.
+    fn finish(&mut self, busy: Busy, then: Option<ui::toast::Toast>, cx: &mut Context<Self>) {
+        busy.done.store(true, std::sync::atomic::Ordering::SeqCst);
+        match then {
+            Some(toast) => self.toast(toast, cx),
+            None => self.dismiss_toast(&busy.id, cx),
+        }
     }
 
     fn add_document(
@@ -618,6 +1053,7 @@ impl Enso {
             .position(|d| path.is_some() && d.path == path)
         {
             self.active = Some(index);
+            self.refocus = true;
             cx.notify();
             return;
         }
@@ -772,6 +1208,7 @@ impl Enso {
                 this.reveal_editor_cursor(index, cx);
             }
         });
+        let spellcheck = markdown.then(|| cx.new(|cx| spellcheck::Spellcheck::new(&editor, source.len(), cx)));
         self.documents.push(Document {
             path,
             saved: source,
@@ -780,6 +1217,7 @@ impl Enso {
             large_reader,
             stats,
             _stats_task: None,
+            spellcheck,
             last_reader_cursor: None,
             last_preview_text: None,
             _preview_task: None,
@@ -787,14 +1225,26 @@ impl Enso {
             revision: 0,
             saving: false,
             close_after_save: false,
+            disk_stamp: None,
+            disk_prompt: false,
+            missing: false,
+            locked: false,
             editor,
             preview,
             preview_loaded: false,
+            outline: Vec::new(),
             last_viewed: 0,
             markdown,
             _subscriptions: vec![subscription, cursor_subscription, preview_subscription],
         });
         self.active = Some(self.documents.len() - 1);
+        self.refocus = true;
+        if let Some(path) = self.documents.last().and_then(|d| d.path.clone()) {
+            self.reveal_in_tree(&path, cx);
+            if lock::is_locked(&path, cx) {
+                self.set_locked(self.documents.len() - 1, true, cx);
+            }
+        }
         self.schedule_word_count(self.documents.len() - 1, true, cx);
         self.mode = if markdown { Mode::Read } else { Mode::Edit };
         self.message("Ready", false, cx);
@@ -811,10 +1261,12 @@ impl Enso {
             .position(|d| d.path.as_ref() == Some(&path))
         {
             self.active = Some(index);
+            self.refocus = true;
             cx.notify();
             return;
         }
-        self.message("Opening file…", false, cx);
+        let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let busy = self.busy(format!("open:{}", path.display()), format!("Opening “{name}”…"), cx);
         let task = cx.background_executor().spawn(async move {
             files::read_text(&path).map(|text| {
                 let sections =
@@ -828,14 +1280,85 @@ impl Enso {
         });
         cx.spawn_in(window, async move |this, cx| {
             let result = task.await;
-            let _ = this.update_in(cx, |this, window, cx| match result {
-                Ok((path, source, sections)) => {
-                    this.add_document(Some(path), source, sections, window, cx)
+            let _ = this.update_in(cx, |this, window, cx| {
+                this.finish(busy, None, cx);
+                match result {
+                    Ok((path, source, sections)) => {
+                        this.add_document(Some(path), source, sections, window, cx)
+                    }
+                    Err(error) => this.message(error.to_string(), true, cx),
                 }
-                Err(error) => this.message(error.to_string(), true, cx),
             });
         })
         .detach();
+    }
+
+    /// Open `path` (or switch to its tab) with the cursor at byte `offset`.
+    fn open_path_at(
+        &mut self,
+        path: PathBuf,
+        offset: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(index) = self.documents.iter().position(|d| d.path.as_ref() == Some(&path)) {
+            self.active = Some(index);
+            self.refocus = true;
+            self.pending_jump = Some((self.documents[index].editor.entity_id(), offset, 120));
+            cx.notify();
+            return;
+        }
+        let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let busy = self.busy(format!("open:{}", path.display()), format!("Opening “{name}”…"), cx);
+        let task = cx.background_executor().spawn({
+            let path = path.clone();
+            async move {
+                files::read_text(&path).map(|text| {
+                    let sections = (files::is_markdown(&path)
+                        && text.len() >= reader::LARGE_DOCUMENT_BYTES)
+                        .then(|| reader::LargeReader::index(&text));
+                    (text, sections)
+                })
+            }
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let result = task.await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                this.finish(busy, None, cx);
+                match result {
+                Ok((text, sections)) => {
+                    this.add_document(Some(path), text, sections, window, cx);
+                    if let Some(doc) = this.active.and_then(|i| this.documents.get(i)) {
+                        this.pending_jump = Some((doc.editor.entity_id(), offset, 120));
+                    }
+                }
+                Err(error) => this.message(error.to_string(), true, cx),
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Run `pending_jump` once its document can show the position: the
+    /// editor at once, the reader after its text has been laid out.
+    fn run_pending_jump(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((id, offset, frames)) = self.pending_jump else {
+            return;
+        };
+        let Some(doc) = self.documents.iter().find(|d| d.editor.entity_id() == id) else {
+            self.pending_jump = None;
+            return;
+        };
+        let ready = self.mode == Mode::Edit
+            || doc.large_reader.is_some()
+            || (doc.preview_loaded && !doc.preview.read(cx).rendered_text().source().is_empty());
+        if ready || frames == 0 {
+            self.pending_jump = None;
+            cx.defer_in(window, move |this, window, cx| this.jump_to_heading(id, offset, window, cx));
+        } else {
+            self.pending_jump = Some((id, offset, frames - 1));
+            window.request_animation_frame();
+        }
     }
 
     fn pick(&mut self, directory: bool, window: &mut Window, cx: &mut Context<Self>) {
@@ -884,7 +1407,349 @@ impl Enso {
         cx.defer(move |cx| {
             let _ = handle.update(cx, |_, window, _| window.set_window_title(&title));
         });
-        self.load_folder(path, cx);
+        self.load_folder(path.clone(), cx);
+        self.restore_session(path, cx);
+    }
+
+    /// Check the open files against the disk every so often. Polling, not
+    /// file-system events: it works the same on network drives and in synced
+    /// folders (iCloud, Dropbox), where events are unreliable, and a file is
+    /// only read when its modified time or size moved.
+    fn watch_disk(window: &mut Window, cx: &mut Context<Self>) -> Task<()> {
+        cx.spawn_in(window, async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(1500))
+                    .await;
+                let Ok((open, shown)) = this.read_with(cx, |this, _| {
+                    let open = this
+                        .documents
+                        .iter()
+                        .filter(|d| !d.saving && !d.disk_prompt)
+                        .filter_map(|d| {
+                            Some((d.editor.entity_id(), d.path.clone()?, d.disk_stamp, d.saved.clone()))
+                        })
+                        .collect::<Vec<_>>();
+                    (open, this.shown_folders())
+                }) else {
+                    return;
+                };
+                if !open.is_empty() {
+                    let changes = cx
+                        .background_executor()
+                        .spawn(async move { files::changed_on_disk(open) })
+                        .await;
+                    if !changes.is_empty() {
+                        let _ = this.update_in(cx, |this, window, cx| {
+                            for change in changes {
+                                this.apply_disk_change(change, window, cx);
+                            }
+                        });
+                    }
+                }
+                if !shown.is_empty() {
+                    let changed = cx
+                        .background_executor()
+                        .spawn(async move { files::changed_folders(shown) })
+                        .await;
+                    if !changed.is_empty() {
+                        let _ = this.update(cx, |this, cx| this.refresh_folders(changed, cx));
+                    }
+                }
+            }
+        })
+    }
+
+    /// The folders the sidebar shows (the workspace and every expanded folder
+    /// in it) with the stamp each was listed at. Only these are watched:
+    /// a collapsed folder is read again when it's opened.
+    fn shown_folders(&self) -> Vec<(PathBuf, Option<std::time::SystemTime>)> {
+        let Some(root) = &self.root else {
+            return Vec::new();
+        };
+        self.expanded
+            .iter()
+            .filter(|folder| folder.starts_with(root) && self.folders.contains_key(*folder))
+            .map(|folder| (folder.clone(), self.folder_stamps.get(folder).copied()))
+            .collect()
+    }
+
+    /// Folders that changed on disk: list them again; ones that are gone
+    /// leave the sidebar (their parent's new listing drops their row).
+    fn refresh_folders(&mut self, changed: Vec<(PathBuf, bool)>, cx: &mut Context<Self>) {
+        for (folder, exists) in changed {
+            if exists {
+                self.load_folder(folder, cx);
+            } else {
+                self.folders.retain(|p, _| !p.starts_with(&folder));
+                self.folder_stamps.retain(|p, _| !p.starts_with(&folder));
+                self.expanded.retain(|p| !p.starts_with(&folder));
+                cx.notify();
+            }
+        }
+    }
+
+    fn apply_disk_change(
+        &mut self,
+        change: files::DiskChange,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(index) = self.documents.iter().position(|d| d.editor.entity_id() == change.id)
+        else {
+            return;
+        };
+        let doc = &mut self.documents[index];
+        // A save started since the check: it will compare with the disk itself.
+        if doc.saving {
+            return;
+        }
+        let Some((stamp, text)) = change.now else {
+            if !std::mem::replace(&mut doc.missing, true) {
+                let title = doc.title();
+                self.message(format!("“{title}” was moved or deleted outside enso."), true, cx);
+            }
+            return;
+        };
+        doc.missing = false;
+        doc.disk_stamp = Some(stamp);
+        let Some(text) = text else {
+            return; // Same text as enso's copy, only the timestamp moved.
+        };
+        if !doc.dirty {
+            self.reload_document(index, text, window, cx);
+            return;
+        }
+        // Edits here that the file doesn't have yet, and a different file:
+        // the user picks which one wins.
+        doc.disk_prompt = true;
+        let title = doc.title();
+        let editor_id = change.id;
+        let receiver = window.prompt(
+            PromptLevel::Warning,
+            &format!("“{title}” changed on disk"),
+            Some("Another app changed this file while you had unsaved edits in enso."),
+            &["Keep My Version", "Use the Version on Disk"],
+            cx,
+        );
+        cx.spawn_in(window, async move |this, cx| {
+            let answer = receiver.await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                let Some(index) =
+                    this.documents.iter().position(|d| d.editor.entity_id() == editor_id)
+                else {
+                    return;
+                };
+                this.documents[index].disk_prompt = false;
+                if answer == Ok(1) {
+                    this.reload_document(index, text, window, cx);
+                } else {
+                    // Overwrite the file with the edits: the next save expects
+                    // the disk's text, so its conflict check passes.
+                    this.documents[index].saved = Arc::new(text);
+                    this.start_save(index, cx);
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Replace a document's text with what's on disk, keeping the cursor.
+    fn reload_document(
+        &mut self,
+        index: usize,
+        text: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let doc = &mut self.documents[index];
+        let text = Arc::new(text);
+        doc.saved = text.clone();
+        doc.dirty = false;
+        doc._autosave_timer = None;
+        // `set_value` raises no change event, so this isn't taken for an edit;
+        // the preview and word count are refreshed here instead.
+        if doc.editor_loaded || doc.large_reader.is_none() {
+            doc.editor.update(cx, |editor, cx| {
+                let cursor = editor.cursor().min(text.len());
+                editor.set_value(text.as_str(), window, cx);
+                if text.is_char_boundary(cursor) {
+                    editor.set_selected_range(cursor..cursor, cx);
+                }
+            });
+        }
+        if let Some(reader) = doc.large_reader.clone() {
+            let source = text.clone();
+            let task = cx
+                .background_executor()
+                .spawn(async move { reader::LargeReader::index(&source) });
+            let source = text.clone();
+            cx.spawn(async move |_, cx| {
+                let sections = task.await;
+                let _ = reader.update(cx, |reader, cx| reader.replace(source, sections, cx));
+            })
+            .detach();
+        }
+        if doc.preview_loaded && doc.large_reader.is_none() {
+            doc.preview.update(cx, |preview, cx| preview.set_text(&text, cx));
+        }
+        doc.revision += 1;
+        self.schedule_word_count(index, true, cx);
+        let title = self.documents[index].title();
+        self.toast(
+            ui::toast::done(SharedString::from(format!("reloaded:{title}")), format!("Reloaded “{title}”"), "It changed outside enso."),
+            cx,
+        );
+        cx.notify();
+    }
+
+    /// Expand the folders between the workspace and `path`, so a file opened
+    /// from deep inside the workspace shows in the sidebar.
+    fn reveal_in_tree(&mut self, path: &std::path::Path, cx: &mut Context<Self>) {
+        let Some(root) = self.root.clone() else {
+            return;
+        };
+        let mut folders: Vec<_> = path
+            .ancestors()
+            .skip(1)
+            .take_while(|folder| folder.starts_with(&root) && *folder != root)
+            .map(std::path::Path::to_path_buf)
+            .collect();
+        folders.reverse();
+        for folder in folders {
+            if self.expanded.insert(folder.clone()) {
+                self.load_folder(folder, cx);
+            }
+        }
+    }
+
+    /// This window's workspace session as it stands: its saved files in tab
+    /// order, the active one, the view mode and the sidebar.
+    fn current_session(&self) -> Option<(PathBuf, session::Session)> {
+        let root = self.root.clone()?;
+        // A tab only waiting to finish saving before it closes isn't part of it.
+        let saved: Vec<_> = self
+            .documents
+            .iter()
+            .filter(|d| d.path.is_some() && !d.close_after_save)
+            .collect();
+        let active = self.active.and_then(|i| {
+            let id = self.documents[i].editor.entity_id();
+            saved.iter().position(|d| d.editor.entity_id() == id)
+        });
+        Some((
+            root,
+            session::Session {
+                tabs: saved.iter().filter_map(|d| d.path.clone()).collect(),
+                active,
+                mode: match self.mode {
+                    Mode::Read => "read",
+                    Mode::Edit => "edit",
+                    Mode::Split => "split",
+                }
+                .into(),
+                sidebar_open: self.sidebar_open,
+                sidebar_width: f32::from(self.sidebar_width),
+                // Sorted: `expanded` is a set, and an unchanged session must
+                // compare equal so it isn't written again.
+                expanded: {
+                    let mut folders: Vec<_> =
+                        self.expanded.iter().filter(|p| self.root.as_ref() != Some(*p)).cloned().collect();
+                    folders.sort();
+                    folders
+                },
+            },
+        ))
+    }
+
+    fn save_session(&mut self, cx: &mut App) {
+        if self.restoring_session {
+            return;
+        }
+        if let Some(current) = self.current_session() {
+            if self.saved_session.as_ref() != Some(&current) {
+                session::save(&current.0, current.1.clone(), cx);
+                self.saved_session = Some(current);
+            }
+        }
+    }
+
+    /// Reopen what `root` had open last time: the view and sidebar at once,
+    /// the tabs once their files are read, in their old order.
+    fn restore_session(&mut self, root: PathBuf, cx: &mut Context<Self>) {
+        let Some(saved) = session::get(&root, cx) else {
+            return;
+        };
+        let mode = match saved.mode.as_str() {
+            "edit" => Mode::Edit,
+            "split" => Mode::Split,
+            _ => Mode::Read,
+        };
+        // Open or collapsed is one app-wide choice (see `toggle_sidebar`),
+        // not the workspace's; only its width is the workspace's own.
+        self.sidebar_width = px(saved.sidebar_width.clamp(160., 480.));
+        for folder in &saved.expanded {
+            if folder.starts_with(&root) && folder.is_dir() && self.expanded.insert(folder.clone()) {
+                self.load_folder(folder.clone(), cx);
+            }
+        }
+        if saved.tabs.is_empty() {
+            return;
+        }
+        self.restoring_session = true;
+        let count = saved.tabs.len();
+        let busy = self.busy(
+            format!("restore:{}", root.display()),
+            if count == 1 { "Opening your note…".to_string() } else { format!("Opening your {count} notes…") },
+            cx,
+        );
+        let tabs = saved.tabs.clone();
+        let task = cx.background_executor().spawn(async move {
+            tabs.into_iter()
+                .map(|path| {
+                    // Moved or deleted files are skipped.
+                    let loaded = files::read_text(&path).ok().map(|text| {
+                        let sections = (files::is_markdown(&path)
+                            && text.len() >= reader::LARGE_DOCUMENT_BYTES)
+                            .then(|| reader::LargeReader::index(&text));
+                        (text, sections)
+                    });
+                    (path, loaded)
+                })
+                .collect::<Vec<_>>()
+        });
+        let handle = self.window_handle;
+        cx.spawn(async move |this, cx| {
+            let files = task.await;
+            let _ = handle.update(cx, |_, window, cx| {
+                this.update(cx, |this, cx| {
+                    this.finish(busy, None, cx);
+                    this.restoring_session = false;
+                    // The user moved on to another workspace meanwhile.
+                    if this.root.as_ref() != Some(&root) {
+                        return;
+                    }
+                    let mut active = None;
+                    for (i, (path, loaded)) in files.into_iter().enumerate() {
+                        let Some((text, sections)) = loaded else {
+                            continue;
+                        };
+                        this.add_document(Some(path.clone()), text, sections, window, cx);
+                        if saved.active == Some(i) {
+                            active = this.documents.iter().position(|d| d.path.as_ref() == Some(&path));
+                        }
+                    }
+                    if let Some(active) = active.or(this.active) {
+                        this.active = Some(active);
+                    }
+                    // Opening a file shows it in Read; set_mode also fills the
+                    // editor that Edit and Split show.
+                    this.set_mode(mode, window, cx);
+                    cx.notify();
+                })
+            });
+        })
+        .detach();
     }
 
     /// Show the workspace at `path`: in the window that already has it, in a
@@ -918,7 +1783,9 @@ impl Enso {
             return;
         }
         // Tabs belong to the workspace they were opened from. Closing flushes
-        // pending edits first, as closing a tab by hand does.
+        // pending edits first, as closing a tab by hand does. Remember them
+        // first, to bring them back when this workspace is opened again.
+        self.save_session(cx);
         for index in (0..self.documents.len()).rev() {
             self.close_document(index, cx);
         }
@@ -978,17 +1845,23 @@ impl Enso {
 
     fn load_folder(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         let root = self.root.clone();
-        let task = cx
-            .background_executor()
-            .spawn(async move { (path.clone(), files::list_folder(&path)) });
+        let task = cx.background_executor().spawn(async move {
+            // Stamped before reading, so a change made while it's read is
+            // still seen by the next check.
+            let stamp = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
+            (path.clone(), stamp, files::list_folder(&path))
+        });
         cx.spawn(async move |this, cx| {
-            let (path, result) = task.await;
+            let (path, stamp, result) = task.await;
             let _ = this.update(cx, |this, cx| {
                 if this.root != root {
                     return;
                 }
                 match result {
                     Ok(entries) => {
+                        if let Some(stamp) = stamp {
+                            this.folder_stamps.insert(path.clone(), stamp);
+                        }
                         this.folders.insert(path, entries);
                         cx.notify();
                     }
@@ -1069,6 +1942,10 @@ impl Enso {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.is_locked(editor.entity_id()) {
+            self.message("This page is locked. Unlock it to add images.", true, cx);
+            return;
+        }
         let Some(doc_path) = self
             .documents
             .iter()
@@ -1086,16 +1963,26 @@ impl Enso {
             .clone()
             .filter(|root| doc_dir.starts_with(root))
             .unwrap_or_else(|| doc_dir.clone());
-        let mut links = Vec::new();
-        for image in images {
-            let saved = match &image {
-                PastedImage::Data(image) => {
-                    files::save_image(&root, None, &image.bytes, image.format.extension())
-                }
-                PastedImage::File(path) => files::import_image(&root, path),
-            };
-            match saved {
-                Ok(saved) => {
+        // Saving the images happens off the window's thread (a big
+        // screenshot takes a moment), then the links go in where the cursor
+        // was when they were pasted.
+        let selection = editor.read(cx).selected_range();
+        let count = images.len();
+        let busy = self.busy(
+            format!("images:{}", editor.entity_id()),
+            if count == 1 { "Adding the image…".to_string() } else { format!("Adding {count} images…") },
+            cx,
+        );
+        let task = cx.background_executor().spawn(async move {
+            images
+                .into_iter()
+                .map(|image| {
+                    let saved = match &image {
+                        PastedImage::Data(image) => {
+                            files::save_image(&root, None, &image.bytes, image.format.extension())
+                        }
+                        PastedImage::File(path) => files::import_image(&root, path),
+                    }?;
                     let alt = saved
                         .file_stem()
                         .map(|s| s.to_string_lossy().into_owned())
@@ -1109,19 +1996,63 @@ impl Enso {
                             .replace('<', "&lt;")
                     };
                     let link = files::relative_link(&doc_dir, &saved);
-                    links.push(format!(
+                    Ok(format!(
                         "<img src=\"{}\" alt=\"{}\" width=\"100%\" />",
                         attr(&link),
                         attr(&alt)
-                    ));
+                    ))
+                })
+                .collect::<Vec<std::io::Result<String>>>()
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let results = task.await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                this.finish(busy, None, cx);
+                let mut links = Vec::new();
+                for result in results {
+                    match result {
+                        Ok(link) => links.push(link),
+                        Err(error) => {
+                            this.message(format!("Could not save the image: {error}"), true, cx)
+                        }
+                    }
                 }
-                Err(error) => {
-                    self.message(format!("Could not save the image: {error}"), true, cx)
+                if !links.is_empty() {
+                    editor.update(cx, |editor, cx| {
+                        let text = editor.text().clone();
+                        let len = text.len();
+                        let start = selection.start.min(len);
+                        let end = selection.end.clamp(start, len);
+                        if text.is_char_boundary(start) && text.is_char_boundary(end) {
+                            editor.set_selected_range(start..end, cx);
+                        }
+                        editor.replace(links.join("\n"), window, cx)
+                    });
                 }
+            });
+        })
+        .detach();
+    }
+
+    /// Files dropped on the document area: images are inserted into the open
+    /// note at its cursor (as pasting them would), other files open as tabs.
+    fn drop_files(&mut self, paths: Vec<PathBuf>, window: &mut Window, cx: &mut Context<Self>) {
+        let (images, others): (Vec<_>, Vec<_>) =
+            paths.into_iter().partition(|path| files::is_image(path));
+        if !images.is_empty() {
+            match self.active.map(|i| &self.documents[i]).filter(|d| d.markdown) {
+                Some(doc) => {
+                    let editor = doc.editor.clone();
+                    let images = images.into_iter().map(PastedImage::File).collect();
+                    self.paste_images(images, editor, window, cx);
+                }
+                None => self.message("Open a note to drop images into it.", true, cx),
             }
         }
-        if !links.is_empty() {
-            editor.update(cx, |editor, cx| editor.replace(links.join("\n"), window, cx));
+        for path in others {
+            if path.is_file() {
+                self.open_path(path, window, cx);
+            }
         }
     }
 
@@ -1133,11 +2064,43 @@ impl Enso {
             .filter(|path| path != root && path.starts_with(root) && path.exists())
     }
 
-    /// Move a file or folder to the Trash (Recycle Bin on Windows), without
-    /// asking: it can be restored from there. Only an item that can't be
-    /// recycled is ever deleted outright, and then the system asks first
-    /// (Windows) or the move fails and nothing is deleted (macOS, Linux).
-    fn delete_entry(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+    /// Delete from the sidebar or the palette: to the Trash, after a system
+    /// prompt unless Settings › Confirm Before Deleting is off.
+    fn delete_entry(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        if !settings::confirm_delete(cx) {
+            self.trash_entry(path, cx);
+            return;
+        }
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let bin = if cfg!(windows) { "Recycle Bin" } else { "Trash" };
+        let detail = if path.is_dir() {
+            format!("The folder and everything in it go to the {bin}.")
+        } else {
+            format!("You can restore it from the {bin}.")
+        };
+        let receiver = window.prompt(
+            PromptLevel::Warning,
+            &format!("Delete “{name}”?"),
+            Some(&detail),
+            &[format!("Move to {bin}").as_str(), "Cancel"],
+            cx,
+        );
+        cx.spawn_in(window, async move |this, cx| {
+            if receiver.await == Ok(0) {
+                let _ = this.update(cx, |this, cx| this.trash_entry(path, cx));
+            }
+        })
+        .detach();
+    }
+
+    /// Move a file or folder to the Trash (Recycle Bin on Windows). Only an
+    /// item that can't be recycled is ever deleted outright, and then the
+    /// system asks first (Windows) or the move fails and nothing is deleted
+    /// (macOS, Linux).
+    fn trash_entry(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         let name = path
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
@@ -1146,7 +2109,7 @@ impl Enso {
         match files::move_to_trash(&path) {
             Ok(()) => self.forget_entry(&path, cx),
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {
-                self.message(format!("Kept “{name}”: {error}"), false, cx)
+                self.toast(ui::toast::done(SharedString::from(format!("kept:{name}")), format!("Kept “{name}”"), error.to_string()), cx)
             }
             Err(error) => self.message(format!("Could not delete “{name}”: {error}"), true, cx),
         }
@@ -1179,6 +2142,19 @@ impl Enso {
             self.load_folder(parent.to_path_buf(), cx);
         }
         cx.notify();
+    }
+
+    /// Rename a note from anywhere (the command palette): its row in the
+    /// sidebar, shown and opened up to it, takes the new name inline.
+    pub(crate) fn rename_file(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.root.as_ref().is_some_and(|root| path.starts_with(root)) {
+            self.message("Open its folder as the workspace to rename it.", true, cx);
+            return;
+        }
+        self.sidebar_open = true;
+        self.reveal_in_tree(&path, cx);
+        self.selected = Some(path.clone());
+        self.start_rename(path, window, cx);
     }
 
     fn start_rename(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
@@ -1214,42 +2190,160 @@ impl Enso {
         };
         let name = self.rename_input.read(cx).value().to_string();
         match files::rename(&old, &name) {
-            Ok(new) if new != old => {
-                let moved = |path: &PathBuf| {
-                    path.strip_prefix(&old)
-                        .ok()
-                        .map(|rest| if rest.as_os_str().is_empty() { new.clone() } else { new.join(rest) })
-                };
-                if let Some(path) = self.selected.as_ref().and_then(|p| moved(p)) {
-                    self.selected = Some(path);
-                }
-                for doc in &mut self.documents {
-                    if let Some(path) = doc.path.as_ref().and_then(|p| moved(p)) {
-                        doc.markdown = files::is_markdown(&path);
-                        doc.path = Some(path);
-                    }
-                }
-                self.folders.retain(|path, _| !path.starts_with(&old));
-                self.expanded = self
-                    .expanded
-                    .drain()
-                    .map(|path| moved(&path).unwrap_or(path))
-                    .collect();
-                let reload: Vec<_> = old
-                    .parent()
-                    .map(PathBuf::from)
-                    .into_iter()
-                    .chain(self.expanded.iter().filter(|p| p.starts_with(&new)).cloned())
-                    .collect();
-                for path in reload {
-                    self.load_folder(path, cx);
-                }
-            }
+            Ok(new) if new != old => self.entry_moved(&old, &new, cx),
             Ok(_) => {}
             Err(error) => self.message(error.to_string(), true, cx),
         }
         self.focus.focus(window, cx);
         cx.notify();
+    }
+
+    /// A file or folder went from `old` to `new` (renamed or moved): open
+    /// tabs, the selection and expanded folders follow it, and both folders
+    /// it touched are listed again.
+    fn entry_moved(&mut self, old: &PathBuf, new: &PathBuf, cx: &mut Context<Self>) {
+        lock::moved(old, new, cx);
+        let moved = |path: &PathBuf| {
+            path.strip_prefix(old)
+                .ok()
+                .map(|rest| if rest.as_os_str().is_empty() { new.clone() } else { new.join(rest) })
+        };
+        if let Some(path) = self.selected.as_ref().and_then(|p| moved(p)) {
+            self.selected = Some(path);
+        }
+        for doc in &mut self.documents {
+            if let Some(path) = doc.path.as_ref().and_then(|p| moved(p)) {
+                doc.markdown = files::is_markdown(&path);
+                doc.path = Some(path);
+            }
+        }
+        self.folders.retain(|path, _| !path.starts_with(old));
+        self.expanded = self
+            .expanded
+            .drain()
+            .map(|path| moved(&path).unwrap_or(path))
+            .collect();
+        let reload: Vec<_> = old
+            .parent()
+            .into_iter()
+            .chain(new.parent())
+            .map(PathBuf::from)
+            .chain(self.expanded.iter().filter(|p| p.starts_with(new)).cloned())
+            .collect();
+        for path in reload {
+            self.load_folder(path, cx);
+        }
+    }
+
+    /// Drag and drop in the sidebar: move a file or folder into `dir`.
+    fn move_entry(&mut self, path: PathBuf, dir: PathBuf, cx: &mut Context<Self>) {
+        self.tree_drop = None;
+        // Let go where it already is (or on itself): nothing to do.
+        if path.parent() == Some(dir.as_path()) || path == dir {
+            return;
+        }
+        match files::move_into(&path, &dir) {
+            Ok(new) => {
+                if self.root.as_ref() != Some(&dir) && self.expanded.insert(dir.clone()) {
+                    self.load_folder(dir, cx);
+                }
+                self.entry_moved(&path, &new, cx);
+                self.selected = Some(new);
+            }
+            Err(error) => self.message(error.to_string(), true, cx),
+        }
+        cx.notify();
+    }
+
+    /// A drag over the sidebar is over a row (or the list behind the rows)
+    /// whose drop folder is `dir`.
+    fn hover_tree_drop(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        point: Point<Pixels>,
+        dir: PathBuf,
+        cx: &mut Context<Self>,
+    ) {
+        if bounds.contains(&point) {
+            self.tree_drop_point = Some(point);
+            if self.tree_drop.as_ref() != Some(&dir) {
+                self.tree_drop = Some(dir);
+                cx.notify();
+            }
+        }
+    }
+
+    /// Files or folders from Finder (dropped or pasted) copied into `dir`.
+    fn copy_into_folder(&mut self, paths: Vec<PathBuf>, dir: PathBuf, cx: &mut Context<Self>) {
+        self.tree_drop = None;
+        if !self.root.as_ref().is_some_and(|root| dir.starts_with(root)) || paths.is_empty() {
+            return;
+        }
+        let target = dir.clone();
+        let count = paths.len();
+        let busy = self.busy(
+            format!("copy-in:{}", dir.display()),
+            if count == 1 { "Copying 1 item…".to_string() } else { format!("Copying {count} items…") },
+            cx,
+        );
+        let task = cx.background_executor().spawn(async move {
+            paths
+                .iter()
+                .map(|path| files::copy_into(path, &target))
+                .collect::<Vec<_>>()
+        });
+        cx.spawn(async move |this, cx| {
+            let results = task.await;
+            let _ = this.update(cx, |this, cx| {
+                this.finish(busy, None, cx);
+                let mut copied = Vec::new();
+                for result in results {
+                    match result {
+                        Ok(path) => copied.push(path),
+                        Err(error) => this.message(error.to_string(), true, cx),
+                    }
+                }
+                // Show the copies: the folder and the folders above it open.
+                this.reveal_in_tree(&dir, cx);
+                this.expanded.insert(dir.clone());
+                this.load_folder(dir, cx);
+                if let Some(first) = copied.first() {
+                    this.selected = Some(first.clone());
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Cmd/Ctrl+V in the sidebar: files copied in Finder go into the selected
+    /// folder (or beside the selected file).
+    fn paste_files(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.focus.is_focused(window) {
+            cx.propagate();
+            return;
+        }
+        let Some(dir) = self.target_dir() else {
+            return;
+        };
+        let paths: Vec<PathBuf> = cx
+            .read_from_clipboard()
+            .map(|item| {
+                item.entries()
+                    .iter()
+                    .filter_map(|entry| match entry {
+                        ClipboardEntry::ExternalPaths(paths) => Some(paths.paths().to_vec()),
+                        _ => None,
+                    })
+                    .flatten()
+                    .collect()
+            })
+            .unwrap_or_default();
+        if paths.is_empty() {
+            cx.propagate();
+            return;
+        }
+        self.copy_into_folder(paths, dir, cx);
     }
 
     fn close_current_file(&mut self, cx: &mut Context<Self>) {
@@ -1269,19 +2363,67 @@ impl Enso {
         }
     }
 
+    /// Move the tab at `from` to `to`, keeping the same document active.
+    fn move_tab(&mut self, from: usize, to: usize, cx: &mut Context<Self>) {
+        if from == to || from >= self.documents.len() || to >= self.documents.len() {
+            return;
+        }
+        let active = self.active.map(|i| self.documents[i].editor.entity_id());
+        let doc = self.documents.remove(from);
+        self.documents.insert(to, doc);
+        self.active = active.and_then(|id| {
+            self.documents.iter().position(|doc| doc.editor.entity_id() == id)
+        });
+        cx.notify();
+    }
+
+    /// Insertion boundary under the pointer, including gaps and trailing space.
+    /// ScrollHandle stores item bounds before its scroll offset is applied.
+    fn tab_insertion_slot(&self, x: Pixels) -> usize {
+        let offset = self.tab_scroll.offset().x;
+        (0..self.documents.len())
+            .find(|&i| self.tab_scroll.bounds_for_item(i).is_some_and(|bounds| {
+                x < bounds.center().x + offset
+            }))
+            .unwrap_or(self.documents.len())
+    }
+
     fn remove_document(&mut self, index: usize, cx: &mut Context<Self>) {
         if self.hovered_tab == Some(self.documents[index].editor.entity_id()) {
             self.hovered_tab = None;
         }
-        self.documents.remove(index);
+        let doc = self.documents.remove(index);
+        self.closed_tabs.push(ClosedTab {
+            path: doc.path.clone(),
+            source: doc.path.is_none().then(|| doc.editor.read(cx).value().to_string()),
+            workspace: self.root.clone(),
+        });
+        if self.closed_tabs.len() > 30 { self.closed_tabs.remove(0); }
         self.active = match self.active {
             _ if self.documents.is_empty() => None,
             Some(active) if active > index => Some(active - 1),
             Some(active) if active == index => Some(index.min(self.documents.len() - 1)),
             other => other,
         };
-        self.focus_after_close = true;
+        self.refocus = true;
         cx.notify();
+    }
+
+    fn reopen_closed_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        while let Some(tab) = self.closed_tabs.pop() {
+            if tab.workspace != self.root { continue; }
+            if let Some(path) = tab.path {
+                // Deleted files are skipped; manually reopened files are already
+                // present and should not prevent restoring the next closed tab.
+                if !path.is_file() || self.documents.iter().any(|doc| doc.path.as_ref() == Some(&path)) {
+                    continue;
+                }
+                self.open_path(path, window, cx);
+            } else {
+                self.add_document(None, tab.source.unwrap_or_default(), None, window, cx);
+            }
+            return;
+        }
     }
 
     fn schedule_save(&mut self, index: usize, cx: &mut Context<Self>) {
@@ -1388,18 +2530,18 @@ impl Enso {
         let (detail, discard) = match target {
             CloseTarget::Window => (
                 "Automatic saving failed. Keep editing to preserve your changes, or discard them and close the window.",
-                "Discard and close",
+                "Discard and Close",
             ),
             CloseTarget::App => (
                 "Automatic saving failed. Keep editing to preserve your changes, or discard and quit.",
-                "Discard and quit",
+                "Discard and Quit",
             ),
         };
         let receiver = window.prompt(
             PromptLevel::Warning,
             "You have unsaved changes",
             Some(detail),
-            &["Keep editing", discard],
+            &["Keep Editing", discard],
             cx,
         );
         cx.spawn_in(window, async move |this, cx| {
@@ -1467,8 +2609,9 @@ impl Enso {
 
 impl Render for Enso {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        if self.focus_after_close {
-            self.focus_after_close = false;
+        self.save_session(cx);
+        if self.refocus {
+            self.refocus = false;
             let focus = self
                 .active
                 .filter(|index| self.mode != Mode::Read || !self.documents[*index].markdown)
@@ -1494,12 +2637,26 @@ impl Render for Enso {
         let sidebar_width = self.sidebar_width;
 
         let active_path = self.active.and_then(|i| self.documents[i].path.clone());
+        if active_path != self.followed_path {
+            self.followed_path = active_path.clone();
+            if let Some(path) = &active_path {
+                self.selected = Some(path.clone());
+                self.reveal_in_tree(path, cx);
+            }
+        }
         let markdown = self.active.is_none_or(|i| self.documents[i].markdown);
         let mode = if markdown { self.mode } else { Mode::Edit };
         let active_doc = self.active.map(|i| self.documents[i].editor.entity_id());
         if active_doc != self.warmed_doc {
             self.warmed_doc = active_doc;
             self.warm_documents(cx);
+        }
+        self.run_pending_jump(window, cx);
+        // A drag ended (dropped, or let go elsewhere): no drop target is shown.
+        if !cx.has_active_drag() {
+            self.dragging_tab = None;
+            self.tab_drop = None;
+            self.tree_drop = None;
         }
         // Bring a newly active tab into view, once, so scrolling away stays put.
         // From the last frame's layout (tab bounds there exclude the scroll
@@ -1532,7 +2689,22 @@ impl Render for Enso {
             .items_center()
             .flex_1()
             .min_w_0()
-            .overflow_x_scroll();
+            .overflow_x_scroll()
+            .on_drag_move(cx.listener(|this, event: &DragMoveEvent<DraggedTab>, _, cx| {
+                let slot = event.bounds.contains(&event.event.position)
+                    .then(|| this.tab_insertion_slot(event.event.position.x));
+                if this.tab_drop != slot {
+                    this.tab_drop = slot;
+                    cx.notify();
+                }
+            }))
+            .on_drop(cx.listener(|this, tab: &DraggedTab, window, cx| {
+                let slot = this.tab_insertion_slot(window.mouse_position().x);
+                // Removing the source shifts every later insertion boundary left.
+                let to = if slot > tab.from { slot - 1 } else { slot };
+                this.tab_drop = None;
+                this.move_tab(tab.from, to, cx);
+            }));
         for (i, document) in self.documents.iter().enumerate() {
             let editor_id = document.editor.entity_id();
             let hovered = self.hovered_tab == Some(editor_id);
@@ -1555,6 +2727,7 @@ impl Render for Enso {
             }).child(
                 h_flex()
                     .id(("file-tab", editor_id))
+                    .debug_selector(move || format!("file-tab-{i}"))
                     .flex_shrink_0()
                     .h(px(28.))
                     .pl_2p5()
@@ -1577,6 +2750,31 @@ impl Render for Enso {
                             cx.notify();
                         }
                     }))
+                    // The whole strip handles drops, including between pills.
+                    // Each tab only starts the drag and draws its insertion line.
+                    .relative()
+                    .on_drag(DraggedTab { from: i, title: document.title().into() }, {
+                        let weak = cx.entity().downgrade();
+                        move |tab, _, _, cx| {
+                            let _ = weak.update(cx, |this, _| this.dragging_tab = Some(tab.from));
+                            cx.new(|_| tab.clone())
+                        }
+                    })
+                    .when(self.dragging_tab == Some(i), |tab| tab.opacity(0.4))
+                    .child({
+                        let slot = self.tab_drop;
+                        let after = slot == Some(self.documents.len());
+                        let shown = (slot == Some(i) || (after && i + 1 == self.documents.len()))
+                            && self.dragging_tab.is_some_and(|from| {
+                                slot != Some(from) && slot != Some(from + 1)
+                            });
+                        div()
+                            .absolute()
+                            .top_0()
+                            .bottom_0()
+                            .map(|slot| if after { slot.right(px(-3.)) } else { slot.left(px(-3.)) })
+                            .child(ui::drop_line(("tab-drop", editor_id), shown, window, cx))
+                    })
                     .when(active, |tab| tab.bg(theme.secondary))
                     .when(!active, |tab| {
                         tab.text_color(theme.muted_foreground)
@@ -1584,6 +2782,10 @@ impl Render for Enso {
                     })
                     // Long names end in "…" at a fixed width; the full name is in
                     // the tooltip, and the unsaved dot stays outside the cut.
+                    // A locked note says so on its tab.
+                    .when(document.locked, |tab| {
+                        tab.child(Icon::new(IconName::Lock).size_3().mr_1().text_color(theme.muted_foreground))
+                    })
                     .child(
                         div()
                             .max_w(px(TAB_TITLE_WIDTH))
@@ -1605,11 +2807,8 @@ impl Render for Enso {
                             .flex_shrink_0()
                             .overflow_hidden()
                             .child(
-                                Button::new(("close-tab", editor_id))
-                                    .ghost()
+                                ui::icon_button(("close-tab", editor_id), IconName::X, "Close file")
                                     .xsmall()
-                                    .icon(IconName::X)
-                                    .tooltip("Close file")
                                     .accessibility_label(format!("Close {}", document.title()))
                                     .w(px(20.))
                                     .h(px(20.))
@@ -1770,12 +2969,8 @@ impl Render for Enso {
                                             .opacity(0.)
                                             .group_hover(group, |s| s.opacity(1.))
                                             .child(
-                                                Button::new(("reveal-workspace", i))
-                                                    .ghost()
+                                                ui::icon_button(("reveal-workspace", i), IconName::FolderOpen, reveal)
                                                     .xsmall()
-                                                    .icon(IconName::FolderOpen)
-                                                    .tooltip(reveal)
-                                                    .accessibility_label(reveal)
                                                     .on_click(move |_, _, cx| {
                                                         cx.stop_propagation();
                                                         cx.reveal_path(&reveal_path);
@@ -1788,12 +2983,8 @@ impl Render for Enso {
                                             // The current workspace is already in this window.
                                             .when(!current, |buttons| {
                                                 buttons.child(
-                                                    Button::new(("window-workspace", i))
-                                                        .ghost()
+                                                    ui::icon_button(("window-workspace", i), IconName::ExternalLink, "Open in new window")
                                                         .xsmall()
-                                                        .icon(IconName::ExternalLink)
-                                                        .tooltip("Open in new window")
-                                                        .accessibility_label("Open in new window")
                                                         .on_click(move |_, window, cx| {
                                                             cx.stop_propagation();
                                                             let path = open_path.clone();
@@ -1810,12 +3001,8 @@ impl Render for Enso {
                                 .when(!exists, |row| {
                                     let path = recent.path.clone();
                                     row.child(
-                                        Button::new(("forget-workspace", i))
-                                            .ghost()
+                                        ui::icon_button(("forget-workspace", i), IconName::X, "Remove from list")
                                             .xsmall()
-                                            .icon(IconName::X)
-                                            .tooltip("Remove from list")
-                                            .accessibility_label("Remove from list")
                                             .on_click(move |_, _, cx| {
                                                 cx.stop_propagation();
                                                 workspaces::forget(&path, cx);
@@ -1841,7 +3028,7 @@ impl Render for Enso {
                                         .flex_shrink_0()
                                         .text_color(muted),
                                 )
-                                .child("Open new workspace…")
+                                .child("Open New Workspace…")
                                 .on_click(move |_, window, cx| {
                                     let _ = weak.update(cx, |this, cx| {
                                         this.switcher_open = false;
@@ -1890,12 +3077,8 @@ impl Render for Enso {
                             // add to: the one action is choosing a folder.
                             .when(self.root.is_none(), |row| {
                                 row.child(
-                                    Button::new("open-workspace")
-                                        .ghost()
+                                    ui::icon_button("open-workspace", IconName::Plus, "Open new workspace")
                                         .xsmall()
-                                        .icon(IconName::Plus)
-                                        .tooltip("Open new workspace")
-                                        .accessibility_label("Open new workspace")
                                         .on_click(
                                             cx.listener(|this, _, w, cx| this.pick(true, w, cx)),
                                         ),
@@ -1903,12 +3086,8 @@ impl Render for Enso {
                             })
                             .when(self.root.is_some(), |row| {
                                 row.child(
-                                    Button::new("refresh")
-                                        .ghost()
+                                    ui::icon_button("refresh", IconName::RefreshCw, "Refresh folder")
                                         .xsmall()
-                                        .icon(IconName::RefreshCw)
-                                        .tooltip("Refresh folder")
-                                        .accessibility_label("Refresh folder")
                                         .on_click(cx.listener(|this, _, _, cx| {
                                             let paths: Vec<_> =
                                                 this.expanded.iter().cloned().collect();
@@ -1918,12 +3097,8 @@ impl Render for Enso {
                                         })),
                                 )
                                 .child(
-                                    Button::new("new")
-                                        .ghost()
+                                    ui::icon_button("new", IconName::Plus, "New File")
                                         .xsmall()
-                                        .icon(IconName::Plus)
-                                        .tooltip("New file")
-                                        .accessibility_label("New file")
                                         .on_click(
                                             cx.listener(|this, _, w, cx| this.new_file(w, cx)),
                                         ),
@@ -1938,6 +3113,32 @@ impl Render for Enso {
                     .min_h_0()
                     .overflow_y_scroll()
                     .px_2()
+                    // Below the rows, a drop lands in the workspace itself.
+                    .when_some(self.root.clone(), |list, root| {
+                        let entry_root = root.clone();
+                        let paths_root = root.clone();
+                        let drop_entry_root = root.clone();
+                        let drop_paths_root = root.clone();
+                        list.on_drag_move(cx.listener(move |this, e: &DragMoveEvent<DraggedEntry>, _, cx| {
+                            if this.tree_drop_point != Some(e.event.position) {
+                                this.hover_tree_drop(e.bounds, e.event.position, entry_root.clone(), cx);
+                            }
+                        }))
+                        .on_drag_move(cx.listener(move |this, e: &DragMoveEvent<ExternalPaths>, _, cx| {
+                            if this.tree_drop_point != Some(e.event.position) {
+                                this.hover_tree_drop(e.bounds, e.event.position, paths_root.clone(), cx);
+                            }
+                        }))
+                        .on_drop(cx.listener(move |this, e: &DraggedEntry, _, cx| {
+                            this.move_entry(e.path.clone(), drop_entry_root.clone(), cx)
+                        }))
+                        .on_drop(cx.listener(move |this, paths: &ExternalPaths, _, cx| {
+                            this.copy_into_folder(paths.paths().to_vec(), drop_paths_root.clone(), cx)
+                        }))
+                        .when(self.tree_drop.as_ref() == Some(&root), |list| {
+                            list.bg(theme.ring.opacity(0.06))
+                        })
+                    })
                     .children(rows.into_iter().enumerate().map(|(i, row)| {
                         let TreeRow {
                             entry,
@@ -2015,8 +3216,55 @@ impl Render for Enso {
                                 })
                         });
                         let muted = theme.muted_foreground;
+                        // A drop on a folder lands in it; on a file, beside it.
+                        let drop_dir = if entry.directory {
+                            path.clone()
+                        } else {
+                            path.parent().map(PathBuf::from).unwrap_or_else(|| path.clone())
+                        };
+                        let drop_target = entry.directory && self.tree_drop.as_ref() == Some(&path);
                         h_flex()
                             .id(("file", i))
+                            .relative()
+                            .when(!pending, |row| {
+                                row.on_drag(
+                                    DraggedEntry { path: path.clone(), directory: entry.directory },
+                                    |entry, _, _, cx| cx.new(|_| entry.clone()),
+                                )
+                            })
+                            .on_drag_move(cx.listener({
+                                let dir = drop_dir.clone();
+                                move |this, e: &DragMoveEvent<DraggedEntry>, _, cx| {
+                                    this.hover_tree_drop(e.bounds, e.event.position, dir.clone(), cx)
+                                }
+                            }))
+                            .on_drag_move(cx.listener({
+                                let dir = drop_dir.clone();
+                                move |this, e: &DragMoveEvent<ExternalPaths>, _, cx| {
+                                    this.hover_tree_drop(e.bounds, e.event.position, dir.clone(), cx)
+                                }
+                            }))
+                            .on_drop(cx.listener({
+                                let dir = drop_dir.clone();
+                                move |this, e: &DraggedEntry, _, cx| {
+                                    this.move_entry(e.path.clone(), dir.clone(), cx)
+                                }
+                            }))
+                            .on_drop(cx.listener({
+                                let dir = drop_dir.clone();
+                                move |this, paths: &ExternalPaths, _, cx| {
+                                    this.copy_into_folder(paths.paths().to_vec(), dir.clone(), cx)
+                                }
+                            }))
+                            .when(drop_target, |row| row.bg(theme.ring.opacity(0.12)))
+                            .child(
+                                div()
+                                    .absolute()
+                                    .top_0()
+                                    .bottom_0()
+                                    .left_0()
+                                    .child(ui::drop_line(("tree-drop", i), drop_target, window, cx)),
+                            )
                             .h(px(TREE_ROW_HEIGHT))
                             .w_full()
                             .pl_1()
@@ -2159,7 +3407,22 @@ impl Render for Enso {
                                             cx.notify();
                                         }
                                     });
+                                    let reveal = if cfg!(target_os = "macos") {
+                                        "Show in Finder"
+                                    } else {
+                                        "Show in File Explorer"
+                                    };
                                     menu.item(
+                                        PopupMenuItem::new(reveal)
+                                            .icon(IconName::FolderOpen)
+                                            .on_click({
+                                                let path = menu_path.clone();
+                                                move |_, _, cx| cx.reveal_path(&path)
+                                            }),
+                                    )
+                                    // As in Finder: everyday actions together, one
+                                    // separator setting off the destructive one.
+                                    .item(
                                         PopupMenuItem::new("Rename")
                                             .icon(IconName::Pencil)
                                             .on_click({
@@ -2179,9 +3442,9 @@ impl Render for Enso {
                                             .on_click({
                                                 let weak = weak.clone();
                                                 let path = menu_path.clone();
-                                                move |_, _, cx| {
+                                                move |_, window, cx| {
                                                     let _ = weak.update(cx, |this, cx| {
-                                                        this.delete_entry(path.clone(), cx)
+                                                        this.delete_entry(path.clone(), window, cx)
                                                     });
                                                 }
                                             }),
@@ -2192,17 +3455,23 @@ impl Render for Enso {
             )
             .child(
                 h_flex().px_3().py_3().child(
-                    Button::new("settings")
-                        .ghost()
+                    ui::icon_button("settings", IconName::Settings, "Settings")
                         .small()
-                        .icon(IconName::Settings)
-                        .tooltip("Settings")
-                        .accessibility_label("Settings")
                         .on_click(|_, _, cx| settings::open(cx)),
                 ),
             );
 
-        let mut body = h_flex().flex_1().min_h_0().w_full();
+        let drop_tint = theme.ring.opacity(0.04);
+        let mut body = h_flex()
+            .id("document-body")
+            .flex_1()
+            .min_h_0()
+            .w_full()
+            // Files from Finder: images go into the note, text files open.
+            .drag_over::<ExternalPaths>(move |style, _, _, _| style.bg(drop_tint))
+            .on_drop(cx.listener(|this, paths: &ExternalPaths, window, cx| {
+                this.drop_files(paths.paths().to_vec(), window, cx)
+            }));
         if let Some(i) = self.active {
             let document = &self.documents[i];
             let mut editor_pane = None;
@@ -2212,7 +3481,7 @@ impl Render for Enso {
                     div()
                         .id(("editor-pane", document.editor.entity_id()))
                         .when(document.markdown, |pane| {
-                            markdown_commands(pane, &document.editor)
+                            markdown_commands(pane, &document.editor, document.locked)
                         })
                         .overflow_hidden()
                         .flex_1()
@@ -2223,9 +3492,18 @@ impl Render for Enso {
                         .child(
                             Editor::new(&document.editor)
                                 .bordered(false)
+                                // Locked: readable and selectable, not changeable.
+                                .readonly(document.locked)
                                 .size_full()
                                 .font_family(theme.mono_font_family.clone())
                                 .text_sm()
+                                .when(document.markdown, |editor_view| {
+                                    let editor = document.editor.clone();
+                                    let checker = document.spellcheck.clone();
+                                    editor_view.context_menu(move |menu, _, cx| {
+                                        spellcheck::context_menu(menu, &editor, checker.as_ref(), cx)
+                                    })
+                                })
                                 .on_paste({
                                     let weak = cx.entity().downgrade();
                                     let editor = document.editor.clone();
@@ -2266,6 +3544,8 @@ impl Render for Enso {
             }
             if mode != Mode::Edit {
                 if let Some(reader) = &document.large_reader {
+                    let owner = cx.entity().downgrade();
+                    reader.update(cx, |reader, _| reader.set_controls(owner, document.editor.entity_id()));
                     reading_pane = Some(
                         div()
                             .id(("preview-pane", document.editor.entity_id()))
@@ -2283,6 +3563,7 @@ impl Render for Enso {
                         .and_then(|p| p.parent())
                         .map(PathBuf::from);
                     let link_base = base.clone();
+                    let editor_id = document.editor.entity_id();
                     reading_pane = Some(
                         div()
                             .id(("preview-pane", document.editor.entity_id()))
@@ -2290,6 +3571,16 @@ impl Render for Enso {
                             .min_w_0()
                             .h_full()
                             .overflow_hidden()
+                            // A click in the reader moves the editor there too,
+                            // as the editor's caret moves the reader. Seen on
+                            // the way down, before the text view handles it.
+                            .capture_any_mouse_up(cx.listener(move |_, event: &MouseUpEvent, window, cx| {
+                                if event.button == MouseButton::Left {
+                                    let position = event.position;
+                                    // After the text view has settled its selection.
+                                    cx.defer_in(window, move |this, _, cx| this.reader_clicked(editor_id, position, cx));
+                                }
+                            }))
                             .child(
                                 div().size_full().child(
                                     // Spans the whole pane, like the editor, so its
@@ -2297,7 +3588,8 @@ impl Render for Enso {
                                     // padding is inside the scroll box: text starts
                                     // where the editor's does (Read and Edit swap in
                                     // place) and stops short of the overlaid bar.
-                                    TextView::new(&document.preview)
+                                    rich::decorate(TextView::new(&document.preview), cx.entity().downgrade(), document.editor.entity_id(), base.clone(), 0, 0)
+                                        .map(|view| typography::style(view, cx))
                                         .selectable(true)
                                         .scrollable(true)
                                         .size_full()
@@ -2339,19 +3631,29 @@ impl Render for Enso {
             // resizable state, so switching modes never reuses panel zero for
             // a different kind of document view or its cached draw state.
             body = match (editor_pane, reading_pane) {
-                (Some(editor), Some(reader)) => body.child(
-                    h_resizable(("document-split", document.editor.entity_id()))
-                        .child(
-                            resizable_panel()
-                                .size_range(px(180.)..Pixels::MAX)
-                                .child(editor),
-                        )
-                        .child(
-                            resizable_panel()
-                                .size_range(px(180.)..Pixels::MAX)
-                                .child(reader),
-                        ),
-                ),
+                (Some(editor), Some(reader)) => {
+                    let (first, second) = if settings::reader_first(cx) {
+                        (reader, editor)
+                    } else {
+                        (editor, reader)
+                    };
+                    body.child(
+                        h_resizable(("document-split", document.editor.entity_id()))
+                            .with_handle_appearance(std::rc::Rc::new(|handle, window, cx| {
+                                Some(split_handle(handle, window, cx))
+                            }))
+                            .child(
+                                resizable_panel()
+                                    .size_range(px(180.)..Pixels::MAX)
+                                    .child(first),
+                            )
+                            .child(
+                                resizable_panel()
+                                    .size_range(px(180.)..Pixels::MAX)
+                                    .child(second),
+                            ),
+                    )
+                }
                 (Some(editor), None) => body.child(editor),
                 (None, Some(reader)) => body.child(reader),
                 (None, None) => body,
@@ -2389,27 +3691,21 @@ impl Render for Enso {
                             .gap_2()
                             .items_center()
                             .child(
-                                Button::new("start-open")
-                                    .small()
+                                ui::secondary_button("start-workspace", "Open Workspace")
+                                    .icon(IconName::FolderOpen)
+                                    .on_click(cx.listener(|this, _, w, cx| this.pick(true, w, cx))),
+                            )
+                            .child(
+                                ui::secondary_button("start-open", "Open File")
                                     .icon(IconName::File)
-                                    .label("Open file")
                                     .on_click(
                                         cx.listener(|this, _, w, cx| this.pick(false, w, cx)),
                                     ),
                             )
                             .child(
-                                Button::new("start-folder")
-                                    .small()
-                                    .icon(IconName::FolderOpen)
-                                    .label("Open folder")
-                                    .on_click(cx.listener(|this, _, w, cx| this.pick(true, w, cx))),
-                            )
-                            .child(
-                                Button::new("start-new")
-                                    .small()
-                                    .icon(IconName::Plus)
-                                    .label("New note")
-                                    .on_click(cx.listener(|this, _, w, cx| this.new_file(w, cx))),
+                                ui::secondary_button("start-palette", "Command Palette")
+                                    .icon(IconName::Search)
+                                    .on_click(cx.listener(|this, _, w, cx| this.open_palette(w, cx))),
                             ),
                     ),
             );
@@ -2440,19 +3736,79 @@ impl Render for Enso {
                     .into_iter()
                     .enumerate()
                     .map(|(i, (value, label, icon))| {
-                        Button::new(("mode", i))
-                            .ghost()
+                        ui::icon_button(("mode", i), icon, label)
                             .small()
-                            .icon(icon)
-                            .tooltip(label)
-                            .accessibility_label(label)
                             .disabled(!markdown || self.active.is_none())
                             .when(mode == value, |b| b.bg(theme.secondary))
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 this.set_mode(value, window, cx)
                             }))
                     }),
-                ),
+                )
+                // Reading preferences are global, with live size preview.
+                .child({
+                    let weak = cx.entity().downgrade();
+                    div().debug_selector(|| "document-menu-trigger".into()).child(Popover::new("document-menu")
+                        .overlay_closable(false)
+                        // Compact: the kit's 12px, halved twice; items bring their own.
+                        .p_1()
+                        .trigger(ui::icon_button("document-menu-button", IconName::Ellipsis, "More")
+                            .small().disabled(!markdown || self.active.is_none()))
+                        .content(move |_, window, cx| {
+                            let controls = window.use_keyed_state("document-reading-controls", cx, |window, cx| {
+                                typography::ReadingControls::new(window, cx)
+                            });
+                            let weak = weak.clone();
+                            let popover = cx.entity().downgrade();
+                            let theme = cx.theme().clone();
+                            let dismiss_controls = controls.clone();
+                            let dismiss_popover = popover.clone();
+                            let lock_weak = weak.clone();
+                            let locked = weak.upgrade().is_some_and(|enso| {
+                                let enso = enso.read(cx);
+                                enso.active.is_some_and(|i| enso.documents[i].locked)
+                            });
+                            v_flex().debug_selector(|| "document-menu-panel".into()).w(px(240.))
+                                // Room under the last row, matching the top.
+                                .pb_1()
+                                // Select's popup can extend beyond this surface.
+                                // Wait for its outside-click handling before
+                                // deciding whether the parent should close.
+                                .on_mouse_down_out(move |_, window, cx| {
+                                    let controls = dismiss_controls.clone();
+                                    let popover = dismiss_popover.clone();
+                                    window.defer(cx, move |window, cx| {
+                                        if !controls.read(cx).font_dropdown_has_focus(window, cx) {
+                                            let _ = popover.update(cx, |state, cx| state.dismiss(window, cx));
+                                        }
+                                    });
+                                })
+                                .child(controls)
+                                .child(div().h(px(1.)).mx_1().my_1().bg(theme.border))
+                                // The switch shows the state; the whole row flips it.
+                                .child(h_flex().id("lock-page").px_2().h(px(28.)).gap_2()
+                                    .items_center().rounded_md().cursor_pointer().text_sm()
+                                    .hover(|row| row.bg(theme.secondary))
+                                    .child(Icon::new(if locked { IconName::Lock } else { IconName::LockOpen })
+                                        .size_4().text_color(theme.muted_foreground))
+                                    .child(div().flex_1().child("Lock Page"))
+                                    .child(gpui_kit::component::switch::Switch::new("lock-page-switch")
+                                        .checked(locked).small().accessibility_label("Lock Page"))
+                                    .on_click(move |_, _, cx| {
+                                        let _ = lock_weak.update(cx, |this, cx| this.toggle_lock(cx));
+                                    }))
+                                // Last, always: the one item that leaves this menu.
+                                .child(h_flex().id("export-note").px_2().h(px(28.)).gap_2()
+                                    .items_center().rounded_md().cursor_pointer().text_sm()
+                                    .hover(|row| row.bg(theme.secondary))
+                                    .child(Icon::new(IconName::Share).size_4().text_color(theme.muted_foreground))
+                                    .child(div().flex_1().child("Export…"))
+                                    .on_click(move |_, window, cx| {
+                                        let _ = popover.update(cx, |state, cx| state.dismiss(window, cx));
+                                        let _ = weak.update(cx, |this, cx| this.open_export(window, cx));
+                                    }))
+                        }))
+                }),
             );
         let (custom_titlebar, standard_header) = if CUSTOM_TITLEBAR {
             let toggle_label = if self.sidebar_open {
@@ -2490,16 +3846,9 @@ impl Render for Enso {
                             div()
                                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                                 .child(
-                                    Button::new("toggle-sidebar")
-                                        .ghost()
+                                    ui::icon_button("toggle-sidebar", IconName::PanelLeft, toggle_label)
                                         .small()
-                                        .icon(IconName::PanelLeft)
-                                        .tooltip(toggle_label)
-                                        .accessibility_label(toggle_label)
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            this.sidebar_open = !this.sidebar_open;
-                                            cx.notify();
-                                        })),
+                                        .on_click(cx.listener(|this, _, _, cx| this.toggle_sidebar(cx))),
                                 ),
                         )
                         .child(div().flex_shrink_0().w(px(header_offset)))
@@ -2523,10 +3872,31 @@ impl Render for Enso {
             // content column paints its own opaque background.
             .when(!backdrop, |view| view.bg(theme.background))
             .text_color(theme.foreground)
+            .on_action(cx.listener(|this, _: &OpenCommandPalette, w, cx| this.open_palette(w, cx)))
+            .on_action(cx.listener(|this, _: &SearchEverything, w, cx| this.toggle_content_search(w, cx)))
+            .on_action(cx.listener(|this, _: &PasteFiles, w, cx| this.paste_files(w, cx)))
+            .on_action(cx.listener(|this, action: &spellcheck::ReplaceSpelling, w, cx| this.replace_spelling(action, w, cx)))
+            .on_action(cx.listener(|this, _: &ExportNote, w, cx| this.open_export(w, cx)))
+            .on_action(cx.listener(|this, _: &ToggleLock, _, cx| this.toggle_lock(cx)))
+            .on_action(cx.listener(|this, _: &ToggleSidebar, _, cx| this.toggle_sidebar(cx)))
+            .on_action(cx.listener(|this, _: &CopyRichText, _, cx| {
+                let images = this.export_choice.images;
+                this.copy_rich_text(images, cx)
+            }))
+            .on_action(cx.listener(|this, _: &OpenSelectionInsertMenu, w, cx| {
+                if !this.open_selection_insert_menu(w, cx) { cx.propagate(); }
+            }))
+            .on_action(cx.listener(|this, _: &OpenInsertMenu, w, cx| {
+                if !this.open_insert_menu(w, cx) { cx.propagate(); }
+            }))
+            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| this.move_image_resize(event,cx)))
+            .on_mouse_up(MouseButton::Left,cx.listener(|this,_,w,cx|this.finish_image_resize(w,cx)))
+            .on_mouse_up_out(MouseButton::Left,cx.listener(|this,_,w,cx|this.finish_image_resize(w,cx)))
             .on_action(cx.listener(|this, _: &OpenFile, w, cx| this.pick(false, w, cx)))
             .on_action(cx.listener(|this, _: &OpenFolder, w, cx| this.pick(true, w, cx)))
             .on_action(cx.listener(|this, _: &NewFile, w, cx| this.new_file(w, cx)))
             .on_action(cx.listener(|this, _: &Save, _, cx| this.save(cx)))
+            .on_action(cx.listener(|this, _: &ReopenClosedTab, w, cx| this.reopen_closed_tab(w, cx)))
             // Closes the current tab; with no tabs left, the window, as Cmd-W
             // does in other Mac apps (and quits after the last window).
             .on_action(cx.listener(|this, _: &CloseFile, window, cx| {
@@ -2548,7 +3918,7 @@ impl Render for Enso {
             }))
             .on_action(cx.listener(|this, _: &DeleteSelected, w, cx| {
                 match this.selected_entry().filter(|_| this.focus.is_focused(w)) {
-                    Some(path) => this.delete_entry(path, cx),
+                    Some(path) => this.delete_entry(path, w, cx),
                     None => cx.propagate(),
                 }
             }))
@@ -2567,6 +3937,12 @@ impl Render for Enso {
                     Mode::Split
                 };
                 this.set_mode(next, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &SwapSplitSides, _, cx| {
+                if this.mode != Mode::Split { return; }
+                if let Err(error) = settings::set_reader_first(!settings::reader_first(cx), cx) {
+                    this.message(format!("Could not save split order: {error}"), true, cx);
+                }
             }))
             .child(
                 div().flex_1().min_h_0().w_full().child(
@@ -2626,7 +4002,7 @@ impl Render for Enso {
                                     )
                                 })
                                 .when_some(standard_header, |view, header| view.child(header))
-                                .child(body)
+                                .child(h_flex().flex_1().min_h_0().min_w_0().relative().child(self.outline_rail(window,cx)).child(body.h_full().min_w_0()))
                                 .child(
                                     h_flex()
                                         .relative()
@@ -2642,18 +4018,6 @@ impl Render for Enso {
                                         .border_color(theme.border)
                                         .text_size(px(10.))
                                         .line_height(relative(1.))
-                                        .when(self.error && self.error_shown, |bar| {
-                                            bar.child(
-                                                div()
-                                                    .absolute()
-                                                    .inset_0()
-                                                    .flex()
-                                                    .items_center()
-                                                    .justify_center()
-                                                    .text_color(theme.danger)
-                                                    .child(self.status.clone()),
-                                            )
-                                        })
                                         .child(
                                             div().text_color(theme.muted_foreground).child(stats),
                                         ),
@@ -2664,14 +4028,40 @@ impl Render for Enso {
             .when_some(custom_titlebar, |view, titlebar| {
                 view.child(div().absolute().top_0().left_0().right_0().child(titlebar))
             })
+            .when_some(self.palette_overlay(window, cx), |view, overlay| view.child(overlay))
+            .when_some(self.controls_overlay(window, cx), |view, overlay| view.child(overlay))
+            .when_some(self.export_overlay(window, cx), |view, overlay| view.child(overlay))
+            .when_some(self.lightbox_overlay(window, cx), |view, overlay| view.child(overlay))
+            .when_some(self.toast_layer(window, cx), |view, layer| view.child(layer))
     }
 }
 
 fn bind_view_keys(cx: &mut App) {
+    cx.bind_keys([
+        KeyBinding::new("escape", DismissCommandPalette, Some("CommandPalette > Input")),
+        KeyBinding::new("escape", DismissRichControls, Some("RichControls > Input")),
+        KeyBinding::new("escape", DismissRichControls, Some("RichControls")),
+        KeyBinding::new("escape", DismissExport, Some("ExportDialog")),
+        KeyBinding::new("escape", DismissLightbox, Some("Lightbox")),
+        KeyBinding::new(if cfg!(target_os = "macos") { "cmd-shift-t" } else { "ctrl-shift-t" }, ReopenClosedTab, Some("Enso")),
+        KeyBinding::new("ctrl-shift-p", OpenCommandPalette, Some("Enso")),
+        KeyBinding::new("cmd-shift-p", OpenCommandPalette, Some("Enso")),
+        KeyBinding::new(if cfg!(target_os = "macos") { "cmd-shift-s" } else { "ctrl-shift-s" }, SearchEverything, Some("Enso")),
+        // At the window's depth only: in a Markdown editor the same keys are
+        // Bold, which its deeper context binds first.
+        KeyBinding::new(if cfg!(target_os = "macos") { "cmd-b" } else { "ctrl-b" }, ToggleSidebar, Some("Enso")),
+        // Only acts while the sidebar has focus; text fields paste as usual.
+        KeyBinding::new(if cfg!(target_os = "macos") { "cmd-v" } else { "ctrl-v" }, PasteFiles, Some("Enso")),
+    ]);
     // Bind at the input's context depth too: macOS inputs normally
     // consume Ctrl+E as end-of-line before a parent action can see it.
     for context in ["Enso", "Enso > Input"] {
         cx.bind_keys([
+            KeyBinding::new(if cfg!(target_os = "macos") { "cmd-shift-\\" } else { "ctrl-shift-\\" }, SwapSplitSides, Some(context)),
+            // Shifted punctuation is delivered as `|` on macOS, consuming
+            // Shift. Accept both representations from platform keyboards.
+            KeyBinding::new(if cfg!(target_os = "macos") { "cmd-|" } else { "ctrl-|" }, SwapSplitSides, Some(context)),
+            KeyBinding::new(if cfg!(target_os = "macos") { "cmd-shift-|" } else { "ctrl-shift-|" }, SwapSplitSides, Some(context)),
             KeyBinding::new("ctrl-e", ToggleView, Some(context)),
             KeyBinding::new("ctrl-w", CloseFile, Some(context)),
             KeyBinding::new("ctrl-\\", ToggleSplit, Some(context)),
@@ -2684,6 +4074,54 @@ fn bind_view_keys(cx: &mut App) {
             ]);
         }
     }
+}
+
+/// The split view's divider: the kit's line and pill, plus a button that swaps
+/// the editor and reader sides. The button shows while the pointer is on the
+/// divider or on the button itself; a press that moves still drags the divider.
+fn split_handle(handle: &ResizeHandleContext, window: &mut Window, cx: &mut App) -> AnyElement {
+    const SIZE: f32 = 24.;
+    let line = resize_handle_appearance()(handle, window, cx);
+    let shown = matches!(
+        handle.state(),
+        ResizeHandleState::Hovered | ResizeHandleState::Pressed
+    );
+    let theme = cx.theme();
+    let hover_color = theme.foreground;
+    let button = div()
+        .id("split-swap")
+        .absolute()
+        .top(relative(0.5))
+        .mt(px(-SIZE / 2.))
+        .left(px(0.5 - SIZE / 2.))
+        .size(px(SIZE))
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded_full()
+        .border_1()
+        .border_color(theme.border)
+        .bg(theme.background)
+        .text_color(theme.muted_foreground)
+        .cursor_pointer()
+        .opacity(if shown { 1. } else { 0. })
+        .hover(move |button| button.opacity(1.).text_color(hover_color))
+        .child(Icon::new(IconName::ArrowLeftRight).size(px(13.)))
+        .tooltip(|window, cx| Tooltip::new("Swap editor and reader").build(window, cx))
+        .on_click(|_, _, cx| {
+            let swapped = !settings::reader_first(cx);
+            if let Err(error) = settings::set_reader_first(swapped, cx) {
+                eprintln!("enso: could not save the split order: {error}");
+            }
+        });
+    div()
+        .flex_none()
+        .relative()
+        .w(px(1.))
+        .h_full()
+        .children(line)
+        .child(button)
+        .into_any_element()
 }
 
 /// Markdown shortcuts, live only in a Markdown document's editor (its
@@ -2700,6 +4138,8 @@ fn bind_markdown_keys(cx: &mut App) {
         };
     }
     cx.bind_keys([
+        KeyBinding::new("/", OpenInsertMenu, context),
+        KeyBinding::new(key!("/"), OpenSelectionInsertMenu, context),
         KeyBinding::new(key!("b"), Bold, context),
         KeyBinding::new(key!("i"), Italic, context),
         KeyBinding::new(key!("shift-x"), Strikethrough, context),
@@ -2726,13 +4166,17 @@ fn bind_markdown_keys(cx: &mut App) {
 }
 
 /// Hook the Markdown shortcuts up to a document editor's pane.
-fn markdown_commands(pane: Stateful<Div>, editor: &Entity<EditorState>) -> Stateful<Div> {
+fn markdown_commands(pane: Stateful<Div>, editor: &Entity<EditorState>, locked: bool) -> Stateful<Div> {
     use markdown_edit::{Block, Inline};
     // A command that always applies.
     macro_rules! command {
         ($pane:expr, $action:ty, $run:expr) => {{
             let editor = editor.clone();
             $pane.on_action(move |_: &$action, window, cx| {
+                // A locked note takes no formatting.
+                if locked {
+                    return;
+                }
                 apply_markdown(&editor, window, cx, |text, selection| {
                     Some($run(text, selection))
                 });
@@ -2744,7 +4188,7 @@ fn markdown_commands(pane: Stateful<Div>, editor: &Entity<EditorState>) -> State
         ($pane:expr, $action:ty, $run:expr) => {{
             let editor = editor.clone();
             $pane.on_action(move |_: &$action, window, cx| {
-                if !apply_markdown(&editor, window, cx, $run) {
+                if locked || !apply_markdown(&editor, window, cx, $run) {
                     cx.propagate();
                 }
             })
@@ -2795,6 +4239,10 @@ fn apply_markdown(
 ) -> bool {
     editor.update(cx, |state, cx| {
         use gpui_kit::base::input::RopeExt as _;
+        // A locked note takes no edits, from keys or commands.
+        if !state.is_editable() {
+            return false;
+        }
         let selection = state.selected_range();
         let rope = state.text();
         // One line of context either side, for fences around a selection.
@@ -2937,6 +4385,36 @@ fn open_urls(urls: Vec<String>, cx: &mut App) {
     }
 }
 
+/// Look for a newer enso in the background (at most once a day, if allowed
+/// in Settings) and say so in the front window. Never holds up startup;
+/// a failed check stays silent.
+fn check_for_updates(cx: &mut App) {
+    if !settings::check_updates(cx) || !update::due() {
+        return;
+    }
+    let found = cx.background_executor().spawn(async { update::check() });
+    cx.spawn(async move |cx| {
+        let Some(release) = found.await else { return };
+        cx.update(|cx| {
+            let active = cx.active_window();
+            let views = open_views(cx);
+            let Some((_, view)) = views
+                .iter()
+                .find(|(handle, _)| Some(*handle) == active)
+                .or(views.first())
+                .cloned()
+            else {
+                return;
+            };
+            let url = release.url;
+            let toast = ui::toast::info("update", format!("enso {} is available", release.version))
+                .action(IconName::Download, "Download", move |_, cx| cx.open_url(&url));
+            view.update(cx, |app, cx| app.toast(toast, cx));
+        });
+    })
+    .detach();
+}
+
 fn open_workspace_window(root: Option<PathBuf>, cx: &mut App) {
     open_enso_window(cx, move |app, _, cx| {
         if let Some(root) = root {
@@ -2947,7 +4425,10 @@ fn open_workspace_window(root: Option<PathBuf>, cx: &mut App) {
 
 fn main() {
     let initial = std::env::args_os().nth(1).map(PathBuf::from);
-    let app = gpui_kit::application().with_assets(gpui_kit::assets::AllAssets);
+    let app = gpui_kit::application()
+        .with_assets(gpui_kit::assets::AllAssets)
+        // Web images in notes; GPUI's own client refuses every request.
+        .with_http_client(std::sync::Arc::new(http::Client::new()));
     // The system can hand over files before the app has a context to open them
     // with; queue them until the run loop below picks them up.
     let (opened_tx, mut opened_rx) = futures::channel::mpsc::unbounded::<Vec<String>>();
@@ -2956,9 +4437,12 @@ fn main() {
     });
     app.run(move |cx| {
             gpui_kit::init(cx);
+            typography::init(cx);
             app_icon::init();
             settings::init(cx);
             workspaces::init(cx);
+            session::init(cx);
+            lock::init(cx);
             cx.on_action(|_: &OpenSettings, cx| settings::open(cx));
             cx.bind_keys([
                 KeyBinding::new("cmd-,", OpenSettings, None),
@@ -3018,11 +4502,18 @@ fn main() {
                 Menu {
                     name: "File".into(),
                     items: vec![
+                        MenuItem::action("Command Palette…", OpenCommandPalette),
+                        MenuItem::action("Search Everything…", SearchEverything),
+                        MenuItem::separator(),
+                        MenuItem::action("Export…", ExportNote),
+                        MenuItem::action("Copy as Rich Text", CopyRichText),
+                        MenuItem::separator(),
                         MenuItem::action("Open File…", OpenFile),
                         MenuItem::action("Open Folder…", OpenFolder),
                         MenuItem::action("New File", NewFile),
                         MenuItem::action("New Folder", NewFolder),
                         MenuItem::action("Close File", CloseFile),
+                        MenuItem::action("Reopen Closed Tab", ReopenClosedTab),
                         #[cfg(not(target_os = "macos"))]
                         MenuItem::action("Settings…", OpenSettings),
                         MenuItem::separator(),
@@ -3060,6 +4551,7 @@ fn main() {
                     }),
                 }
             }
+            check_for_updates(cx);
             cx.spawn(async move |cx| {
                 use futures::StreamExt as _;
                 while let Some(urls) = opened_rx.next().await {
@@ -3088,6 +4580,859 @@ mod transition_tests {
         })
         .unwrap();
         cx.run_until_parked();
+    }
+
+    #[gpui_kit::test]
+    fn reopen_closed_tabs_in_reverse_order(cx: &mut TestAppContext) {
+        cx.update(|cx| { gpui_kit::init(cx); bind_view_keys(cx); });
+        let root = std::env::temp_dir().join(format!("enso-reopen-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let paths: Vec<_> = ["a.md", "b.md", "c.md"].iter().map(|name| root.join(name)).collect();
+        for path in &paths { std::fs::write(path, "original").unwrap(); }
+        let (handle, view) = cx.update(|cx| gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+            cx.new(|cx| {
+                let mut app = Enso::new(window, cx);
+                for path in &paths { app.add_document(Some(path.clone()), "original".into(), None, window, cx); }
+                app
+            })
+        }).unwrap());
+        draw(cx, handle);
+        cx.update(|cx| view.update(cx, |app, cx| { app.close_document(1, cx); app.close_document(1, cx); }));
+        std::fs::write(&paths[2], "changed on disk").unwrap();
+        let key = if cfg!(target_os = "macos") { "cmd-shift-t" } else { "ctrl-shift-t" };
+        draw(cx, handle);
+        for expected in [2, 1] {
+            cx.simulate_keystrokes(handle, key);
+            cx.run_until_parked();
+            draw(cx, handle);
+            cx.update(|cx| {
+                let app = view.read(cx);
+                let doc = &app.documents[app.active.unwrap()];
+                assert_eq!(doc.path.as_ref(), Some(&paths[expected]));
+                if expected == 2 { assert_eq!(doc.saved.as_str(), "changed on disk"); }
+            });
+        }
+        // No history is harmless and never creates a duplicate tab.
+        cx.simulate_keystrokes(handle, key);
+        draw(cx, handle);
+        assert_eq!(cx.update(|cx| view.read(cx).documents.len()), 3);
+        cx.update(|cx| view.update(cx, |app, cx| app.close_document(2, cx)));
+        std::fs::remove_file(&paths[1]).unwrap();
+        cx.simulate_keystrokes(handle, key);
+        draw(cx, handle);
+        assert_eq!(cx.update(|cx| view.read(cx).documents.len()), 2);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn quick_reopens_bring_back_every_closed_tab(cx: &mut TestAppContext) {
+        cx.update(|cx| { gpui_kit::init(cx); bind_view_keys(cx); });
+        let root = std::env::temp_dir().join(format!("enso-reopen-quick-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let paths: Vec<_> = ["a.md", "b.md", "c.md", "d.md", "e.md"].iter().map(|name| root.join(name)).collect();
+        for path in &paths { std::fs::write(path, "text").unwrap(); }
+        let (handle, view) = cx.update(|cx| gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+            cx.new(|cx| {
+                let mut app = Enso::new(window, cx);
+                app.open_folder(root.clone(), cx);
+                app
+            })
+        }).unwrap());
+        cx.run_until_parked();
+        for path in &paths {
+            let path = path.clone();
+            cx.update_window(handle, |_, window, cx| {
+                view.update(cx, |app, cx| app.open_path(path, window, cx))
+            }).unwrap();
+            cx.run_until_parked();
+            draw(cx, handle);
+        }
+        for _ in 0..4 {
+            cx.simulate_keystrokes(handle, "ctrl-w");
+            cx.run_until_parked();
+            draw(cx, handle);
+        }
+        assert_eq!(cx.update(|cx| view.read(cx).documents.len()), 1);
+        // Typing in the tab that's left, then a press per closed tab: each
+        // reopened tab takes the keyboard, so the next press still lands.
+        cx.update_window(handle, |_, window, cx| {
+            view.update(cx, |app, _| app.mode = Mode::Split);
+            let editor = view.read(cx).documents[0].editor.clone();
+            editor.focus_handle(cx).focus(window, cx);
+        }).unwrap();
+        draw(cx, handle);
+        let key = if cfg!(target_os = "macos") { "cmd-shift-t" } else { "ctrl-shift-t" };
+        for _ in 0..4 {
+            cx.simulate_keystrokes(handle, key);
+            cx.run_until_parked();
+            draw(cx, handle);
+        }
+        cx.update(|cx| {
+            let app = view.read(cx);
+            let mut open: Vec<_> = app.documents.iter().filter_map(|d| d.path.clone()).collect();
+            open.sort();
+            assert_eq!(open, paths);
+        });
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn reopen_brings_back_every_closed_tab_in_turn(cx: &mut TestAppContext) {
+        cx.update(|cx| { gpui_kit::init(cx); bind_view_keys(cx); });
+        let root = std::env::temp_dir().join(format!("enso-reopen-all-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let paths: Vec<_> = ["a.md", "b.md", "c.md"].iter().map(|name| root.join(name)).collect();
+        for path in &paths { std::fs::write(path, "text").unwrap(); }
+        let (handle, view) = cx.update(|cx| gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+            cx.new(|cx| Enso::new(window, cx))
+        }).unwrap());
+        for path in &paths {
+            let path = path.clone();
+            cx.update_window(handle, |_, window, cx| {
+                view.update(cx, |app, cx| app.open_path(path, window, cx))
+            }).unwrap();
+            cx.run_until_parked();
+            draw(cx, handle);
+        }
+        // Close all three from the keyboard, the last one open first.
+        for _ in 0..3 {
+            cx.simulate_keystrokes(handle, "ctrl-w");
+            cx.run_until_parked();
+            draw(cx, handle);
+        }
+        assert_eq!(cx.update(|cx| view.read(cx).documents.len()), 0);
+        let key = if cfg!(target_os = "macos") { "cmd-shift-t" } else { "ctrl-shift-t" };
+        for expected in [0, 1, 2] {
+            cx.simulate_keystrokes(handle, key);
+            cx.run_until_parked();
+            draw(cx, handle);
+            cx.update(|cx| {
+                let app = view.read(cx);
+                assert_eq!(app.documents.len(), expected + 1, "press {}", expected + 1);
+            });
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn a_workspace_reopens_with_its_tabs_view_and_sidebar(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            bind_view_keys(cx);
+            // In memory only: no file, so the user's own sessions are untouched.
+            cx.set_global(super::session::Sessions::default());
+        });
+        let root = std::env::temp_dir().join(format!("enso-session-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let deep = root.join("notes").join("deep");
+        std::fs::create_dir_all(&deep).unwrap();
+        let paths: Vec<_> = ["a.md", "b.md", "c.md"].iter().map(|name| root.join(name)).collect();
+        for path in &paths { std::fs::write(path, "text").unwrap(); }
+        std::fs::write(deep.join("d.md"), "text").unwrap();
+        let (handle, view) = cx.update(|cx| gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+            cx.new(|cx| {
+                let mut app = Enso::new(window, cx);
+                app.open_folder(root.clone(), cx);
+                // Opening a file deep inside expands its folders.
+                app.add_document(Some(deep.join("d.md")), "text".into(), None, window, cx);
+                app.close_document(0, cx);
+                assert!(app.expanded.contains(&deep) && app.expanded.contains(&root.join("notes")));
+                for path in &paths { app.add_document(Some(path.clone()), "text".into(), None, window, cx); }
+                app.active = Some(1);
+                app.mode = Mode::Split;
+                app
+            })
+        }).unwrap());
+        cx.run_until_parked();
+        draw(cx, handle);
+        // c is gone before the workspace is opened again: it's skipped.
+        std::fs::remove_file(&paths[2]).unwrap();
+        cx.update(|cx| { let _ = handle.update(cx, |_, window, _| window.remove_window()); });
+        cx.run_until_parked();
+        let (second, reopened) = cx.update(|cx| gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+            cx.new(|cx| {
+                let mut app = Enso::new(window, cx);
+                app.open_folder(root.clone(), cx);
+                app
+            })
+        }).unwrap());
+        cx.run_until_parked();
+        draw(cx, second);
+        cx.update(|cx| {
+            let app = reopened.read(cx);
+            let tabs: Vec<_> = app.documents.iter().map(|d| d.path.clone().unwrap()).collect();
+            assert_eq!(tabs, paths[..2]);
+            assert_eq!(app.active, Some(1));
+            assert!(app.mode == Mode::Split);
+            // The folders expanded last time are expanded again.
+            assert!(app.expanded.contains(&deep));
+        });
+        let _ = view;
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn files_changed_on_disk_reload_or_ask(cx: &mut TestAppContext) {
+        cx.update(|cx| { gpui_kit::init(cx); bind_view_keys(cx); });
+        let root = std::env::temp_dir().join(format!("enso-disk-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("note.md");
+        std::fs::write(&path, "first").unwrap();
+        let (handle, view) = cx.update(|cx| gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+            cx.new(|cx| {
+                let mut app = Enso::new(window, cx);
+                app.add_document(Some(path.clone()), "first".into(), None, window, cx);
+                app
+            })
+        }).unwrap());
+        draw(cx, handle);
+        let poll = |cx: &mut TestAppContext| {
+            cx.executor().advance_clock(std::time::Duration::from_secs(2));
+            cx.run_until_parked();
+            draw(cx, handle);
+        };
+        let state = |cx: &mut TestAppContext| cx.update(|cx| {
+            let doc = &view.read(cx).documents[0];
+            (doc.editor.read(cx).value().to_string(), doc.dirty)
+        });
+        // Untouched in enso: the new text just appears, and isn't saved back.
+        poll(cx);
+        std::fs::write(&path, "changed elsewhere").unwrap();
+        poll(cx);
+        assert_eq!(state(cx), ("changed elsewhere".into(), false));
+        poll(cx);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "changed elsewhere");
+        // Unsaved edits here and a new file: enso asks, and keeps the edits.
+        cx.update(|cx| { let _ = handle.update(cx, |_, window, cx| {
+            view.update(cx, |app, cx| app.documents[0].editor.update(cx, |e, cx| e.set_value("mine", window, cx)));
+        }); });
+        // A programmatic edit raises no change event; mark it as typing would.
+        cx.update(|cx| view.update(cx, |app, _| app.documents[0].dirty = true));
+        std::fs::write(&path, "theirs").unwrap();
+        poll(cx);
+        assert!(cx.has_pending_prompt());
+        cx.simulate_prompt_answer("Keep My Version");
+        poll(cx);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "mine");
+        assert_eq!(state(cx), ("mine".into(), false));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn the_sidebar_follows_files_added_and_removed_outside_enso(cx: &mut TestAppContext) {
+        cx.update(|cx| { gpui_kit::init(cx); bind_view_keys(cx); });
+        let root = std::env::temp_dir().join(format!("enso-watch-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("open")).unwrap();
+        std::fs::create_dir_all(root.join("closed")).unwrap();
+        std::fs::write(root.join("first.md"), "").unwrap();
+        let (handle, view) = cx.update(|cx| gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+            cx.new(|cx| {
+                let mut app = Enso::new(window, cx);
+                app.open_folder(root.clone(), cx);
+                app.expanded.insert(root.join("open"));
+                app.load_folder(root.join("open"), cx);
+                app
+            })
+        }).unwrap());
+        cx.run_until_parked();
+        let names = |cx: &mut TestAppContext, folder: &std::path::Path| -> Option<Vec<String>> {
+            cx.update(|cx| {
+                view.read(cx).folders.get(folder).map(|entries| {
+                    let mut names: Vec<String> =
+                        entries.iter().map(|e| e.path.file_name().unwrap().to_string_lossy().into()).collect();
+                    names.sort();
+                    names
+                })
+            })
+        };
+        let tick = |cx: &mut TestAppContext| {
+            cx.executor().advance_clock(std::time::Duration::from_millis(1600));
+            cx.run_until_parked();
+        };
+        // Added, renamed and deleted outside enso: the root and the expanded folder follow.
+        std::fs::write(root.join("second.md"), "").unwrap();
+        std::fs::write(root.join("open/inside.md"), "").unwrap();
+        tick(cx);
+        assert_eq!(names(cx, &root).unwrap(), ["closed", "first.md", "open", "second.md"]);
+        assert_eq!(names(cx, &root.join("open")).unwrap(), ["inside.md"]);
+        std::fs::rename(root.join("first.md"), root.join("renamed.md")).unwrap();
+        std::fs::remove_file(root.join("open/inside.md")).unwrap();
+        tick(cx);
+        assert_eq!(names(cx, &root).unwrap(), ["closed", "open", "renamed.md", "second.md"]);
+        assert_eq!(names(cx, &root.join("open")).unwrap(), Vec::<String>::new());
+        // A collapsed folder isn't read until it's opened.
+        std::fs::write(root.join("closed/later.md"), "").unwrap();
+        tick(cx);
+        assert!(names(cx, &root.join("closed")).is_none());
+        // An expanded folder removed from disk leaves the sidebar.
+        std::fs::remove_dir_all(root.join("open")).unwrap();
+        tick(cx);
+        assert_eq!(names(cx, &root).unwrap(), ["closed", "renamed.md", "second.md"]);
+        cx.update(|cx| {
+            let app = view.read(cx);
+            assert!(!app.folders.contains_key(&root.join("open")));
+            assert!(!app.expanded.contains(&root.join("open")));
+        });
+        draw(cx, handle);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn the_sidebar_selects_the_file_switched_to(cx: &mut TestAppContext) {
+        cx.update(|cx| { gpui_kit::init(cx); bind_view_keys(cx); });
+        let root = std::env::temp_dir().join(format!("enso-follow-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("deep")).unwrap();
+        std::fs::write(root.join("one.md"), "one").unwrap();
+        std::fs::write(root.join("deep/two.md"), "two").unwrap();
+        let (handle, view) = cx.update(|cx| gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+            cx.new(|cx| {
+                let mut app = Enso::new(window, cx);
+                app.open_folder(root.clone(), cx);
+                app.add_document(Some(root.join("deep/two.md")), "two".into(), None, window, cx);
+                app.add_document(Some(root.join("one.md")), "one".into(), None, window, cx);
+                app
+            })
+        }).unwrap());
+        cx.run_until_parked();
+        draw(cx, handle);
+        // Clicked in the sidebar, then the folder collapsed.
+        cx.update(|cx| view.update(cx, |app, _| {
+            app.selected = Some(root.join("one.md"));
+            app.expanded.remove(&root.join("deep"));
+        }));
+        // Switching from the palette (an open tab): its row is selected and shown.
+        let _ = handle.update(cx, |_, window, cx| {
+            view.update(cx, |app, cx| app.open_path(root.join("deep/two.md"), window, cx))
+        });
+        draw(cx, handle);
+        cx.update(|cx| {
+            let app = view.read(cx);
+            assert_eq!(app.selected.as_ref(), Some(&root.join("deep/two.md")));
+            assert!(app.expanded.contains(&root.join("deep")));
+        });
+        // A folder clicked while the tab stays the same keeps the selection.
+        cx.update(|cx| view.update(cx, |app, _| app.selected = Some(root.join("deep"))));
+        draw(cx, handle);
+        cx.update(|cx| assert_eq!(view.read(cx).selected.as_ref(), Some(&root.join("deep"))));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn deleting_asks_first_and_cancel_keeps_the_file(cx: &mut TestAppContext) {
+        cx.update(|cx| { gpui_kit::init(cx); bind_view_keys(cx); });
+        let root = std::env::temp_dir().join(format!("enso-confirm-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("keep.md"), "").unwrap();
+        let (handle, view) = cx.update(|cx| gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+            cx.new(|cx| {
+                let mut app = Enso::new(window, cx);
+                app.open_folder(root.clone(), cx);
+                app
+            })
+        }).unwrap());
+        cx.run_until_parked();
+        // Confirming is on unless turned off in Settings.
+        cx.update(|cx| assert!(crate::settings::confirm_delete(cx)));
+        let _ = handle.update(cx, |_, window, cx| {
+            view.update(cx, |app, cx| app.delete_entry(root.join("keep.md"), window, cx))
+        });
+        cx.run_until_parked();
+        assert!(cx.has_pending_prompt());
+        cx.simulate_prompt_answer("Cancel");
+        cx.run_until_parked();
+        assert!(root.join("keep.md").is_file());
+        draw(cx, handle);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn sidebar_moves_and_copies_keep_tabs_pointing_at_the_files(cx: &mut TestAppContext) {
+        cx.update(|cx| { gpui_kit::init(cx); bind_view_keys(cx); });
+        let root = std::env::temp_dir().join(format!("enso-dnd-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("folder")).unwrap();
+        let outside = std::env::temp_dir().join(format!("enso-dnd-outside-{}", std::process::id()));
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(root.join("note.md"), "note").unwrap();
+        std::fs::write(outside.join("from finder.md"), "copied").unwrap();
+        let (handle, view) = cx.update(|cx| gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+            cx.new(|cx| {
+                let mut app = Enso::new(window, cx);
+                app.open_folder(root.clone(), cx);
+                app.add_document(Some(root.join("note.md")), "note".into(), None, window, cx);
+                app
+            })
+        }).unwrap());
+        cx.run_until_parked();
+        draw(cx, handle);
+        // Dragging the open note into the folder moves the file; its tab follows.
+        cx.update(|cx| view.update(cx, |app, cx| app.move_entry(root.join("note.md"), root.join("folder"), cx)));
+        cx.run_until_parked();
+        cx.update(|cx| {
+            let app = view.read(cx);
+            assert_eq!(app.documents[0].path.as_ref(), Some(&root.join("folder/note.md")));
+            assert!(app.expanded.contains(&root.join("folder")));
+        });
+        assert!(root.join("folder/note.md").is_file() && !root.join("note.md").exists());
+        // A Finder item dropped on the folder is copied in, twice with a number.
+        for _ in 0..2 {
+            cx.update(|cx| view.update(cx, |app, cx| {
+                app.copy_into_folder(vec![outside.join("from finder.md")], root.join("folder"), cx)
+            }));
+            cx.run_until_parked();
+        }
+        assert!(root.join("folder/from finder.md").is_file());
+        assert!(root.join("folder/from finder 2.md").is_file());
+        assert!(outside.join("from finder.md").is_file());
+        // Copies only land inside the workspace.
+        cx.update(|cx| view.update(cx, |app, cx| app.copy_into_folder(vec![root.join("folder/note.md")], outside.clone(), cx)));
+        cx.run_until_parked();
+        assert!(!outside.join("note.md").exists());
+        draw(cx, handle);
+        std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_dir_all(outside).unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn export_dialog_writes_the_chosen_format(cx: &mut TestAppContext) {
+        use gpui_kit::BorrowAppContext;
+        cx.update(|cx| {
+            gpui_kit::init(cx); bind_view_keys(cx); super::settings::init(cx);
+            cx.update_global::<super::settings::Preferences, _>(|p, _| p.reading.font = super::typography::ReadingFont::Poppins);
+        });
+        let root = std::env::temp_dir().join(format!("enso-export-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("pics")).unwrap();
+        image::RgbImage::new(4, 4).save(root.join("pics/p.png")).unwrap();
+        let note = root.join("Trip Notes.md");
+        let text = "# Trip\n\n![photo](pics/p.png)\n";
+        std::fs::write(&note, text).unwrap();
+        let (handle, view) = cx.update(|cx| gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+            cx.new(|cx| {
+                let mut app = Enso::new(window, cx);
+                app.add_document(Some(note.clone()), text.into(), None, window, cx);
+                app
+            })
+        }).unwrap());
+        draw(cx, handle);
+        let run = |cx: &mut TestAppContext, format, images, name: &str| {
+            cx.update_window(handle, |_, window, cx| {
+                view.update(cx, |app, cx| {
+                    app.open_export(window, cx);
+                    let dialog = app.export_dialog.as_mut().unwrap();
+                    dialog.choice.format = format;
+                    dialog.choice.images = images;
+                    cx.notify();
+                })
+            }).unwrap();
+            draw(cx, handle);
+            let target = root.join(name);
+            cx.simulate_keystrokes(handle, "enter");
+            cx.run_until_parked();
+            cx.simulate_new_path_selection(|folder| {
+                // Offered beside the note, under its name.
+                assert_eq!(folder, root.as_path());
+                Some(target)
+            });
+            cx.run_until_parked();
+            draw(cx, handle);
+        };
+        run(cx, crate::export::Format::Html, false, "a.html");
+        let html = std::fs::read_to_string(root.join("a/index.html")).unwrap();
+        assert!(html.contains("<h1>Trip</h1>") && !html.contains("<img"));
+        assert!(root.join("a/public/fonts/Poppins-Regular.ttf").is_file());
+        assert!(std::fs::read_to_string(root.join("a/public/style.css")).unwrap().contains("font-family: \"Poppins\""));
+        assert!(!root.join("a_files").exists());
+        run(cx, crate::export::Format::Html, true, "b.html");
+        assert!(root.join("b/public/images/p.png").is_file());
+        run(cx, crate::export::Format::Pdf, true, "c.pdf");
+        assert!(std::fs::read(root.join("c.pdf")).unwrap().starts_with(b"%PDF"));
+        assert!(String::from_utf8_lossy(&std::fs::read(root.join("c.pdf")).unwrap()).contains("Poppins"));
+        // The dialog offers the last choice again.
+        assert!(cx.update(|cx| view.read(cx).export_choice.format) == crate::export::Format::Pdf);
+        // Each export ends in one toast (its "Exporting…" one replaced).
+        let toasts = cx.update(|cx| view.read(cx).toasts.iter().filter(|t| !t.leaving).count());
+        assert_eq!(toasts, 3);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn toasts_replace_in_place_hide_themselves_and_stay_few(cx: &mut TestAppContext) {
+        cx.update(|cx| { gpui_kit::init(cx); bind_view_keys(cx); });
+        let (handle, view) = cx.update(|cx| gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+            cx.new(|cx| Enso::new(window, cx))
+        }).unwrap());
+        let showing = |cx: &mut TestAppContext| cx.update(|cx| {
+            view.read(cx).toasts.iter().filter(|t| !t.leaving).map(|t| t.toast.title.to_string()).collect::<Vec<_>>()
+        });
+        cx.update(|cx| view.update(cx, |app, cx| {
+            app.toast(super::ui::toast::working("job", "Working…"), cx);
+            app.toast(super::ui::toast::done("job", "Done", "detail"), cx);
+        }));
+        draw(cx, handle);
+        // The spinner became the result: one toast, not two.
+        assert_eq!(showing(cx), ["Done"]);
+        cx.update(|cx| view.update(cx, |app, cx| {
+            for n in 0..5 {
+                app.toast(super::ui::toast::done(format!("n{n}"), format!("T{n}"), ""), cx);
+            }
+        }));
+        draw(cx, handle);
+        assert_eq!(showing(cx), ["T1", "T2", "T3", "T4"]);
+        // A few seconds later they leave, and are gone once faded.
+        cx.executor().advance_clock(std::time::Duration::from_secs(5));
+        draw(cx, handle);
+        assert!(showing(cx).is_empty());
+        cx.executor().advance_clock(std::time::Duration::from_secs(1));
+        draw(cx, handle);
+        draw(cx, handle);
+        assert!(cx.update(|cx| view.read(cx).toasts.is_empty()));
+        // A working toast stays until it's finished; dismissing takes it away.
+        cx.update(|cx| view.update(cx, |app, cx| app.toast(super::ui::toast::working("w", "Busy…"), cx)));
+        cx.executor().advance_clock(std::time::Duration::from_secs(10));
+        draw(cx, handle);
+        assert_eq!(showing(cx), ["Busy…"]);
+        cx.update(|cx| view.update(cx, |app, cx| app.dismiss_toast(&"w".into(), cx)));
+        assert!(showing(cx).is_empty());
+    }
+
+    #[gpui_kit::test]
+    fn moving_a_tab_keeps_the_same_document_active(cx: &mut TestAppContext) {
+        cx.update(|cx| { gpui_kit::init(cx); bind_view_keys(cx); });
+        let paths: Vec<_> = ["a.md", "b.md", "c.md"].iter().map(PathBuf::from).collect();
+        let (handle, view) = cx.update(|cx| gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+            cx.new(|cx| {
+                let mut app = Enso::new(window, cx);
+                for path in &paths { app.add_document(Some(path.clone()), String::new(), None, window, cx); }
+                app.active = Some(0);
+                app
+            })
+        }).unwrap());
+        draw(cx, handle);
+        let order = |cx: &mut TestAppContext| cx.update(|cx| {
+            let app = view.read(cx);
+            let names: Vec<_> = app.documents.iter().map(|d| d.path.clone().unwrap()).collect();
+            (names, app.active)
+        });
+        // a moves to the end; it stays the active tab at its new place.
+        cx.update(|cx| view.update(cx, |app, cx| app.move_tab(0, 2, cx)));
+        assert_eq!(order(cx), (vec![paths[1].clone(), paths[2].clone(), paths[0].clone()], Some(2)));
+        // c moves to the front, past the active a's neighbour; a stays active.
+        cx.update(|cx| view.update(cx, |app, cx| app.move_tab(1, 0, cx)));
+        assert_eq!(order(cx), (vec![paths[2].clone(), paths[1].clone(), paths[0].clone()], Some(2)));
+        // Out of range is ignored.
+        cx.update(|cx| view.update(cx, |app, cx| app.move_tab(0, 9, cx)));
+        assert_eq!(order(cx).0.len(), 3);
+        draw(cx, handle);
+    }
+
+    #[gpui_kit::test]
+    fn shortcut_swaps_split_sides_from_editor_and_reader_and_remembers_it(cx: &mut TestAppContext) {
+        use gpui_kit::BorrowAppContext;
+        let path = std::env::temp_dir().join(format!("enso-split-shortcut-{}", std::process::id()));
+        cx.update(|cx| {
+            gpui_kit::init(cx); bind_view_keys(cx); super::settings::init(cx);
+            cx.update_global::<super::settings::Preferences, _>(|p, _| {
+                p.reader_first = false;
+                p.split_order_path = Some(path.clone());
+            });
+        });
+        let (handle, view) = cx.update(|cx| gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+            cx.new(|cx| {
+                let mut app = Enso::new(window, cx);
+                app.add_document(None, "# Heading\n\nBody".into(), None, window, cx);
+                app
+            })
+        }).unwrap());
+        draw(cx, handle);
+        let shortcut = if cfg!(target_os = "macos") { "cmd-shift-\\" } else { "ctrl-shift-\\" };
+        cx.simulate_keystrokes(handle, shortcut);
+        assert!(!cx.update(|cx| super::settings::reader_first(cx)), "Read mode does not swap");
+        cx.update_window(handle, |_, w, cx| view.update(cx, |app, cx| app.set_mode(Mode::Split, w, cx))).unwrap();
+        draw(cx, handle);
+        cx.simulate_keystrokes(handle, shortcut);
+        draw(cx, handle);
+        assert!(cx.update(|cx| super::settings::reader_first(cx)));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "reader-first");
+        cx.update_window(handle, |_, w, cx| view.update(cx, |app, cx| app.focus.focus(w, cx))).unwrap();
+        // macOS reports Shift+backslash as the shifted character `|`, with
+        // Shift consumed, rather than as an unshifted key plus a modifier.
+        let shifted_character = if cfg!(target_os = "macos") { "cmd-|" } else { "ctrl-|" };
+        cx.simulate_keystrokes(handle, shifted_character);
+        draw(cx, handle);
+        assert!(!cx.update(|cx| super::settings::reader_first(cx)));
+        assert!(cx.update(|cx| view.read(cx).mode == Mode::Split));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "editor-first");
+        let retained_shift = if cfg!(target_os = "macos") { "cmd-shift-|" } else { "ctrl-shift-|" };
+        cx.simulate_keystrokes(handle, retained_shift);
+        draw(cx, handle);
+        assert!(cx.update(|cx| super::settings::reader_first(cx)));
+        assert!(cx.update(|cx| view.read(cx).mode == Mode::Split));
+        // Without Shift, the same physical key still only toggles Split.
+        let toggle = if cfg!(target_os = "macos") { "cmd-\\" } else { "ctrl-\\" };
+        cx.simulate_keystrokes(handle, toggle);
+        draw(cx, handle);
+        assert!(cx.update(|cx| view.read(cx).mode == Mode::Read));
+        cx.simulate_keystrokes(handle, toggle);
+        draw(cx, handle);
+        assert!(cx.update(|cx| view.read(cx).mode == Mode::Split));
+        assert!(cx.update(|cx| super::settings::reader_first(cx)));
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn diagrams_copy_save_and_open_full_size(cx: &mut TestAppContext) {
+        cx.update(|cx| { gpui_kit::init(cx); bind_view_keys(cx); });
+        let dir = std::env::temp_dir().join(format!("enso-media-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let source = "flowchart LR\n  A --> B";
+        let (handle, view) = cx.update(|cx| gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+            cx.new(|cx| Enso::new(window, cx))
+        }).unwrap());
+        draw(cx, handle);
+        // Copy: a PNG on the clipboard.
+        cx.update(|cx| view.update(cx, |app, cx| app.copy_diagram(source, cx)));
+        let copied = cx.update(|cx| cx.read_from_clipboard()).expect("clipboard");
+        match copied.entries().first() {
+            Some(gpui_kit::ClipboardEntry::Image(image)) => {
+                assert_eq!(image.format(), gpui_kit::ImageFormat::Png);
+                assert!(image.bytes().starts_with(b"\x89PNG"));
+            }
+            other => panic!("expected an image, got {other:?}"),
+        }
+        // Save as PNG and as SVG, wherever the dialog says.
+        for (format, name, magic) in [
+            (super::media::DiagramFormat::Png, "d.png", &b"\x89PNG"[..]),
+            (super::media::DiagramFormat::Svg, "d.svg", &b"<svg"[..]),
+        ] {
+            cx.update_window(handle, |_, window, cx| {
+                view.update(cx, |app, cx| app.save_diagram(source, format, Some(dir.clone()), window, cx))
+            }).unwrap();
+            cx.run_until_parked();
+            let target = dir.join(name);
+            cx.simulate_new_path_selection(|_| Some(target));
+            cx.run_until_parked();
+            assert!(std::fs::read(dir.join(name)).unwrap().starts_with(magic), "{name}");
+        }
+        // Full size opens, and Escape closes it.
+        let drawn = crate::diagram::render(source, false).unwrap();
+        cx.update_window(handle, |_, window, cx| view.update(cx, |app, cx| {
+            app.open_lightbox(super::media::Lightbox::Diagram { svg: drawn.svg.clone(), width: drawn.width, height: drawn.height }, window, cx)
+        })).unwrap();
+        draw(cx, handle);
+        assert!(cx.update(|cx| view.read(cx).lightbox.is_some()));
+        cx.simulate_keystrokes(handle, "escape");
+        draw(cx, handle);
+        assert!(cx.update(|cx| view.read(cx).lightbox.is_none()));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn cmd_b_toggles_the_sidebar_except_in_the_markdown_editor(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            bind_view_keys(cx);
+            super::bind_markdown_keys(cx);
+        });
+        let text = "hello";
+        let (handle, view) = cx.update(|cx| gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+            cx.new(|cx| {
+                let mut app = Enso::new(window, cx);
+                app.add_document(Some(PathBuf::from("note.md")), text.into(), None, window, cx);
+                app
+            })
+        }).unwrap());
+        draw(cx, handle);
+        let key = if cfg!(target_os = "macos") { "cmd-b" } else { "ctrl-b" };
+        let open = |cx: &mut TestAppContext| cx.update(|cx| view.read(cx).sidebar_open);
+        // Reading: the keys collapse the sidebar, and bring it back.
+        assert!(open(cx));
+        cx.simulate_keystrokes(handle, key);
+        draw(cx, handle);
+        assert!(!open(cx));
+        cx.simulate_keystrokes(handle, key);
+        draw(cx, handle);
+        assert!(open(cx));
+        // Typing in the Markdown editor: they're Bold, and the sidebar stays.
+        cx.update(|cx| view.update(cx, |app, cx| { app.mode = Mode::Edit; cx.notify(); }));
+        draw(cx, handle);
+        let editor = cx.update(|cx| view.read(cx).documents[0].editor.clone());
+        cx.update_window(handle, |_, window, cx| {
+            editor.focus_handle(cx).focus(window, cx);
+            editor.update(cx, |e, cx| e.set_selected_range(0..text.len(), cx));
+        }).unwrap();
+        cx.simulate_keystrokes(handle, key);
+        draw(cx, handle);
+        assert!(open(cx));
+        assert_eq!(cx.update(|cx| editor.read(cx).value().to_string()), "**hello**");
+    }
+
+    #[gpui_kit::test]
+    fn a_locked_page_takes_no_edits(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            bind_view_keys(cx);
+            super::bind_markdown_keys(cx);
+        });
+        let text = "- [ ] task\n\nhello";
+        let (handle, view) = cx.update(|cx| gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+            cx.new(|cx| {
+                let mut app = Enso::new(window, cx);
+                app.add_document(Some(PathBuf::from("locked.md")), text.into(), None, window, cx);
+                app.mode = Mode::Edit;
+                app
+            })
+        }).unwrap());
+        draw(cx, handle);
+        let editor = cx.update(|cx| view.read(cx).documents[0].editor.clone());
+        cx.update_window(handle, |_, window, cx| {
+            editor.focus_handle(cx).focus(window, cx);
+            editor.update(cx, |e, cx| e.set_selected_range(text.len()..text.len(), cx));
+        }).unwrap();
+        cx.update(|cx| view.update(cx, |app, cx| app.toggle_lock(cx)));
+        draw(cx, handle);
+        let value = |cx: &mut TestAppContext| cx.update(|cx| editor.read(cx).value().to_string());
+        // Typing, a formatting shortcut, the reader's checkbox, the slash menu.
+        cx.simulate_input(handle, " more");
+        let bold = if cfg!(target_os = "macos") { "cmd-b" } else { "ctrl-b" };
+        cx.simulate_keystrokes(handle, bold);
+        let id = editor.entity_id();
+        cx.update_window(handle, |_, window, cx| view.update(cx, |app, cx| app.toggle_read_task(id, 2, window, cx))).unwrap();
+        cx.simulate_keystrokes(handle, "enter /");
+        draw(cx, handle);
+        assert_eq!(value(cx), text);
+        assert!(cx.update(|cx| view.read(cx).palette.is_none()));
+        // Unlocked, the same typing lands.
+        cx.update(|cx| view.update(cx, |app, cx| app.toggle_lock(cx)));
+        draw(cx, handle);
+        cx.simulate_input(handle, "!");
+        assert_eq!(value(cx), format!("{text}!"));
+    }
+
+    #[gpui_kit::test]
+    fn clicking_the_reader_moves_the_editor_there(cx: &mut TestAppContext) {
+        use gpui_kit::{Modifiers, VisualTestContext, point};
+        cx.update(|cx| { gpui_kit::init(cx); bind_view_keys(cx); });
+        let mut source = String::new();
+        for n in 0..12 {
+            source.push_str(&format!("## Section {n}\n\nSome words for section {n}.\n\n"));
+        }
+        source.push_str("- one\n- two\n- three\n\n| a | b |\n|---|---|\n| 1 | 2 |\n\n```rust\nfn x() {}\n```\n");
+        let text = source.clone();
+        let (handle, view) = cx.update(|cx| gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+            cx.new(|cx| {
+                let mut app = Enso::new(window, cx);
+                app.add_document(Some(PathBuf::from("click.md")), text, None, window, cx);
+                app
+            })
+        }).unwrap());
+        cx.update_window(handle, |_, window, cx| view.update(cx, |app, cx| app.set_mode(Mode::Split, window, cx))).unwrap();
+        for _ in 0..3 {
+            draw(cx, handle);
+        }
+        // The reader lists one item per top-level block, as the source has.
+        let blocks = super::top_level_blocks(&source);
+        let (count, bounds) = cx.update(|cx| {
+            let app = view.read(cx);
+            let preview = app.documents[0].preview.read(cx);
+            (preview.list_state().item_count(), preview.list_state().bounds_for_item(5))
+        });
+        assert_eq!(count, blocks.len());
+        let bounds = bounds.expect("block 5 is on screen");
+        let mut visual = VisualTestContext::from_window(handle, cx);
+        visual.simulate_click(point(bounds.left() + px(4.), bounds.center().y), Modifiers::default());
+        draw(cx, handle);
+        let cursor = cx.update(|cx| view.read(cx).documents[0].editor.read(cx).cursor());
+        assert_eq!(cursor, blocks[5].start, "caret at {:?}", &source[cursor..cursor + 20]);
+    }
+
+    #[gpui_kit::test]
+    fn the_reader_lists_one_item_per_block_for_the_features_sample(cx: &mut TestAppContext) {
+        cx.update(|cx| { gpui_kit::init(cx); bind_view_keys(cx); });
+        let source = include_str!("../Get Started.md").to_string()
+            + "\n\n> quote\n>\n> > nested\n\n<table><tr><td>x</td></tr></table>\n\n<img src=\"a.png\" width=\"50%\" />\n\nA footnote.[^1]\n\n[^1]: Note.\n[gfm]: https://example.com\n\n$$\nE = mc^2\n$$\n\n```mermaid\nflowchart LR\n  A --> B\n```\n\n- [x] done\n\n---\n";
+        let text = source.clone();
+        let (handle, view) = cx.update(|cx| gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+            cx.new(|cx| {
+                let mut app = Enso::new(window, cx);
+                app.add_document(Some(PathBuf::from("sample.md")), text, None, window, cx);
+                app
+            })
+        }).unwrap());
+        for _ in 0..3 {
+            draw(cx, handle);
+        }
+        let count = cx.update(|cx| view.read(cx).documents[0].preview.read(cx).list_state().item_count());
+        assert_eq!(count, super::top_level_blocks(&source).len());
+    }
+
+    #[gpui_kit::test]
+    fn dragging_tabs_both_ways_including_gaps_and_end_of_strip(cx: &mut TestAppContext) {
+        use gpui_kit::{Modifiers, MouseButton, VisualTestContext, point};
+        cx.update(|cx| { gpui_kit::init(cx); bind_view_keys(cx); });
+        let (handle, view) = cx.update(|cx| gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+            cx.new(|cx| {
+                let mut app = Enso::new(window, cx);
+                for name in ["a.md", "b.md", "c.md"] {
+                    app.add_document(Some(PathBuf::from(name)), String::new(), None, window, cx);
+                }
+                app.active = Some(0);
+                app
+            })
+        }).unwrap());
+        draw(cx, handle);
+        let mut visual = VisualTestContext::from_window(handle, cx);
+        let order = |cx: &mut TestAppContext| cx.update(|cx| {
+            let app = view.read(cx);
+            (app.documents.iter().map(|doc| doc.title()).collect::<Vec<_>>(), app.active)
+        });
+        let mut drag = |from: usize, to: usize, after: bool, cx: &mut TestAppContext| {
+            draw(cx, handle);
+            let selectors = ["file-tab-0", "file-tab-1", "file-tab-2"];
+            let start = visual.debug_bounds(selectors[from]).unwrap().center();
+            let target = visual.debug_bounds(selectors[to]).unwrap();
+            // Test insertion gaps. The strip starts at the first pill's edge.
+            let finish = point(
+                if after { target.right() + px(2.) }
+                else if to == 0 { target.left() + px(2.) }
+                else { target.left() - px(1.) },
+                target.center().y,
+            );
+            visual.simulate_mouse_move(start, None, Modifiers::default());
+            visual.simulate_mouse_down(start, MouseButton::Left, Modifiers::default());
+            visual.simulate_mouse_move(start + point(px(5.), px(0.)), Some(MouseButton::Left), Modifiers::default());
+            draw(cx, handle);
+            visual.simulate_mouse_move(finish, Some(MouseButton::Left), Modifiers::default());
+            draw(cx, handle);
+            visual.simulate_mouse_up(finish, MouseButton::Left, Modifiers::default());
+            draw(cx, handle);
+        };
+        drag(0, 2, true, cx);
+        assert_eq!(order(cx), (vec!["b.md".to_string(), "c.md".to_string(), "a.md".to_string()], Some(2)));
+        drag(2, 0, false, cx);
+        assert_eq!(order(cx), (vec!["a.md".to_string(), "b.md".to_string(), "c.md".to_string()], Some(0)));
+        drag(0, 1, true, cx);
+        assert_eq!(order(cx), (vec!["b.md".to_string(), "a.md".to_string(), "c.md".to_string()], Some(1)));
+        drag(1, 0, false, cx);
+        assert_eq!(order(cx), (vec!["a.md".to_string(), "b.md".to_string(), "c.md".to_string()], Some(0)));
+        // Dropping beside the source is a no-op; dropping outside cancels.
+        drag(0, 0, true, cx);
+        assert_eq!(order(cx), (vec!["a.md".to_string(), "b.md".to_string(), "c.md".to_string()], Some(0)));
+        let start = visual.debug_bounds("file-tab-0").unwrap().center();
+        let outside = point(start.x, start.y + px(80.));
+        visual.simulate_mouse_down(start, MouseButton::Left, Modifiers::default());
+        visual.simulate_mouse_move(start + point(px(5.), px(0.)), Some(MouseButton::Left), Modifiers::default());
+        draw(cx, handle);
+        visual.simulate_mouse_move(outside, Some(MouseButton::Left), Modifiers::default());
+        draw(cx, handle);
+        visual.simulate_mouse_up(outside, MouseButton::Left, Modifiers::default());
+        draw(cx, handle);
+        assert_eq!(order(cx), (vec!["a.md".to_string(), "b.md".to_string(), "c.md".to_string()], Some(0)));
     }
 
     #[gpui_kit::test]

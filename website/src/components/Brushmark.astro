@@ -1,0 +1,109 @@
+---
+import { arc, brush, line, type Point } from "../utils/brush";
+
+/**
+ * Small ink drawings for each part of the page, brushed in code:
+ * an open book (read), one stroke ending in the caret (write), a cairn of stones (keep) and
+ * ripples spreading from a drop (share).
+ */
+interface Props {
+  name: "read" | "write" | "keep" | "share";
+  class?: string;
+}
+const { name, class: className } = Astro.props;
+const id = `bm-${name}`;
+
+type Stroke = { d: string; opacity?: number };
+const strokes: Stroke[] = [];
+const ellipses: { cx: number; cy: number; rx: number; ry: number; rot: number; opacity: number }[] = [];
+let caret: { x: number; y: number } | null = null;
+let drop = false;
+
+const taper = (max: number, min = 0.6, start = 0.7) => (t: number) =>
+  Math.max(min, max * (start + (1 - start) * Math.sin(Math.min(1, t / 0.25) * (Math.PI / 2))) * (t < 0.55 ? 1 : 1 - ((t - 0.55) / 0.45) ** 1.5));
+
+if (name === "write") {
+  strokes.push({ d: brush(line([12, 44], [94, 40], -2.5), { width: taper(9, 0.8, 0.95), bluntStart: true, seed: 3, roughness: 0.6 }) });
+  caret = { x: 104, y: 41 };
+}
+if (name === "read") {
+  // An open book: each page one stroke, from the spine out, down the edge and back in
+  const page = (dir: 1 | -1, seed: number) => {
+    const x = (dx: number) => 60 + dir * dx;
+    const pts: Point[] = [
+      ...line([x(1.5), 24], [x(44), 17], dir * -3.5, 50),
+      ...line([x(44), 17], [x(45), 55], dir * -1, 30).slice(1),
+      ...line([x(45), 55], [x(1.5), 61], dir * 3, 50).slice(1),
+    ];
+    return brush(pts, { width: (t) => Math.max(0.9, 5.4 * (1 - t * 0.72)), seed, roughness: 0.45 });
+  };
+  strokes.push({ d: page(-1, 4) });
+  strokes.push({ d: page(1, 9) });
+  [32, 40, 48].forEach((y, i) => {
+    strokes.push({ d: brush(line([24, y - 1.5], [52, y + 1.5], 1.2, 30), { width: taper(1.7, 0.4), seed: 60 + i, roughness: 0.3 }), opacity: 0.4 });
+    strokes.push({ d: brush(line([68, y + 1.5], [96, y - 1.5], -1.2, 30), { width: taper(1.7, 0.4), seed: 70 + i, roughness: 0.3 }), opacity: 0.4 });
+  });
+}
+if (name === "keep") {
+  ellipses.push({ cx: 60, cy: 60, rx: 28, ry: 8.5, rot: -2, opacity: 0.92 });
+  ellipses.push({ cx: 58, cy: 43.5, rx: 19, ry: 7, rot: 4, opacity: 0.7 });
+  ellipses.push({ cx: 61, cy: 30, rx: 11.5, ry: 5.2, rot: -6, opacity: 0.95 });
+  ellipses.push({ cx: 63, cy: 19.5, rx: 5.5, ry: 3, rot: 3, opacity: 0.55 });
+}
+if (name === "share") {
+  // A drop falling into still water, the ripples spreading out
+  drop = true;
+  [12, 25, 39].forEach((r, i) => {
+    const pts = arc(60, 58, (t) => r * (1 + Math.sin(t * 4 + i) * 0.015), 168 + i * 8, 300 - i * 22, 120).map(
+      ([x, y]) => [x, 58 + (y - 58) * 0.34] as Point
+    );
+    strokes.push({ d: brush(pts, { width: taper(3.6 - i * 0.8, 0.5, 0.55), seed: 20 + i, roughness: 0.45 }), opacity: 1 - i * 0.28 });
+  });
+}
+---
+
+<svg class:list={["brushmark", className]} viewBox="0 0 120 80" aria-hidden="true">
+  <defs>
+    <filter id={`${id}-ink`} x="-10%" y="-20%" width="120%" height="140%">
+      <feTurbulence type="fractalNoise" baseFrequency="0.09" numOctaves="2" seed="4" result="flow" />
+      <feDisplacementMap in="SourceGraphic" in2="flow" scale="2.2" xChannelSelector="R" yChannelSelector="G" />
+    </filter>
+  </defs>
+  <g filter={`url(#${id}-ink)`}>
+    {strokes.map((s) => <path d={s.d} fill="currentColor" opacity={s.opacity ?? 1} />)}
+    {
+      ellipses.map((e) => (
+        <ellipse cx={e.cx} cy={e.cy} rx={e.rx} ry={e.ry} transform={`rotate(${e.rot} ${e.cx} ${e.cy})`} fill="currentColor" opacity={e.opacity} />
+      ))
+    }
+  </g>
+  {drop && <path d="M60 18c-3.4 5.2-5.6 8.6-5.6 11.4a5.6 5.6 0 0 0 11.2 0c0-2.8-2.2-6.2-5.6-11.4Z" fill="currentColor" filter={`url(#${id}-ink)`} />}
+  {caret && <rect class="bm-caret" x={caret.x - 1.6} y={caret.y - 10} width="3.2" height="20" rx="1.6" />}
+</svg>
+
+<style>
+  .brushmark {
+    width: 120px;
+    height: 80px;
+    color: var(--ink);
+    overflow: visible;
+  }
+  .bm-caret {
+    fill: var(--accent);
+    animation: bm-blink 1.25s ease-in-out infinite alternate;
+  }
+  @keyframes bm-blink {
+    0%,
+    35% {
+      opacity: 1;
+    }
+    100% {
+      opacity: 0.15;
+    }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .bm-caret {
+      animation: none;
+    }
+  }
+</style>

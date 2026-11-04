@@ -1,16 +1,81 @@
 [package]
 name = "enso"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2024"
 description = "A quiet, native Markdown workspace"
 license = "MIT"
 
+# Linux packages (scripts/package-linux.sh): a .deb from cargo-deb and an
+# .rpm from cargo-generate-rpm, installing the same files.
+[package.metadata.deb]
+maintainer = "Niraj Khatiwada <nirazzz.nk@gmail.com>"
+copyright = "Niraj Khatiwada"
+section = "editors"
+priority = "optional"
+extended-description = "A reading-first Markdown workspace: read notes as a page, write in plain text, and keep every note an ordinary file."
+# The libraries the binary links, found by dpkg-shlibdeps. Enchant is loaded
+# only if present (spell check), and a Vulkan driver is what draws the window.
+depends = "$auto"
+recommends = "libenchant-2-2, mesa-vulkan-drivers"
+assets = [
+    ["target/release/enso", "usr/bin/", "755"],
+    ["assets/linux/app.enso.markdown.desktop", "usr/share/applications/", "644"],
+    ["assets/linux/48x48/app.enso.markdown.png", "usr/share/icons/hicolor/48x48/apps/", "644"],
+    ["assets/linux/64x64/app.enso.markdown.png", "usr/share/icons/hicolor/64x64/apps/", "644"],
+    ["assets/linux/128x128/app.enso.markdown.png", "usr/share/icons/hicolor/128x128/apps/", "644"],
+    ["assets/linux/256x256/app.enso.markdown.png", "usr/share/icons/hicolor/256x256/apps/", "644"],
+    ["assets/linux/512x512/app.enso.markdown.png", "usr/share/icons/hicolor/512x512/apps/", "644"],
+    ["assets/font-licenses.txt", "usr/share/doc/enso/", "644"],
+]
+
+[package.metadata.generate-rpm]
+summary = "A quiet, native Markdown workspace"
+# Requires the libraries' sonames (libfoo.so.N), which every RPM distro's
+# packages provide whatever they are named.
+auto-req = "builtin"
+assets = [
+    { source = "target/release/enso", dest = "/usr/bin/enso", mode = "755" },
+    { source = "assets/linux/app.enso.markdown.desktop", dest = "/usr/share/applications/app.enso.markdown.desktop", mode = "644" },
+    { source = "assets/linux/48x48/app.enso.markdown.png", dest = "/usr/share/icons/hicolor/48x48/apps/app.enso.markdown.png", mode = "644" },
+    { source = "assets/linux/64x64/app.enso.markdown.png", dest = "/usr/share/icons/hicolor/64x64/apps/app.enso.markdown.png", mode = "644" },
+    { source = "assets/linux/128x128/app.enso.markdown.png", dest = "/usr/share/icons/hicolor/128x128/apps/app.enso.markdown.png", mode = "644" },
+    { source = "assets/linux/256x256/app.enso.markdown.png", dest = "/usr/share/icons/hicolor/256x256/apps/app.enso.markdown.png", mode = "644" },
+    { source = "assets/linux/512x512/app.enso.markdown.png", dest = "/usr/share/icons/hicolor/512x512/apps/app.enso.markdown.png", mode = "644" },
+    { source = "assets/font-licenses.txt", dest = "/usr/share/doc/enso/font-licenses.txt", mode = "644", doc = true },
+]
+
 [dependencies]
 dirs = "6.0.0"
 futures = "0.3"
+chrono = "0.4"
 url = "2"
 gpui-test = { package = "gpui-pre", version = "=0.3.10", features = ["test-support"], optional = true }
 gpui-kit = "0.8.1"
+ropey = "=2.0.0-beta.1"
+# Export: Markdown parsed as the reader parses it, HTML with its images, PDFs
+# laid out by enso itself and written by krilla (text shaped by rustybuzz, in
+# the system's fonts), and HTML on the clipboard for Copy as Rich Text.
+markdown = "1.0.0"
+base64 = "0.22"
+# Already built for GPUI; scales large images down for Copy as Rich Text.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
+arboard = { version = "3.7", default-features = false }
+krilla = { version = "0.8.2", default-features = false, features = ["raster-images", "simple-text"] }
+rustybuzz = "0.20.1"
+fontdb = "0.23"
+memmap2 = "0.9"
+unicode-linebreak = "0.1.5"
+# ```mermaid fences drawn as SVG: a pure-Rust port of Obsidian's Pele, no
+# browser or JavaScript engine.
+bezel-mermaid = "0.2.24"
+# Pictures of diagrams for PDFs and the clipboard: the SVG renderer GPUI
+# already builds, at its version and features.
+resvg = { version = "0.46", default-features = false, features = ["text", "system-fonts"] }
+# Web images: GPUI fetches them through an HTTP client the app installs.
+# The system's TLS and trusted roots (Secure Transport, SChannel, OpenSSL),
+# rather than a bundled TLS stack.
+ureq = { version = "3.5", default-features = false, features = ["native-tls-no-default"] }
+bytes = "1"
 
 # Moving deleted files to the Trash: the trash crate on macOS and Linux;
 # Windows goes through the shell itself (see files::move_to_trash).
@@ -21,13 +86,19 @@ embed-resource = "3"
 [target.'cfg(not(windows))'.dependencies]
 trash = "5"
 
+[target.'cfg(target_os = "linux")'.dependencies]
+libloading = "0.8.9"
+# Rich text on the clipboard under Wayland as well as X11.
+arboard = { version = "3.7", default-features = false, features = ["wayland-data-control"] }
+
 [target.'cfg(windows)'.dependencies]
+windows = { version = "0.62.2", features = ["Win32_Globalization", "Win32_System_Com"] }
 windows-sys = { version = "0.61", features = ["Win32_UI_Shell", "Win32_Foundation"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
-objc2-app-kit = { version = "0.3", default-features = false, features = ["NSApplication", "NSImage"] }
-objc2-foundation = { version = "0.3", default-features = false, features = ["NSData"] }
+objc2-app-kit = { version = "0.3", default-features = false, features = ["NSApplication", "NSImage", "NSSpellChecker"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["NSData", "NSString", "NSArray", "NSRange"] }
 
 [profile.dev]
 debug = 0

@@ -1,9 +1,13 @@
-# Release builds of enso for macOS (Apple silicon), Windows (x64, ARM64) and
-# Linux (x64, ARM64).
+# Release builds of enso for macOS (Apple silicon, Intel), Windows (x64,
+# ARM64) and Linux (x64, ARM64).
+#
+#   macOS    enso-<version>-arm64.dmg, enso-<version>-x64.dmg
+#   Windows  enso-<version>-windows-<arch>-setup.exe (installer) and .zip (portable)
+#   Linux    enso-<version>-linux-<arch>.AppImage, .deb, .rpm and .tar.gz
 #
 # Run it by hand: Actions -> Release -> Run workflow. It builds every package
 # and puts them in a draft GitHub Release for the version in Cargo.toml
-# (v0.1.0 and so on), to check and publish from the Releases page. Running it
+# (v1.0.0 and so on), to check and publish from the Releases page. Running it
 # again for the same version replaces the draft's files.
 name: Release
 
@@ -18,13 +22,29 @@ env:
 
 jobs:
   macos:
-    name: macOS (Apple silicon)
+    name: macOS (${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Apple silicon
+            arch: arm64
+            target: ""
+          # Built on Apple silicon too: Rust and Swift both cross-compile.
+          - name: Intel
+            arch: x64
+            target: x86_64-apple-darwin
     runs-on: macos-15
+    env:
+      ENSO_TARGET: ${{ matrix.target }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
         with:
+          key: ${{ matrix.arch }}
           workspaces: |
             .
             macos/quicklook -> ../../target/quicklook
@@ -33,8 +53,8 @@ jobs:
       - run: ./scripts/build-mac.sh
       - uses: actions/upload-artifact@v4
         with:
-          name: enso-macos-arm64
-          path: target/enso-*.dmg
+          name: enso-macos-${{ matrix.arch }}
+          path: target/enso-*-${{ matrix.arch }}.dmg
           if-no-files-found: error
 
   windows:
@@ -57,6 +77,7 @@ jobs:
       # build.rs embeds the app icon; .cargo/config.toml gives the main
       # thread the 8 MB stack GPUI needs.
       - run: cargo build --release --locked
+      # The portable zip: enso.exe runs from wherever it's unpacked.
       - name: Package
         shell: pwsh
         run: |
@@ -65,11 +86,45 @@ jobs:
           New-Item -ItemType Directory $dir | Out-Null
           Copy-Item target/release/enso.exe "$dir/enso.exe"
           Copy-Item README.md $dir
+          Copy-Item assets/font-licenses.txt $dir
           Compress-Archive -Path $dir -DestinationPath "$dir.zip"
       - uses: actions/upload-artifact@v4
         with:
           name: enso-windows-${{ matrix.arch }}
           path: enso-*-windows-*.zip
+          if-no-files-found: error
+
+  # The installers, made from each architecture's enso.exe on an x64 runner,
+  # where Inno Setup runs (it installs either architecture).
+  windows-installer:
+    name: Windows installers
+    needs: windows
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: enso-windows-*
+          path: zips
+          merge-multiple: true
+      - name: Build the installers
+        shell: pwsh
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { choco install innosetup -y --no-progress | Out-Null }
+          $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"' | Select-Object -First 1).Matches.Groups[1].Value
+          New-Item -ItemType Directory dist | Out-Null
+          foreach ($arch in "x64", "arm64") {
+            $name = "enso-$version-windows-$arch"
+            Expand-Archive "zips/$name.zip" -DestinationPath unpacked
+            & $iscc /Qp "/DVersion=$version" "/DArch=$arch" "/DSource=$PWD\unpacked\$name\enso.exe" "/DOutput=$PWD\dist" installer\windows\enso.iss
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+          Get-ChildItem dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: enso-windows-installers
+          path: dist/*-setup.exe
           if-no-files-found: error
 
   linux:
@@ -79,9 +134,11 @@ jobs:
       matrix:
         include:
           - arch: x64
-            runner: ubuntu-24.04
+            runner: ubuntu-22.04
           - arch: arm64
-            runner: ubuntu-24.04-arm
+            runner: ubuntu-22.04-arm
+    # Built on Ubuntu 22.04 (glibc 2.35), so the binary also runs on older
+    # distros, such as Debian 12 and RHEL 9.
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
@@ -91,44 +148,26 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             pkg-config libfontconfig-dev libfreetype-dev libwayland-dev \
             libxkbcommon-dev libxkbcommon-x11-dev libxcb1-dev libx11-xcb-dev \
-            libvulkan-dev libssl-dev libzstd-dev
+            libvulkan-dev libssl-dev libzstd-dev dpkg-dev file
       - uses: dtolnay/rust-toolchain@stable
+      # Keyed by runner image too: a cache built on another Ubuntu doesn't load.
       - uses: Swatinem/rust-cache@v2
         with:
-          key: ${{ matrix.arch }}
+          key: ${{ matrix.arch }}-${{ matrix.runner }}
+      - name: Packaging tools
+        run: cargo install --locked cargo-deb cargo-generate-rpm
       - run: cargo build --release --locked
-      # The binary, its launcher icon and the script that installs both:
-      # after unpacking, run ./install.sh (or sh install.sh) to add enso to
-      # the app launcher.
-      - name: Package
-        run: |
-          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
-          dir="enso-$version-linux-${{ matrix.arch }}"
-          mkdir -p "$dir/assets" "$dir/scripts"
-          cp target/release/enso "$dir/enso"
-          cp -R assets/linux "$dir/assets/"
-          cp scripts/install-linux.sh "$dir/scripts/"
-          cat > "$dir/install.sh" <<'EOF'
-          #!/bin/sh
-          # Add enso to the app launcher, with its icon, for the current user.
-          # Works as `sh install.sh` too: some archive tools unpack without
-          # the executable bits, so they're restored here.
-          here=$(cd "$(dirname "$0")" && pwd)
-          chmod +x "$here/enso" "$here/scripts/install-linux.sh" "$here/install.sh" 2>/dev/null || true
-          exec sh "$here/scripts/install-linux.sh" "$here/enso"
-          EOF
-          chmod +x "$dir/install.sh" "$dir/enso"
-          cp README.md "$dir/"
-          tar -czf "$dir.tar.gz" "$dir"
+      # AppImage, .deb, .rpm and the .tar.gz with install.sh.
+      - run: ./scripts/package-linux.sh ${{ matrix.arch }} dist
       - uses: actions/upload-artifact@v4
         with:
           name: enso-linux-${{ matrix.arch }}
-          path: enso-*-linux-*.tar.gz
+          path: dist/enso-*-linux-*
           if-no-files-found: error
 
   release:
     name: Draft release
-    needs: [macos, windows, linux]
+    needs: [macos, windows, windows-installer, linux]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -145,6 +184,19 @@ jobs:
           version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
           tag="v$version"
           ls -l dist
+          # The release text: .github/release-template.md, with the version
+          # and its CHANGELOG.md section (### <version> up to the next ###).
+          changelog=$(awk -v v="### $version" '
+            $0 ~ /^### / && !/^#### / { if (found) exit; if ($0 == v) { found = 1; next } }
+            found { print }
+          ' CHANGELOG.md | sed -e '/./,$!d')
+          [ -n "$changelog" ] || changelog="No changelog available"
+          CHANGELOG="$changelog" VERSION="$version" python3 -c '
+          import os, sys
+          text = open(".github/release-template.md").read()
+          text = text.replace("{{version}}", os.environ["VERSION"]).replace("{{changelog}}", os.environ["CHANGELOG"].strip())
+          open("release-notes.md", "w").write(text)
+          '
           if draft=$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft 2>/dev/null); then
             if [ "$draft" != "true" ]; then
               echo "::error::$tag is already published. Bump the version in Cargo.toml for a new release."
@@ -152,6 +204,7 @@ jobs:
             fi
             # Already drafted for this version: refresh its files.
             gh release upload "$tag" dist/* --repo "$GITHUB_REPOSITORY" --clobber
+            gh release edit "$tag" --repo "$GITHUB_REPOSITORY" --notes-file release-notes.md
           else
             # A draft: nothing is public, and the tag is only created on publish.
             gh release create "$tag" dist/* \
@@ -159,5 +212,5 @@ jobs:
               --draft \
               --target "$GITHUB_SHA" \
               --title "enso $tag" \
-              --generate-notes
+              --notes-file release-notes.md
           fi

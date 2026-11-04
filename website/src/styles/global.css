@@ -1,0 +1,272 @@
+@import "tailwindcss";
+
+/*
+ * enso's palette: rice paper and sumi ink, with the logo's orange kept for the caret alone.
+ * Dark is the same page by lamplight: warm ink-black paper, the ink turned to pale chalk.
+ */
+:root {
+  --paper: #f6f4ef;
+  --paper-raised: #fbfaf7;
+  --paper-sunk: #eeebe4;
+  --ink: #1b1a18;
+  --ink-muted: #5d5a54;
+  --ink-soft: #8a867e;
+  --ink-faint: #a9a59c;
+  --line: rgba(27, 26, 24, 0.09);
+  --line-strong: rgba(27, 26, 24, 0.16);
+  --accent: #ff7a45;
+  --accent-ink: #d9531f;
+  --shadow: 0 1px 0 rgba(255, 255, 255, 0.7) inset, 0 30px 80px -30px rgba(40, 32, 20, 0.28),
+    0 12px 28px -18px rgba(40, 32, 20, 0.22);
+  --grain-opacity: 0.05;
+  --grain-blend: multiply;
+
+  --font-display: "Lora", "Iowan Old Style", Georgia, serif;
+  --font-sans: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace;
+
+  --page: 1120px;
+  --gutter: clamp(20px, 5vw, 40px);
+  --ease: cubic-bezier(0.22, 0.7, 0.2, 1);
+  color-scheme: light;
+}
+
+:root[data-theme="dark"] {
+  --paper: #141311;
+  --paper-raised: #1b1a17;
+  --paper-sunk: #0f0e0d;
+  --ink: #ebe7de;
+  --ink-muted: #aaa59b;
+  --ink-soft: #7f7b73;
+  --ink-faint: #5f5c56;
+  --line: rgba(235, 231, 222, 0.08);
+  --line-strong: rgba(235, 231, 222, 0.15);
+  --accent: #ff7a45;
+  --accent-ink: #ff8f61;
+  --shadow: 0 1px 0 rgba(255, 255, 255, 0.04) inset, 0 40px 90px -30px rgba(0, 0, 0, 0.7),
+    0 14px 30px -18px rgba(0, 0, 0, 0.6);
+  --grain-opacity: 0.07;
+  --grain-blend: screen;
+  color-scheme: dark;
+}
+
+@font-face {
+  font-family: "Lora";
+  src: url("/fonts/Lora-Regular.woff2") format("woff2");
+  font-weight: 400;
+  font-display: swap;
+}
+@font-face {
+  font-family: "Lora";
+  src: url("/fonts/Lora-Italic.woff2") format("woff2");
+  font-weight: 400;
+  font-style: italic;
+  font-display: swap;
+}
+@font-face {
+  font-family: "Inter";
+  src: url("/fonts/Inter-Regular.woff2") format("woff2");
+  font-weight: 400;
+  font-display: swap;
+}
+@font-face {
+  font-family: "Inter";
+  src: url("/fonts/Inter-Bold.woff2") format("woff2");
+  font-weight: 600 700;
+  font-display: swap;
+}
+@font-face {
+  font-family: "JetBrains Mono";
+  src: url("/fonts/JetBrainsMono-Regular.woff2") format("woff2");
+  font-weight: 400;
+  font-display: swap;
+}
+@font-face {
+  font-family: "Poppins";
+  src: url("/fonts/Poppins-Regular.woff2") format("woff2");
+  font-weight: 400;
+  font-display: swap;
+}
+@font-face {
+  font-family: "Fira Code";
+  src: url("/fonts/FiraCode-Regular.woff2") format("woff2");
+  font-weight: 400;
+  font-display: swap;
+}
+
+*,
+*::before,
+*::after {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+html {
+  scroll-behavior: smooth;
+  scroll-padding-top: 84px;
+  background: var(--paper);
+}
+
+body {
+  font-family: var(--font-sans);
+  font-size: 16px;
+  line-height: 1.6;
+  letter-spacing: -0.006em;
+  background: var(--paper);
+  color: var(--ink);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
+  overflow-x: hidden;
+  transition: background-color 0.4s var(--ease), color 0.4s var(--ease);
+}
+
+/* Paper grain over everything, so flat fills read as a page */
+body::after {
+  content: "";
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+  pointer-events: none;
+  opacity: var(--grain-opacity);
+  mix-blend-mode: var(--grain-blend);
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='220' height='220'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='3' stitchTiles='stitch'/%3E%3CfeColorMatrix values='0 0 0 0 0.5 0 0 0 0 0.45 0 0 0 0 0.4 0 0 0 1 0'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+}
+
+::selection {
+  background: color-mix(in srgb, var(--accent) 28%, transparent);
+}
+
+a {
+  color: inherit;
+  text-decoration: none;
+}
+
+img,
+svg {
+  display: block;
+}
+
+button {
+  font: inherit;
+  color: inherit;
+  background: none;
+  border: 0;
+  cursor: pointer;
+}
+
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 3px;
+  border-radius: 6px;
+}
+
+.container {
+  width: 100%;
+  max-width: calc(var(--page) + var(--gutter) * 2);
+  margin: 0 auto;
+  padding: 0 var(--gutter);
+}
+
+.display {
+  font-family: var(--font-display);
+  font-weight: 400;
+  letter-spacing: -0.022em;
+  line-height: 1.08;
+}
+
+.eyebrow {
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--ink-soft);
+}
+
+kbd {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 22px;
+  height: 22px;
+  padding: 0 6px;
+  font-family: var(--font-sans);
+  font-size: 12px;
+  line-height: 1;
+  color: var(--ink);
+  background: var(--paper-raised);
+  border: 1px solid var(--line-strong);
+  border-bottom-width: 2px;
+  border-radius: 6px;
+}
+
+/* Buttons: one solid ink, one quiet outline */
+.btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  height: 44px;
+  padding: 0 20px;
+  font-size: 14.5px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  border-radius: 999px;
+  white-space: nowrap;
+  transition:
+    transform 0.3s var(--ease),
+    background-color 0.3s var(--ease),
+    border-color 0.3s var(--ease),
+    color 0.3s var(--ease);
+}
+.btn:active {
+  transform: scale(0.98);
+}
+.btn-ink {
+  color: var(--paper);
+  background: var(--ink);
+}
+.btn-ink:hover {
+  background: color-mix(in srgb, var(--ink) 86%, var(--paper));
+}
+.btn-quiet {
+  color: var(--ink);
+  border: 1px solid var(--line-strong);
+}
+.btn-quiet:hover {
+  border-color: var(--ink-soft);
+}
+.btn-sm {
+  height: 34px;
+  padding: 0 14px;
+  font-size: 13px;
+}
+
+/* Content rises gently into place as it scrolls into view */
+[data-rise] {
+  opacity: 0;
+  transform: translateY(14px);
+  transition:
+    opacity 1.1s var(--ease),
+    transform 1.1s var(--ease);
+  transition-delay: var(--delay, 0s);
+}
+[data-rise].is-in {
+  opacity: 1;
+  transform: none;
+}
+.no-js [data-rise] {
+  opacity: 1;
+  transform: none;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  html {
+    scroll-behavior: auto;
+  }
+  [data-rise] {
+    opacity: 1;
+    transform: none;
+    transition: none;
+  }
+}

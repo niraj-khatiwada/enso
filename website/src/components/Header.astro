@@ -1,0 +1,106 @@
+---
+import Logo from "./Logo.astro";
+import Icon from "./Icon.astro";
+import ThemeToggle from "./ThemeToggle.astro";
+import { REPO_URL } from "../consts";
+---
+
+<header class="site-header" data-scrolled="false">
+  <nav class="nav container">
+    <a href="/" class="brand" aria-label="enso Home">
+      <Logo size={26} />
+      <span>enso</span>
+    </a>
+    <div class="actions">
+      <a href="/changelog" class="text-link">Changelog</a>
+      <a href={REPO_URL} class="icon-link" aria-label="enso on GitHub" title="GitHub">
+        <Icon name="github" size={18} />
+      </a>
+      <ThemeToggle />
+      <a href="/#download" class="btn btn-ink btn-sm">Download</a>
+    </div>
+  </nav>
+</header>
+
+<script is:inline>
+  (() => {
+    const header = document.querySelector(".site-header");
+    const update = () => header?.setAttribute("data-scrolled", String(window.scrollY > 8));
+    update();
+    window.addEventListener("scroll", update, { passive: true });
+  })();
+</script>
+
+<style>
+  .site-header {
+    position: fixed;
+    inset: 0 0 auto;
+    z-index: 50;
+    border-bottom: 1px solid transparent;
+    transition:
+      background-color 0.4s var(--ease),
+      border-color 0.4s var(--ease);
+  }
+  .site-header[data-scrolled="true"] {
+    background: color-mix(in srgb, var(--paper) 78%, transparent);
+    border-color: var(--line);
+    backdrop-filter: saturate(1.4) blur(18px);
+    -webkit-backdrop-filter: saturate(1.4) blur(18px);
+  }
+  .nav {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    height: 64px;
+  }
+  .brand {
+    display: inline-flex;
+    align-items: center;
+    gap: 10px;
+    justify-self: start;
+    font-family: var(--font-display);
+    font-size: 21px;
+    letter-spacing: -0.02em;
+  }
+  .actions {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    justify-self: end;
+  }
+  .text-link {
+    padding: 0 10px;
+    font-size: 13.5px;
+    color: var(--ink-muted);
+    transition: color 0.3s var(--ease);
+  }
+  .text-link:hover {
+    color: var(--ink);
+  }
+  .icon-link {
+    display: grid;
+    place-items: center;
+    width: 34px;
+    height: 34px;
+    border-radius: 999px;
+    color: var(--ink-muted);
+    transition: color 0.3s var(--ease), background-color 0.3s var(--ease);
+  }
+  .icon-link:hover {
+    color: var(--ink);
+    background: var(--line);
+  }
+  .actions .btn {
+    margin-left: 8px;
+  }
+  @media (max-width: 760px) {
+    .nav {
+      height: 58px;
+    }
+  }
+  @media (max-width: 520px) {
+    .text-link {
+      display: none;
+    }
+  }
+</style>

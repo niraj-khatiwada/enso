@@ -1,6 +1,7 @@
 #!/bin/sh
 # The full macOS release: optimized build, enso.app with its Quick Look
 # extension, signing, and a drag-to-Applications disk image.
+# ENSO_TARGET=x86_64-apple-darwin builds it for Intel Macs (see bundle-macos.sh).
 set -eu
 cd "$(dirname "$0")/.."
 
@@ -9,7 +10,11 @@ step() {
 }
 
 version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
-arch=$(uname -m)
+# Named like the other packages: arm64 for Apple silicon, x64 for Intel.
+case "${ENSO_TARGET:-$(uname -m)}" in
+    x86_64*) arch=x64 ;;
+    *) arch=arm64 ;;
+esac
 app="$PWD/target/enso.app"
 dmg="$PWD/target/enso-$version-$arch.dmg"
 

@@ -38,8 +38,23 @@ impl Appearance {
 
 pub struct Preferences {
     pub appearance: Appearance,
+    pub reading: crate::typography::ReadingStyle,
+    pub(crate) reading_path: Option<PathBuf>,
     /// Show line numbers beside the editor's text.
     pub line_numbers: bool,
+    pub document_outline: bool,
+    pub spell_check: bool,
+    /// Load images from the web (`https://…`) in notes.
+    pub web_images: bool,
+    /// Ask before a file or folder goes to the Trash.
+    pub confirm_delete: bool,
+    /// Split view puts the reader on the left and the editor on the right.
+    pub reader_first: bool,
+    pub(crate) split_order_path: Option<PathBuf>,
+    /// The sidebar is open; every window and workspace opens it this way.
+    pub sidebar_open: bool,
+    /// Ask GitHub once a day whether a newer enso is out.
+    pub check_updates: bool,
     window: Option<AnyWindowHandle>,
     path: Option<PathBuf>,
 }
@@ -53,6 +68,153 @@ fn path() -> Option<PathBuf> {
 fn line_numbers_path() -> Option<PathBuf> {
     dirs::config_dir().map(|p| crate::files::app_folder(p).join("line-numbers"))
 }
+fn document_outline_path() -> Option<PathBuf> {
+    dirs::config_dir().map(|p| crate::files::app_folder(p).join("document-outline"))
+}
+fn load_document_outline(path: &Path) -> bool {
+    std::fs::read_to_string(path).map_or(true, |value| value.trim() != "off")
+}
+fn web_images_path() -> Option<PathBuf> {
+    dirs::config_dir().map(|p| crate::files::app_folder(p).join("web-images"))
+}
+pub fn web_images(cx: &App) -> bool {
+    cx.try_global::<Preferences>().is_none_or(|p| p.web_images)
+}
+/// Whether notes load images from the web. Off, no image request leaves the
+/// app; images already shown stay until the note is reopened.
+fn set_web_images(on: bool, cx: &mut App) -> io::Result<()> {
+    if !cx.has_global::<Preferences>() { init(cx); }
+    cx.update_global::<Preferences, _>(|prefs, _| prefs.web_images = on);
+    crate::http::set_enabled(on);
+    if let Some(path) = web_images_path() {
+        if let Some(parent) = path.parent() { std::fs::create_dir_all(parent)?; }
+        std::fs::write(path, if on { "on" } else { "off" })?;
+    }
+    Ok(())
+}
+fn confirm_delete_path() -> Option<PathBuf> {
+    dirs::config_dir().map(|p| crate::files::app_folder(p).join("confirm-delete"))
+}
+pub fn confirm_delete(cx: &App) -> bool {
+    cx.try_global::<Preferences>().is_none_or(|p| p.confirm_delete)
+}
+fn set_confirm_delete(on: bool, cx: &mut App) -> io::Result<()> {
+    if !cx.has_global::<Preferences>() { init(cx); }
+    cx.update_global::<Preferences, _>(|prefs, _| prefs.confirm_delete = on);
+    if let Some(path) = confirm_delete_path() {
+        if let Some(parent) = path.parent() { std::fs::create_dir_all(parent)?; }
+        std::fs::write(path, if on { "on" } else { "off" })?;
+    }
+    Ok(())
+}
+fn check_updates_path() -> Option<PathBuf> {
+    dirs::config_dir().map(|p| crate::files::app_folder(p).join("check-for-updates"))
+}
+/// Whether enso looks for a newer release on launch; on unless turned off.
+pub fn check_updates(cx: &App) -> bool {
+    cx.try_global::<Preferences>().is_none_or(|p| p.check_updates)
+}
+fn set_check_updates(on: bool, cx: &mut App) -> io::Result<()> {
+    // Tests mustn't change the real preference.
+    if cfg!(test) { return Ok(()); }
+    if !cx.has_global::<Preferences>() { init(cx); }
+    cx.update_global::<Preferences, _>(|prefs, _| prefs.check_updates = on);
+    if let Some(path) = check_updates_path() {
+        if let Some(parent) = path.parent() { std::fs::create_dir_all(parent)?; }
+        std::fs::write(path, if on { "on" } else { "off" })?;
+    }
+    Ok(())
+}
+fn spell_check_path() -> Option<PathBuf> {
+    dirs::config_dir().map(|p| crate::files::app_folder(p).join("spell-check"))
+}
+pub fn spell_check(cx: &App) -> bool {
+    cx.try_global::<Preferences>().is_none_or(|p| p.spell_check)
+}
+fn set_spell_check(on: bool, cx: &mut App) -> io::Result<()> {
+    if !cx.has_global::<Preferences>() { init(cx); }
+    cx.update_global::<Preferences, _>(|prefs, _| prefs.spell_check = on);
+    if let Some(path) = spell_check_path() {
+        if let Some(parent) = path.parent() { std::fs::create_dir_all(parent)?; }
+        std::fs::write(path, if on { "on" } else { "off" })?;
+    }
+    Ok(())
+}
+pub fn document_outline(cx: &App) -> bool {
+    cx.try_global::<Preferences>().is_none_or(|p| p.document_outline)
+}
+fn set_document_outline(on: bool, cx: &mut App) -> io::Result<()> {
+    if !cx.has_global::<Preferences>() { init(cx); }
+    cx.update_global::<Preferences, _>(|prefs, _| prefs.document_outline = on);
+    if let Some(path) = document_outline_path() {
+        if let Some(parent) = path.parent() { std::fs::create_dir_all(parent)?; }
+        std::fs::write(path, if on { "on" } else { "off" })?;
+    }
+    Ok(())
+}
+fn sidebar_path() -> Option<PathBuf> {
+    dirs::config_dir().map(|p| crate::files::app_folder(p).join("sidebar"))
+}
+fn load_sidebar_open(path: &Path) -> bool {
+    std::fs::read_to_string(path).map_or(true, |value| value.trim() != "closed")
+}
+
+/// Whether windows open with the sidebar shown: open unless last collapsed.
+pub fn sidebar_open(cx: &App) -> bool {
+    cx.try_global::<Preferences>().is_none_or(|p| p.sidebar_open)
+}
+
+/// Remember the sidebar as open or collapsed, for every window and session.
+pub fn set_sidebar_open(open: bool, cx: &mut App) -> io::Result<()> {
+    // Tests toggle the sidebar too, and mustn't change the real preference.
+    if cfg!(test) {
+        return Ok(());
+    }
+    if !cx.has_global::<Preferences>() {
+        init(cx);
+    }
+    if cx.global::<Preferences>().sidebar_open == open {
+        return Ok(());
+    }
+    cx.update_global::<Preferences, _>(|prefs, _| prefs.sidebar_open = open);
+    if let Some(path) = sidebar_path() {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(path, if open { "open" } else { "closed" })?;
+    }
+    Ok(())
+}
+
+fn split_order_path() -> Option<PathBuf> {
+    dirs::config_dir().map(|p| crate::files::app_folder(p).join("split-order"))
+}
+fn load_reader_first(path: &Path) -> bool {
+    std::fs::read_to_string(path).is_ok_and(|value| value.trim() == "reader-first")
+}
+
+/// Whether split view shows the reader on the left; the editor leads unless
+/// the user swapped them.
+pub fn reader_first(cx: &App) -> bool {
+    cx.try_global::<Preferences>()
+        .is_some_and(|p| p.reader_first)
+}
+
+/// Swap the split view's sides in every window, and remember it.
+pub fn set_reader_first(on: bool, cx: &mut App) -> io::Result<()> {
+    if !cx.has_global::<Preferences>() {
+        init(cx);
+    }
+    cx.update_global::<Preferences, _>(|prefs, _| prefs.reader_first = on);
+    if let Some(path) = cx.global::<Preferences>().split_order_path.clone() {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(path, if on { "reader-first" } else { "editor-first" })?;
+    }
+    Ok(())
+}
+
 fn load_line_numbers(path: &Path) -> bool {
     std::fs::read_to_string(path).is_ok_and(|value| value.trim() == "on")
 }
@@ -88,9 +250,31 @@ pub fn init(cx: &mut App) {
     let path = path();
     let appearance = path.as_ref().map(|p| load(p)).unwrap_or_default();
     let line_numbers = line_numbers_path().as_deref().is_some_and(load_line_numbers);
+    let document_outline = document_outline_path().as_deref().is_none_or(load_document_outline);
+    let spell_check = spell_check_path().as_deref().is_none_or(load_document_outline);
+    let web_images = web_images_path().as_deref().is_none_or(load_document_outline);
+    crate::http::set_enabled(web_images);
+    let confirm_delete = confirm_delete_path().as_deref().is_none_or(load_document_outline);
+    let split_order_path = split_order_path();
+    let reader_first = split_order_path.as_deref().is_some_and(load_reader_first);
+    let sidebar_open = sidebar_path().as_deref().is_none_or(load_sidebar_open);
+    let check_updates = check_updates_path().as_deref().is_none_or(load_document_outline);
+    let reading_path = crate::typography::preference_path();
+    let reading = reading_path.as_deref()
+        .map(crate::typography::ReadingStyle::load).unwrap_or_default();
     cx.set_global(Preferences {
         appearance,
+        reading,
+        reading_path,
         line_numbers,
+        document_outline,
+        spell_check,
+        web_images,
+        confirm_delete,
+        reader_first,
+        split_order_path,
+        sidebar_open,
+        check_updates,
         window: None,
         path,
     });
@@ -142,7 +326,25 @@ fn blend_gutter(cx: &mut App) {
 /// on every change, so this runs again after each one.
 fn tune_theme(cx: &mut App) {
     blend_gutter(cx);
+    tone_surfaces(cx);
     thin_scrollbars(cx);
+}
+
+/// Floating surfaces stay opaque so document text never shows through them.
+/// Use softer neutral tones instead of pure black and white. In dark mode the
+/// surface stays close to the window's own neutral dark; its border and
+/// shadow (`ui::SurfaceExt`) lift it, not a lighter, bluer fill.
+fn tone_surfaces(cx: &mut App) {
+    let theme = Theme::global_mut(cx);
+    let surface: Hsla = if theme.mode.is_dark() { rgb(0x1f1f1f).into() } else { rgb(0xf5f5f3).into() };
+    theme.popover = surface;
+    theme.tokens.popover = surface.into();
+    // The highlighted row in menus and the command palette. The kit's own
+    // accent is a near-white in light mode, invisible on the surface above,
+    // so it's set a clear step away from that surface instead.
+    let accent: Hsla = if theme.mode.is_dark() { rgb(0x2e2e2e).into() } else { rgb(0xe6e6e3).into() };
+    theme.accent = accent;
+    theme.tokens.accent = accent.into();
 }
 
 /// Hairline scrollbar thumbs, a little wider while hovered or dragged. The kit's
@@ -251,9 +453,10 @@ pub fn open(cx: &mut App) {
                 focus.focus(window, cx);
                 SettingsWindow {
                     focus,
-                    category: Category::Appearance,
+                    category: Category::General,
                     error: None,
                     _appearance: watch_system(window),
+                    _preferences: cx.observe_global::<Preferences>(|_, cx| cx.notify()),
                 }
             })
         },
@@ -265,15 +468,17 @@ pub fn open(cx: &mut App) {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Category {
+    General,
     Appearance,
     Editor,
 }
 
 impl Category {
-    const ALL: [Category; 2] = [Category::Appearance, Category::Editor];
+    const ALL: [Category; 3] = [Category::General, Category::Appearance, Category::Editor];
 
     fn label(self) -> &'static str {
         match self {
+            Self::General => "General",
             Self::Appearance => "Appearance",
             Self::Editor => "Editor",
         }
@@ -281,6 +486,7 @@ impl Category {
 
     fn icon(self) -> IconName {
         match self {
+            Self::General => IconName::Settings,
             Self::Appearance => IconName::Palette,
             Self::Editor => IconName::Pencil,
         }
@@ -292,6 +498,7 @@ struct SettingsWindow {
     category: Category,
     error: Option<String>,
     _appearance: Subscription,
+    _preferences: Subscription,
 }
 
 fn preview(appearance: Appearance) -> impl IntoElement {
@@ -342,6 +549,27 @@ fn page_header(title: &'static str, description: &'static str, muted: Hsla) -> i
 }
 
 impl SettingsWindow {
+    fn general_page(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme().clone();
+        let weak = cx.entity().downgrade();
+        v_flex()
+            .gap_6()
+            .child(page_header("General", "How enso behaves on this device.", theme.muted_foreground))
+            .child(
+                h_flex().gap_4().items_center().justify_between().py_3()
+                    .child(v_flex().gap_0p5()
+                        .child(div().text_sm().font_weight(FontWeight::MEDIUM).child("Check for Updates"))
+                        .child(div().text_xs().text_color(theme.muted_foreground).child(
+                            "Once a day, ask GitHub whether a newer enso is out. Nothing downloads on its own.")))
+                    .child(Switch::new("check-updates").checked(check_updates(cx))
+                        .accessibility_label("Check for Updates")
+                        .on_change(move |on, _, cx| {
+                            let error = set_check_updates(*on, cx).err().map(|e| format!("Could not save general settings: {e}"));
+                            let _ = weak.update(cx, |this, cx| { this.error = error; cx.notify(); });
+                        })),
+            )
+    }
+
     fn appearance_page(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
         let selected = current(cx);
@@ -406,11 +634,37 @@ impl SettingsWindow {
                         ),
                     ),
             )
+            .child({
+                use crate::typography::{ReadingFont, current, set};
+                let reading = current(cx);
+                v_flex().gap_3()
+                    .child(div().text_sm().font_weight(FontWeight::MEDIUM).child("Font Style"))
+                    .child(v_flex().gap_2().children(ReadingFont::ALL.chunks(3).enumerate().map(|(row, fonts)| {
+                        h_flex().gap_2().children(fonts.iter().copied().enumerate().map(|(col, font)| {
+                            let selected = font == reading.font;
+                            Button::new(("reading-font-card", row * 3 + col)).ghost()
+                                .flex_1().min_w_0().h(px(82.)).p_2()
+                                .border_1().border_color(if selected { theme.primary } else { theme.border })
+                                .when(selected, |b| b.bg(theme.secondary))
+                                .accessibility_label(format!("{} reading font", font.name()))
+                                .child(v_flex().gap_1().items_start().w_full()
+                                    .child(div().font_family(font.family(cx)).text_size(px(24.)).child("Aa"))
+                                    .child(div().text_xs().child(font.name())))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.error = set(crate::typography::ReadingStyle { font, ..current(cx) }, true, cx)
+                                        .err().map(|e| format!("Could not save reading font: {e}"));
+                                    cx.notify();
+                                }))
+                        }))
+                    })))
+            })
     }
 
     fn editor_page(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
         let line_numbers = line_numbers(cx);
+        let outline = document_outline(cx);
+        let outline_weak = cx.entity().downgrade();
         let weak = cx.entity().downgrade();
         v_flex()
             .gap_6()
@@ -419,6 +673,22 @@ impl SettingsWindow {
                 "How the writing pane looks while you edit.",
                 theme.muted_foreground,
             ))
+            .child({
+                let weak = cx.entity().downgrade();
+                h_flex().gap_4().items_center().justify_between().py_3()
+                    .border_b_1().border_color(theme.border)
+                    .child(v_flex().gap_0p5()
+                        .child(div().text_sm().font_weight(FontWeight::MEDIUM).child("Spell Check"))
+                        .child(div().text_xs().text_color(theme.muted_foreground).child(
+                            if cfg!(target_os = "linux") { "Underline misspellings using Enchant and your system dictionaries." }
+                            else { "Underline misspellings using your system’s spelling service." })))
+                    .child(Switch::new("spell-check").checked(spell_check(cx))
+                        .accessibility_label("Spell Check")
+                        .on_change(move |on, _, cx| {
+                            let error = set_spell_check(*on, cx).err().map(|e| format!("Could not save spell check: {e}"));
+                            let _ = weak.update(cx, |this, cx| { this.error = error; cx.notify(); });
+                        }))
+            })
             .child(
                 h_flex()
                     .gap_4()
@@ -453,6 +723,44 @@ impl SettingsWindow {
                             }),
                     ),
             )
+            .child(
+                h_flex().gap_4().items_center().justify_between().py_3()
+                    .border_b_1().border_color(theme.border)
+                    .child(v_flex().gap_0p5()
+                        .child(div().text_sm().font_weight(FontWeight::MEDIUM).child("Document Outline"))
+                        .child(div().text_xs().text_color(theme.muted_foreground).child("Show the section navigation rail beside Markdown documents.")))
+                    .child(Switch::new("document-outline").checked(outline).accessibility_label("Document Outline")
+                        .on_change(move |on,_,cx| {
+                            let error=set_document_outline(*on,cx).err().map(|e|format!("Could not save editor settings: {e}"));
+                            let _=outline_weak.update(cx,|this,cx|{this.error=error;cx.notify();});
+                        }))
+            )
+            .child({
+                let weak = cx.entity().downgrade();
+                h_flex().gap_4().items_center().justify_between().py_3()
+                    .border_b_1().border_color(theme.border)
+                    .child(v_flex().gap_0p5()
+                        .child(div().text_sm().font_weight(FontWeight::MEDIUM).child("Load Web Images"))
+                        .child(div().text_xs().text_color(theme.muted_foreground).child(
+                            "Show images hosted on the web. Off, notes never contact the sites their images come from.")))
+                    .child(Switch::new("web-images").checked(web_images(cx))
+                        .accessibility_label("Load Web Images")
+                        .on_change(move |on, _, cx| {
+                            let error = set_web_images(*on, cx).err().map(|e| format!("Could not save editor settings: {e}"));
+                            let _ = weak.update(cx, |this, cx| { this.error = error; cx.notify(); });
+                        }))
+            })
+            .child({
+                let weak = cx.entity().downgrade();
+                h_flex().gap_4().items_center().justify_between().py_3()
+                    .child(div().text_sm().font_weight(FontWeight::MEDIUM).child("Confirm Before Deleting Files & Folders"))
+                    .child(Switch::new("confirm-delete").checked(confirm_delete(cx))
+                        .accessibility_label("Confirm Before Deleting Files & Folders")
+                        .on_change(move |on, _, cx| {
+                            let error = set_confirm_delete(*on, cx).err().map(|e| format!("Could not save editor settings: {e}"));
+                            let _ = weak.update(cx, |this, cx| { this.error = error; cx.notify(); });
+                        }))
+            })
     }
 }
 
@@ -461,6 +769,7 @@ impl Render for SettingsWindow {
         let theme = cx.theme().clone();
         let category = self.category;
         let page = match category {
+            Category::General => self.general_page(cx).into_any_element(),
             Category::Appearance => self.appearance_page(cx).into_any_element(),
             Category::Editor => self.editor_page(cx).into_any_element(),
         };
@@ -527,11 +836,14 @@ impl Render for SettingsWindow {
                     )
                     .child(
                         v_flex()
+                            .id("settings-page")
                             .flex_1()
                             .min_w_0()
+                            .h_full()
+                            .overflow_y_scroll()
                             .p_8()
                             .gap_6()
-                            .child(page)
+                            .child(div().flex_shrink_0().child(page))
                             .when_some(self.error.clone(), |page, error| {
                                 page.child(div().text_xs().text_color(theme.danger).child(error))
                             }),
@@ -542,6 +854,17 @@ impl Render for SettingsWindow {
 
 #[cfg(test)]
 mod tests {
+    #[::core::prelude::v1::test]
+    fn outline_defaults_on_and_remembers_saved_choice() {
+        let path=std::env::temp_dir().join(format!("enso-outline-setting-{}",std::process::id()));
+        let _=std::fs::remove_file(&path);
+        assert!(super::load_document_outline(&path));
+        std::fs::write(&path,"off").unwrap();
+        assert!(!super::load_document_outline(&path));
+        std::fs::write(&path,"on").unwrap();
+        assert!(super::load_document_outline(&path));
+        std::fs::remove_file(path).unwrap();
+    }
     #[::core::prelude::v1::test]
     fn appearance_values_round_trip() {
         use super::Appearance;
