@@ -1,6 +1,6 @@
 use gpui_kit::assets::IconName;
 use gpui_kit::component::{
-    ActiveTheme, Theme, ThemeMode, ThemeRegistry, TitleBar,
+    ActiveTheme, Sizable, Disableable, Theme, ThemeMode, ThemeRegistry, TitleBar,
     button::{Button, ButtonVariants},
     h_flex,
     switch::Switch,
@@ -453,8 +453,11 @@ pub fn open(cx: &mut App) {
                 focus.focus(window, cx);
                 SettingsWindow {
                     focus,
-                    category: Category::General,
+                    category: Category::Appearance,
                     error: None,
+                    update_status: "Check whether a newer version is available.".into(),
+                    checking_update: false,
+                    release_url: None,
                     _appearance: watch_system(window),
                     _preferences: cx.observe_global::<Preferences>(|_, cx| cx.notify()),
                 }
@@ -468,27 +471,27 @@ pub fn open(cx: &mut App) {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Category {
-    General,
     Appearance,
     Editor,
+    About,
 }
 
 impl Category {
-    const ALL: [Category; 3] = [Category::General, Category::Appearance, Category::Editor];
+    const ALL: [Category; 3] = [Category::Appearance, Category::Editor, Category::About];
 
     fn label(self) -> &'static str {
         match self {
-            Self::General => "General",
             Self::Appearance => "Appearance",
             Self::Editor => "Editor",
+            Self::About => "About",
         }
     }
 
     fn icon(self) -> IconName {
         match self {
-            Self::General => IconName::Settings,
             Self::Appearance => IconName::Palette,
             Self::Editor => IconName::Pencil,
+            Self::About => IconName::Info,
         }
     }
 }
@@ -497,6 +500,9 @@ struct SettingsWindow {
     focus: FocusHandle,
     category: Category,
     error: Option<String>,
+    update_status: String,
+    checking_update: bool,
+    release_url: Option<String>,
     _appearance: Subscription,
     _preferences: Subscription,
 }
@@ -549,37 +555,84 @@ fn page_header(title: &'static str, description: &'static str, muted: Hsla) -> i
 }
 
 impl SettingsWindow {
-    fn general_page(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn check_for_updates(&mut self, cx: &mut Context<Self>) {
+        if self.checking_update { return; }
+        self.checking_update = true;
+        self.release_url = None;
+        self.update_status = "Checking for updates…".into();
+        cx.notify();
+        let task = cx.background_executor().spawn(async { crate::update::check_with_status() });
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            let _ = this.update(cx, |this, cx| {
+                this.checking_update = false;
+                match result {
+                    Ok(Some(release)) => {
+                        this.update_status = format!("Version {} is available.", release.version);
+                        this.release_url = Some(release.url);
+                    }
+                    Ok(None) => this.update_status = "You are on the latest version.".into(),
+                    Err(error) => this.update_status = error,
+                }
+                cx.notify();
+            });
+        }).detach();
+    }
+
+    fn about_page(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
+        let row = |title: String, description: String, action: AnyElement| {
+            h_flex().w_full().gap_4().items_center().justify_between().py_4()
+                .border_b_1().border_color(theme.border)
+                .child(v_flex().flex_1().min_w_0().gap_1()
+                    .child(div().text_sm().font_weight(FontWeight::MEDIUM).child(title))
+                    .child(div().text_xs().text_color(theme.muted_foreground).child(description)))
+                .child(div().flex_shrink_0().child(action))
+        };
+        let link = |id: &'static str, label: &'static str, url: &'static str| {
+            Button::new(id).ghost().small().label(label).icon(IconName::ExternalLink)
+                .on_click(move |_, _, cx| cx.open_url(url)).into_any_element()
+        };
         let weak = cx.entity().downgrade();
-        v_flex()
-            .gap_6()
-            .child(page_header("General", "How enso behaves on this device.", theme.muted_foreground))
-            .child(
-                h_flex().gap_4().items_center().justify_between().py_3()
-                    .border_b_1().border_color(theme.border)
-                    .child(v_flex().gap_0p5()
-                        .child(div().text_sm().font_weight(FontWeight::MEDIUM).child("Check for Updates"))
-                        .child(div().text_xs().text_color(theme.muted_foreground).child(
-                            "Once a day, ask GitHub whether a newer enso is out. Nothing downloads on its own.")))
-                    .child(Switch::new("check-updates").checked(check_updates(cx))
-                        .accessibility_label("Check for Updates")
+        v_flex().w_full().gap_6()
+            .child(h_flex().gap_4().items_center().pb_2()
+                .child(crate::brand::logo(56., cx))
+                .child(v_flex().gap_1()
+                    .child(div().text_size(px(30.)).font_weight(FontWeight::SEMIBOLD).child("enso"))
+                    .child(div().text_sm().text_color(theme.muted_foreground)
+                        .child(env!("CARGO_PKG_DESCRIPTION")))))
+            .child(v_flex().w_full()
+                .child(div().text_lg().font_weight(FontWeight::SEMIBOLD).child("About"))
+                .child(row(format!("Version {}", env!("CARGO_PKG_VERSION")), self.update_status.clone(),
+                    Button::new("check-update-now").small()
+                        .label(if self.checking_update { "Checking…" } else { "Check for updates" })
+                        .disabled(self.checking_update)
+                        .on_click(cx.listener(|this, _, _, cx| this.check_for_updates(cx)))
+                        .into_any_element()))
+                .when_some(self.release_url.clone(), |page, url| page.child(
+                    Button::new("open-new-release").small().label("View latest release")
+                        .icon(IconName::ExternalLink).mt_2()
+                        .on_click(move |_, _, cx| cx.open_url(&url))))
+                .child(row("Check automatically for updates".into(),
+                    "Check once a day. Nothing downloads on its own.".into(),
+                    Switch::new("check-updates").checked(check_updates(cx))
+                        .accessibility_label("Check automatically for updates")
                         .on_change(move |on, _, cx| {
-                            let error = set_check_updates(*on, cx).err().map(|e| format!("Could not save general settings: {e}"));
+                            let error = set_check_updates(*on, cx).err()
+                                .map(|e| format!("Could not save update settings: {e}"));
                             let _ = weak.update(cx, |this, cx| { this.error = error; cx.notify(); });
-                        })),
-            )
-            .child({
-                let weak = cx.entity().downgrade();
-                h_flex().gap_4().items_center().justify_between().py_3()
-                    .child(div().text_sm().font_weight(FontWeight::MEDIUM).child("Confirm Before Deleting Files & Folders"))
-                    .child(Switch::new("confirm-delete").checked(confirm_delete(cx))
-                        .accessibility_label("Confirm Before Deleting Files & Folders")
-                        .on_change(move |on, _, cx| {
-                            let error = set_confirm_delete(*on, cx).err().map(|e| format!("Could not save general settings: {e}"));
-                            let _ = weak.update(cx, |this, cx| { this.error = error; cx.notify(); });
-                        }))
-            })
+                        }).into_any_element()))
+                .child(row("Changelog".into(), "What’s new in every version of enso.".into(),
+                    link("about-changelog", "View changelog", "https://github.com/niraj-khatiwada/enso/releases")))
+                .child(row("Website".into(), "Downloads, features and documentation.".into(),
+                    link("about-website", "enso.codeforreal.com", "https://enso.codeforreal.com")))
+                .child(row("Free and open-source".into(), "Licensed under MIT.".into(),
+                    link("about-github", "GitHub", "https://github.com/niraj-khatiwada/enso"))))
+            .child(h_flex().gap_1().flex_wrap().text_xs().text_color(theme.muted_foreground)
+                .child("Made with care in public by")
+                .child(Button::new("about-code-for-real").link().small()
+                    .label("Code For Real")
+                    .on_click(|_, _, cx| cx.open_url("https://codeforreal.com"))))
     }
 
     fn appearance_page(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -761,6 +814,17 @@ impl SettingsWindow {
                             let _ = weak.update(cx, |this, cx| { this.error = error; cx.notify(); });
                         }))
             })
+            .child({
+                let weak = cx.entity().downgrade();
+                h_flex().gap_4().items_center().justify_between().py_3()
+                    .child(div().text_sm().font_weight(FontWeight::MEDIUM).child("Confirm Before Deleting Files & Folders"))
+                    .child(Switch::new("confirm-delete").checked(confirm_delete(cx))
+                        .accessibility_label("Confirm Before Deleting Files & Folders")
+                        .on_change(move |on, _, cx| {
+                            let error = set_confirm_delete(*on, cx).err().map(|e| format!("Could not save editor settings: {e}"));
+                            let _ = weak.update(cx, |this, cx| { this.error = error; cx.notify(); });
+                        }))
+            })
     }
 }
 
@@ -769,9 +833,9 @@ impl Render for SettingsWindow {
         let theme = cx.theme().clone();
         let category = self.category;
         let page = match category {
-            Category::General => self.general_page(cx).into_any_element(),
             Category::Appearance => self.appearance_page(cx).into_any_element(),
             Category::Editor => self.editor_page(cx).into_any_element(),
+            Category::About => self.about_page(cx).into_any_element(),
         };
         v_flex()
             .id("settings-window")

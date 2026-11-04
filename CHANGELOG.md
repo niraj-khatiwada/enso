@@ -1,5 +1,19 @@
 # Changelog
 
+### 1.2.0
+
+Features:
+
+- **About Settings**: A new About section shows enso’s version, a manual update check, and links to the changelog, website, GitHub and Code For Real. Update checks show whether a newer release is available, the app is current, or the request failed.
+
+Enhancements:
+
+- Automatic update checking now lives in Settings › About. Manual checks work even when automatic checks are off; nothing downloads or installs on its own.
+- Removed the General section. Settings opens to Appearance, and Confirm Before Deleting Files & Folders now lives in Editor.
+- First launch opens the clean empty view without creating or opening a Get Started note.
+- Download buttons on the website show file extensions without package sizes, including in tooltips.
+- The About tagline and website copy use lowercase “markdown” consistently.
+
 ### 1.1.0
 
 Features:

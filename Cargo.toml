@@ -2,7 +2,7 @@
 name = "enso"
 version = "1.1.0"
 edition = "2024"
-description = "A quiet, native Markdown workspace"
+description = "A quiet, native markdown workspace"
 license = "MIT"
 
 # Linux packages (scripts/package-linux.sh): a .deb from cargo-deb and an
@@ -12,7 +12,7 @@ maintainer = "Niraj Khatiwada <nirazzz.nk@gmail.com>"
 copyright = "Niraj Khatiwada"
 section = "editors"
 priority = "optional"
-extended-description = "A reading-first Markdown workspace: read notes as a page, write in plain text, and keep every note an ordinary file."
+extended-description = "A reading-first markdown workspace: read notes as a page, write in plain text, and keep every note an ordinary file."
 # The libraries the binary links, found by dpkg-shlibdeps. Enchant is loaded
 # only if present (spell check), and a Vulkan driver is what draws the window.
 depends = "$auto"
@@ -29,7 +29,7 @@ assets = [
 ]
 
 [package.metadata.generate-rpm]
-summary = "A quiet, native Markdown workspace"
+summary = "A quiet, native markdown workspace"
 # Requires the libraries' sonames (libfoo.so.N), which every RPM distro's
 # packages provide whatever they are named.
 auto-req = "builtin"

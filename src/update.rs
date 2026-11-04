@@ -39,18 +39,25 @@ pub fn due() -> bool {
 /// `None` when this build is current or anything went wrong; a failed check
 /// is tried again on the next launch.
 pub fn check() -> Option<Release> {
-    let reply = crate::http::get_text(LATEST, "application/vnd.github+json").ok()?;
-    let tag = tag_name(&reply)?;
+    check_with_status().ok().flatten()
+}
+
+/// A manual check distinguishes a current build from a failed request.
+pub fn check_with_status() -> Result<Option<Release>, String> {
+    let reply = crate::http::get_text(LATEST, "application/vnd.github+json")
+        .map_err(|_| "Could not check for updates. Please try again.".to_string())?;
+    let tag = tag_name(&reply).filter(|tag| parse(tag).is_some())
+        .ok_or_else(|| "The update service returned an unrecognized version.".to_string())?;
     if let Some(path) = stamp_path() {
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
         let _ = std::fs::write(path, now().to_string());
     }
-    newer(&tag, env!("CARGO_PKG_VERSION")).then(|| Release {
+    Ok(newer(&tag, env!("CARGO_PKG_VERSION")).then(|| Release {
         version: tag.trim_start_matches('v').to_string(),
         url: format!("{RELEASES}{tag}"),
-    })
+    }))
 }
 
 /// The `"tag_name"` of a GitHub release reply, without pulling in a JSON

@@ -20,7 +20,7 @@ const source: { text: string; kind?: "h1" | "h2" | "quote" | "task" | "fence" | 
   { text: "# A little space for your thoughts.", kind: "h1" },
   { text: "", kind: "blank" },
   { text: "Welcome to **enso**, a quiet home for your" },
-  { text: "Markdown and text files. Changes save" },
+  { text: "markdown and text files. Changes save" },
   { text: "automatically." },
   { text: "", kind: "blank" },
   { text: "## Read. Write. Make room.", kind: "h2" },
@@ -38,7 +38,7 @@ const source: { text: string; kind?: "h1" | "h2" | "quote" | "task" | "fence" | 
   { text: "```", kind: "fence" },
 ];
 
-/** Splits Markdown punctuation from the words, so it can be dimmed like the editor does */
+/** Splits markdown punctuation from the words, so it can be dimmed like the editor does */
 function tokens(line: string): { text: string; mark: boolean }[] {
   const parts = line.split(/(\*\*|^#+ |^> |^- \[[ x]\] |```)/g).filter(Boolean);
   return parts.map((text) => ({ text, mark: /^(\*\*|#+ |> |- \[[ x]\] |```)$/.test(text) }));
@@ -128,7 +128,7 @@ const outline = [
           <article class="doc-page">
             <h3 class="r-h1">A little space for your thoughts.</h3>
             <p>
-              Welcome to <strong>enso</strong>, a quiet home for your Markdown and text files. Changes save automatically.
+              Welcome to <strong>enso</strong>, a quiet home for your markdown and text files. Changes save automatically.
             </p>
             <h4 class="r-h2">Read. Write. Make room.</h4>
             <blockquote>Simplicity is the space where ideas take shape.</blockquote>
