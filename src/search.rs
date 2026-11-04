@@ -20,8 +20,11 @@ use std::{
 /// At most this many matching lines are returned, and this many per file.
 pub const LIMIT: usize = 200;
 const PER_FILE: usize = 20;
-/// Larger files aren't notes; they're skipped.
-const MAX_FILE_BYTES: u64 = 4 * 1024 * 1024;
+/// Files up to this size are kept in memory between searches; larger ones
+/// are read in place from disk (memory-mapped) each time, never held.
+const MAX_CACHED_BYTES: u64 = 4 * 1024 * 1024;
+/// Beyond this, a file isn't a note (a log, a dump) and is skipped.
+const MAX_FILE_BYTES: u64 = 1024 * 1024 * 1024;
 /// Matched lines longer than this are cut around the first match.
 const LINE_CHARS: usize = 160;
 
@@ -45,7 +48,7 @@ pub struct Cache(Mutex<HashMap<PathBuf, (SystemTime, u64, Arc<String>)>>);
 impl Cache {
     fn text(&self, path: &Path) -> Option<Arc<String>> {
         let meta = std::fs::metadata(path).ok()?;
-        if meta.len() > MAX_FILE_BYTES {
+        if meta.len() > MAX_CACHED_BYTES {
             return None;
         }
         let stamp = (meta.modified().ok()?, meta.len());
@@ -82,16 +85,56 @@ fn terms(query: &str) -> (Vec<String>, bool) {
     (terms, sensitive)
 }
 
+/// A file too big to keep, searched where it lies on disk.
+fn search_large(path: &Path, terms: &[String], sensitive: bool, cancel: &AtomicBool, hits: &mut Vec<Hit>) {
+    let Ok(meta) = std::fs::metadata(path) else { return };
+    if meta.len() <= MAX_CACHED_BYTES || meta.len() > MAX_FILE_BYTES {
+        return;
+    }
+    let Ok(file) = std::fs::File::open(path) else { return };
+    // Safety: read only; a file rewritten while it's searched gives odd
+    // results for that one search, and the next search maps it again.
+    let Ok(map) = (unsafe { memmap2::Mmap::map(&file) }) else { return };
+    // Not UTF-8 text (or binary): not a note.
+    let Ok(text) = std::str::from_utf8(&map) else { return };
+    search_text(path, text, terms, sensitive, cancel, hits);
+}
+
+/// Where `needle` (already lowercase ASCII) is in `hay`, ignoring ASCII case,
+/// without lowercasing a copy of the line.
+fn find_ascii_folded(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() {
+        return Some(0);
+    }
+    let first = needle[0];
+    (0..=hay.len().checked_sub(needle.len())?).find(|&i| {
+        hay[i].to_ascii_lowercase() == first && hay[i..i + needle.len()].eq_ignore_ascii_case(needle)
+    })
+}
+
 /// Every line of `text` that holds all of `terms`, in any order.
-fn search_text(path: &Path, text: &str, terms: &[String], sensitive: bool, hits: &mut Vec<Hit>) {
+fn search_text(
+    path: &Path,
+    text: &str,
+    terms: &[String],
+    sensitive: bool,
+    cancel: &AtomicBool,
+    hits: &mut Vec<Hit>,
+) {
+    // ASCII words (nearly every search) match without a lowercased copy of
+    // each line, which is what a large file's scan would spend its time on.
+    let ascii = !sensitive && terms.iter().all(|t| t.is_ascii());
     let mut offset = 0;
     for (index, line) in text.split_inclusive('\n').enumerate() {
+        if index % 8192 == 0 && cancel.load(Ordering::Relaxed) {
+            return;
+        }
         let start = offset;
         offset += line.len();
         let line = line.trim_end_matches(['\n', '\r']);
         // Lowercasing can change byte lengths (rare letters); such lines are
         // matched on the original text so ranges stay valid.
-        let folded = if sensitive { None } else { Some(line.to_lowercase()) };
+        let folded = (!sensitive && !ascii).then(|| line.to_lowercase());
         let haystack = match &folded {
             Some(f) if f.len() == line.len() => f.as_str(),
             _ => line,
@@ -99,7 +142,12 @@ fn search_text(path: &Path, text: &str, terms: &[String], sensitive: bool, hits:
         let mut ranges = Vec::new();
         let mut found = true;
         for term in terms {
-            let Some(at) = haystack.find(term.as_str()) else {
+            let at = if ascii {
+                find_ascii_folded(haystack.as_bytes(), term.as_bytes())
+            } else {
+                haystack.find(term.as_str())
+            };
+            let Some(at) = at else {
                 found = false;
                 break;
             };
@@ -176,8 +224,9 @@ pub fn search(files: &[PathBuf], query: &str, cache: &Cache, cancel: &AtomicBool
                         if cancel.load(Ordering::Relaxed) || hits.len() >= LIMIT {
                             break;
                         }
-                        if let Some(text) = cache.text(path) {
-                            search_text(path, &text, terms, sensitive, &mut hits);
+                        match cache.text(path) {
+                            Some(text) => search_text(path, &text, terms, sensitive, cancel, &mut hits),
+                            None => search_large(path, terms, sensitive, cancel, &mut hits),
                         }
                     }
                     hits
@@ -200,7 +249,7 @@ mod tests {
     fn hits(text: &str, query: &str) -> Vec<Hit> {
         let (terms, sensitive) = terms(query);
         let mut hits = Vec::new();
-        search_text(Path::new("n.md"), text, &terms, sensitive, &mut hits);
+        search_text(Path::new("n.md"), text, &terms, sensitive, &AtomicBool::new(false), &mut hits);
         hits
     }
 
@@ -229,6 +278,34 @@ mod tests {
         let hit = &hits(&line, "needle")[0];
         assert!(hit.line.chars().count() <= LINE_CHARS);
         assert_eq!(&hit.line[hit.ranges[0].clone()], "needle");
+    }
+
+    #[test]
+    fn large_files_are_searched_in_place() {
+        let root = std::env::temp_dir().join(format!("enso-search-large-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let big = root.join("big.md");
+        // Past the cache's size: searched from disk, found all the same.
+        let filler = "Some ordinary line of a very long book.\n".repeat(150_000);
+        std::fs::write(&big, format!("{filler}Title: The Adventures of Sherlock Holmes\n{filler}")).unwrap();
+        assert!(std::fs::metadata(&big).unwrap().len() > MAX_CACHED_BYTES);
+        let cache = Cache::default();
+        let cancel = AtomicBool::new(false);
+        let found = search(&[big.clone()], "sherlock holmes", &cache, &cancel);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].line_number, 150_001);
+        assert_eq!(found[0].line, "Title: The Adventures of Sherlock Holmes");
+        // Not kept in memory.
+        assert!(cache.0.lock().unwrap().is_empty());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn ascii_matching_ignores_case_and_keeps_byte_ranges() {
+        let hit = &hits("café SHERLOCK and holmes\n", "sherlock holmes")[0];
+        let words: Vec<_> = hit.ranges.iter().map(|r| &hit.line[r.clone()]).collect();
+        assert_eq!(words, ["SHERLOCK", "holmes"]);
+        assert!(hits("Ärger\n", "ärger").len() == 1);
     }
 
     #[test]

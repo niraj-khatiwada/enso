@@ -9,6 +9,8 @@ Enhancements:
 - Backspace in the insert menu with nothing typed closes it and puts the cursor back where it was; opened with `/`, the slash is erased too.
 - Copy a file or folder in the sidebar with Cmd/Ctrl + C and paste it into any folder with Cmd/Ctrl + V, while the sidebar has focus. On macOS, copied files paste in Finder too. A folder can be pasted into itself, as a copy inside it. Cmd/Ctrl + X cuts instead, and pasting moves the item.
 - Select several files and folders in the sidebar with Cmd + click (Ctrl + click on Windows and Linux), or Shift + click for a range within one folder; copy, cut, drag and delete them together.
+- When no command matches in the command palette, Search Notes for what you typed is offered; press Enter and the same words search every note.
+- Search everything finds text in large notes too: files over 4 MB are searched straight from disk, without slowing the search down.
 - Moving a file into a folder that already has one by that name keeps both, numbering the moved one, instead of refusing.
 
 ### 1.0.0

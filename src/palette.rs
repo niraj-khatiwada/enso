@@ -675,7 +675,7 @@ impl Enso {
         };
         if matches!(choice, Choice::SearchEverything) {
             self.remember_command(&choice, cx);
-            self.start_content_search(window, cx);
+            self.start_content_search(String::new(), window, cx);
             return;
         }
         if matches!(choice, Choice::Table) {
@@ -1077,7 +1077,52 @@ impl Enso {
                 .collect();
             let weak = cx.entity().downgrade();
             let cancel = weak.clone();
+            // Nothing matched: what was typed may be in a note instead.
+            let offer = self.root.is_some() && anchor.is_none();
+            let searcher = weak.clone();
+            let theme = cx.theme().clone();
             command
+                .empty(move |state, _, cx| {
+                    let query = state.query(cx).trim().to_string();
+                    if !offer || query.is_empty() {
+                        return div()
+                            .p_4()
+                            .text_sm()
+                            .text_color(theme.muted_foreground)
+                            .child("No results found.")
+                            .into_any_element();
+                    }
+                    let searcher = searcher.clone();
+                    div()
+                        .p_1p5()
+                        .child(
+                            h_flex()
+                                .id("search-notes-instead")
+                                .h(px(36.))
+                                .px_2()
+                                .gap_2()
+                                .items_center()
+                                .rounded_md()
+                                .cursor_pointer()
+                                .bg(theme.foreground.opacity(0.05))
+                                .hover(|row| row.bg(theme.foreground.opacity(0.08)))
+                                .child(Icon::new(IconName::Search).size_4().text_color(theme.muted_foreground))
+                                .child(
+                                    h_flex()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .gap_1()
+                                        .text_sm()
+                                        .child(div().flex_shrink_0().text_color(theme.muted_foreground).child("Search Notes for"))
+                                        .child(div().min_w_0().truncate().font_weight(FontWeight::MEDIUM).child(format!("“{query}”"))),
+                                )
+                                .child(div().text_xs().text_color(theme.muted_foreground).child("↵"))
+                                .on_click(move |_, window, cx| {
+                                    let _ = searcher.update(cx, |this, cx| this.search_notes_instead(window, cx));
+                                }),
+                        )
+                        .into_any_element()
+                })
                 .on_confirm(move |index, window, cx| {
                     if let Some(&section) = sections.get(index.section) {
                         let _ = weak.update(cx, |this, cx| {
@@ -1108,6 +1153,14 @@ impl Enso {
                     MouseButton::Left,
                     cx.listener(|this, _, window, cx| this.close_palette(window, cx)),
                 )
+                // Enter with no command matching: search the notes instead.
+                .capture_action(cx.listener(
+                    |this, _: &gpui_kit::base::actions::Confirm, window, cx| {
+                        if this.search_notes_instead(window, cx) {
+                            cx.stop_propagation();
+                        }
+                    },
+                ))
                 .capture_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                     if event.keystroke.key == "escape" {
                         cx.stop_propagation();
@@ -1165,16 +1218,40 @@ impl Enso {
         if self.palette.is_none() {
             self.open_palette(window, cx);
         }
-        self.start_content_search(window, cx);
+        self.start_content_search(String::new(), window, cx);
     }
 
     /// Switch the open palette to searching inside the workspace's notes.
-    fn start_content_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// The main palette matched no command: search the notes for what was
+    /// typed, keeping it in the field. False when there's nothing to offer.
+    fn search_notes_instead(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let Some(palette) = self.palette.as_ref() else { return false };
+        if self.root.is_none() || palette.search.is_some() || palette.anchor.is_some() {
+            return false;
+        }
+        let state = palette.state.read(cx);
+        let query = state.query(cx).trim().to_string();
+        if query.is_empty() || state.matched_count() > 0 {
+            return false;
+        }
+        self.remember_command(&Choice::SearchEverything, cx);
+        self.start_content_search(query, window, cx);
+        true
+    }
+
+    /// `query` carries over what was typed (from the palette's "Search Notes
+    /// for …" row); it runs as soon as the notes are listed.
+    fn start_content_search(&mut self, query: String, window: &mut Window, cx: &mut Context<Self>) {
         let Some(root) = self.root.clone() else {
             return;
         };
         let state = cx.new(|cx| CommandState::new(window, cx));
-        state.update(cx, |state, cx| state.focus(window, cx));
+        state.update(cx, |state, cx| {
+            if !query.is_empty() {
+                state.set_query(query.clone(), window, cx);
+            }
+            state.focus(window, cx);
+        });
         let Some(palette) = self.palette.as_mut() else {
             return;
         };
@@ -1187,7 +1264,7 @@ impl Enso {
         palette.search = Some(ContentSearch {
             root: root.clone(),
             files: None,
-            query: String::new(),
+            query,
             hits: Vec::new(),
             searching: false,
             cancel: Default::default(),
@@ -1664,6 +1741,54 @@ mod ui_tests {
                 before,
                 "background reader must stay still"
             );
+        });
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn no_matching_command_offers_to_search_the_notes_with_the_same_words(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            cx.set_global(super::History::default());
+            bind_view_keys(cx);
+            bind_markdown_keys(cx);
+        });
+        let root = std::env::temp_dir().join(format!("enso-palette-offer-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("zoo.md");
+        std::fs::write(&path, "# Zoo\n\nA zebra quilt hangs here.\n").unwrap();
+        let (handle, view) = cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| {
+                    let mut app = Enso::new(window, cx);
+                    app.root = Some(root.clone());
+                    app
+                })
+            })
+            .unwrap()
+        });
+        draw(cx, handle);
+        let palette = if cfg!(target_os = "macos") { "cmd-shift-p" } else { "ctrl-shift-p" };
+        cx.simulate_keystrokes(handle, palette);
+        draw(cx, handle);
+        cx.simulate_input(handle, "zebra quilt");
+        draw(cx, handle);
+        cx.update(|cx| {
+            let palette = view.read(cx).palette.as_ref().unwrap();
+            assert!(palette.search.is_none());
+            assert_eq!(palette.state.read(cx).matched_count(), 0);
+        });
+        // Enter takes the words into a search of the notes, still typed.
+        cx.simulate_keystrokes(handle, "enter");
+        cx.executor().advance_clock(std::time::Duration::from_millis(500));
+        draw(cx, handle);
+        cx.update(|cx| {
+            let palette = view.read(cx).palette.as_ref().unwrap();
+            assert_eq!(palette.state.read(cx).query(cx).as_ref(), "zebra quilt");
+            let search = palette.search.as_ref().unwrap();
+            assert_eq!(search.query, "zebra quilt");
+            assert_eq!(search.hits.len(), 1);
+            assert_eq!(search.hits[0].path, path);
         });
         std::fs::remove_dir_all(root).unwrap();
     }
