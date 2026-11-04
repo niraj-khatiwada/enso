@@ -4,6 +4,7 @@
 
 Features:
 
+- **Pinned Notes**: Pin a tab from its right-click menu, the document's **⋯** menu or the command palette. Pinned tabs stay first, show a pin icon, and reopen pinned with the workspace. Unpin a tab before closing it; Cmd/Ctrl + W and the close button cannot remove pinned tabs.
 - **Wiki Links and Backlinks**: Type `[[` to find another note in the workspace, select it with the keyboard or mouse, and click the link in Read view to open it. A **Linked from** list at the end of each note shows its incoming links. New links include the file extension; existing extensionless links and custom labels remain supported.
 - **Callouts**: GitHub-style Note, Tip, Important, Warning and Caution blocks render as calm, tinted panels. Obsidian-style custom titles are supported, and the panels carry into HTML and PDF exports.
 - **Math**: Inline `$…$` and display `$$…$$` equations render natively and offline, including fractions, roots, sums, integrals and matrices. HTML exports contain self-contained SVG, and PDFs draw equations as sharp vector paths, even with image export disabled.

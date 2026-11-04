@@ -1,4 +1,4 @@
-//! What each workspace had open when it was last used: its tabs, the active
+//! What each workspace had open when it was last used: its tabs and pins, the active
 //! one, the view mode and the sidebar, so reopening the workspace picks up
 //! where the user left off.
 //!
@@ -29,6 +29,8 @@ const KEEP: usize = 50;
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Session {
     pub tabs: Vec<PathBuf>,
+    /// Paths, rather than indices, so missing files cannot shift another pin.
+    pub pinned: Vec<PathBuf>,
     pub active: Option<usize>,
     /// "read", "edit" or "split".
     pub mode: String,
@@ -82,6 +84,11 @@ fn parse(text: &str) -> Vec<(PathBuf, Session)> {
                     session.tabs.push(PathBuf::from(path));
                 }
             }
+            "pin" => {
+                if let Some(path) = parts.next() {
+                    session.pinned.push(PathBuf::from(path));
+                }
+            }
             "open" => {
                 if let Some(path) = parts.next() {
                     session.expanded.push(PathBuf::from(path));
@@ -110,6 +117,9 @@ fn format(entries: &[(PathBuf, Session)]) -> String {
         }
         for tab in &session.tabs {
             text += &format!("tab\t{}\n", tab.display());
+        }
+        for tab in &session.pinned {
+            text += &format!("pin\t{}\n", tab.display());
         }
         for folder in &session.expanded {
             text += &format!("open\t{}\n", folder.display());
@@ -168,6 +178,7 @@ mod tests {
                 PathBuf::from("/notes"),
                 Session {
                     tabs: vec![PathBuf::from("/notes/a.md"), PathBuf::from("/notes/b c.md")],
+                    pinned: vec![PathBuf::from("/notes/a.md")],
                     active: Some(1),
                     mode: "split".into(),
                     sidebar_open: false,
@@ -185,5 +196,6 @@ mod tests {
         let parsed = parse("tab\t/stray.md\nworkspace\t/w\nwhat\tever\ntab\t/w/x.md\n");
         assert_eq!(parsed.len(), 1);
         assert_eq!(parsed[0].1.tabs, [PathBuf::from("/w/x.md")]);
+        assert!(parsed[0].1.pinned.is_empty(), "older sessions have no pinned tabs");
     }
 }

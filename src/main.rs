@@ -92,6 +92,7 @@ actions!(
         DismissExport,
         DismissLightbox,
         ToggleLock,
+        TogglePin,
         CopyRichText,
         DismissCommandPalette,
         DismissRichControls,
@@ -167,6 +168,8 @@ struct Document {
     disk_prompt: bool,
     /// Locked: readable, not changeable (see `lock`).
     locked: bool,
+    /// Pinned tabs stay first and must be unpinned before closing by hand.
+    pinned: bool,
     /// The file was gone at the last check (already reported).
     missing: bool,
     _subscriptions: Vec<Subscription>,
@@ -1360,6 +1363,7 @@ impl Enso {
             disk_prompt: false,
             missing: false,
             locked: false,
+            pinned: false,
             editor,
             preview,
             preview_loaded: false,
@@ -1791,6 +1795,7 @@ impl Enso {
             root,
             session::Session {
                 tabs: saved.iter().filter_map(|d| d.path.clone()).collect(),
+                pinned: saved.iter().filter(|d| d.pinned).filter_map(|d| d.path.clone()).collect(),
                 active,
                 mode: match self.mode {
                     Mode::Read => "read",
@@ -1885,13 +1890,16 @@ impl Enso {
                             continue;
                         };
                         this.add_document(Some(path.clone()), text, sections, window, cx);
+                        if let Some(doc) = this.documents.iter_mut().find(|d| d.path.as_ref() == Some(&path)) {
+                            doc.pinned = saved.pinned.contains(&path);
+                        }
                         if saved.active == Some(i) {
                             active = this.documents.iter().position(|d| d.path.as_ref() == Some(&path));
                         }
                     }
-                    if let Some(active) = active.or(this.active) {
-                        this.active = Some(active);
-                    }
+                    let active_id = active.or(this.active).map(|i| this.documents[i].editor.entity_id());
+                    this.documents.sort_by_key(|doc| !doc.pinned);
+                    this.active = active_id.and_then(|id| this.documents.iter().position(|doc| doc.editor.entity_id() == id));
                     // Opening a file shows it in Read; set_mode also fills the
                     // editor that Edit and Split show.
                     this.set_mode(mode, window, cx);
@@ -1949,7 +1957,7 @@ impl Enso {
         // first, to bring them back when this workspace is opened again.
         self.save_session(cx);
         for index in (0..self.documents.len()).rev() {
-            self.close_document(index, cx);
+            self.flush_and_close_document(index, cx);
         }
         self.open_folder(path, cx);
         self.focus.focus(window, cx);
@@ -2716,6 +2724,14 @@ impl Enso {
     }
 
     fn close_document(&mut self, index: usize, cx: &mut Context<Self>) {
+        if self.documents[index].pinned {
+            return;
+        }
+        self.flush_and_close_document(index, cx);
+    }
+
+    /// Workspace changes flush every tab, including pins; manual close does not.
+    fn flush_and_close_document(&mut self, index: usize, cx: &mut Context<Self>) {
         let doc = &mut self.documents[index];
         if doc.dirty || doc.saving || self.repairing_links || !self.link_moves.is_empty() {
             doc.close_after_save = true;
@@ -2725,11 +2741,38 @@ impl Enso {
         }
     }
 
+    pub(crate) fn toggle_pin(&mut self, cx: &mut Context<Self>) {
+        if let Some(index) = self.active {
+            self.toggle_tab_pin(index, cx);
+        }
+    }
+
+    fn toggle_tab_pin(&mut self, index: usize, cx: &mut Context<Self>) {
+        let pinned = self.documents.iter().filter(|doc| doc.pinned).count();
+        let doc = &mut self.documents[index];
+        doc.pinned = !doc.pinned;
+        // Pinning while an autosave finishes cancels a pending tab close.
+        if doc.pinned {
+            doc.close_after_save = false;
+        }
+        let to = if doc.pinned { pinned } else { pinned - 1 };
+        self.move_tab(index, to, cx);
+        self.save_session(cx);
+        cx.notify();
+    }
+
     /// Move the tab at `from` to `to`, keeping the same document active.
     fn move_tab(&mut self, from: usize, to: usize, cx: &mut Context<Self>) {
-        if from == to || from >= self.documents.len() || to >= self.documents.len() {
+        if from >= self.documents.len() || to >= self.documents.len() {
             return;
         }
+        let pinned = self.documents.iter().filter(|doc| doc.pinned).count();
+        let to = if self.documents[from].pinned {
+            to.min(pinned - 1)
+        } else {
+            to.max(pinned)
+        };
+        if from == to { return; }
         let active = self.active.map(|i| self.documents[i].editor.entity_id());
         let doc = self.documents.remove(from);
         self.documents.insert(to, doc);
@@ -2743,11 +2786,18 @@ impl Enso {
     /// ScrollHandle stores item bounds before its scroll offset is applied.
     fn tab_insertion_slot(&self, x: Pixels) -> usize {
         let offset = self.tab_scroll.offset().x;
-        (0..self.documents.len())
+        let slot = (0..self.documents.len())
             .find(|&i| self.tab_scroll.bounds_for_item(i).is_some_and(|bounds| {
                 x < bounds.center().x + offset
             }))
-            .unwrap_or(self.documents.len())
+            .unwrap_or(self.documents.len());
+        // Show the insertion marker where this tab can actually be dropped.
+        let pinned = self.documents.iter().filter(|doc| doc.pinned).count();
+        match self.dragging_tab.and_then(|i| self.documents.get(i)) {
+            Some(doc) if doc.pinned => slot.min(pinned),
+            Some(_) => slot.max(pinned),
+            None => slot,
+        }
     }
 
     fn remove_document(&mut self, index: usize, cx: &mut Context<Self>) {
@@ -3167,6 +3217,9 @@ impl Render for Enso {
                     .when(document.locked, |tab| {
                         tab.child(Icon::new(IconName::Lock).size_3().mr_1().text_color(theme.muted_foreground))
                     })
+                    .when(document.pinned, |tab| {
+                        tab.child(Icon::new(IconName::Pin).size_3().mr_1().text_color(theme.muted_foreground))
+                    })
                     .child(
                         div()
                             .max_w(px(TAB_TITLE_WIDTH))
@@ -3181,7 +3234,7 @@ impl Render for Enso {
                     })
                     // Built only while shown: a hidden button per tab made every
                     // frame cost more with each open file.
-                    .when(reveal > 0.001, |tab| tab.child(
+                    .when(!document.pinned && reveal > 0.001, |tab| tab.child(
                         h_flex()
                             .w(px(20. * reveal))
                             .h(px(20.))
@@ -3216,7 +3269,25 @@ impl Render for Enso {
                             .position(|doc| doc.editor.entity_id() == editor_id);
                         this.selected = None;
                         cx.notify();
-                    })),
+                    }))
+                    .context_menu({
+                        let weak = cx.entity().downgrade();
+                        let pinned = document.pinned;
+                        move |menu, _, _| {
+                            menu.item(PopupMenuItem::new(if pinned { "Unpin Tab" } else { "Pin Tab" })
+                                .icon(if pinned { IconName::PinOff } else { IconName::Pin })
+                                .on_click({
+                                    let weak = weak.clone();
+                                    move |_, _, cx| {
+                                        let _ = weak.update(cx, |this, cx| {
+                                            if let Some(index) = this.documents.iter().position(|doc| doc.editor.entity_id() == editor_id) {
+                                                this.toggle_tab_pin(index, cx);
+                                            }
+                                        });
+                                    }
+                                }))
+                        }
+                    }),
             ));
         }
         let highlighted = self.selected.clone().or_else(|| active_path.clone());
@@ -4203,6 +4274,12 @@ impl Render for Enso {
                             let dismiss_controls = controls.clone();
                             let dismiss_popover = popover.clone();
                             let lock_weak = weak.clone();
+                            let pin_weak = weak.clone();
+                            let pin_popover = popover.clone();
+                            let pinned = weak.upgrade().is_some_and(|enso| {
+                                let enso = enso.read(cx);
+                                enso.active.is_some_and(|i| enso.documents[i].pinned)
+                            });
                             let focus_weak = weak.clone();
                             let focus_popover = popover.clone();
                             let focusing = weak.upgrade().is_some_and(|enso| enso.read(cx).focus_mode);
@@ -4227,6 +4304,16 @@ impl Render for Enso {
                                 })
                                 .child(controls)
                                 .child(div().h(px(1.)).mx_1().my_1().bg(theme.border))
+                                .child(h_flex().id("pin-tab").px_2().h(px(28.)).gap_2()
+                                    .items_center().rounded_md().cursor_pointer().text_sm()
+                                    .hover(|row| row.bg(theme.secondary))
+                                    .child(Icon::new(if pinned { IconName::PinOff } else { IconName::Pin })
+                                        .size_4().text_color(theme.muted_foreground))
+                                    .child(div().flex_1().child(if pinned { "Unpin Tab" } else { "Pin Tab" }))
+                                    .on_click(move |_, window, cx| {
+                                        let _ = pin_popover.update(cx, |state, cx| state.dismiss(window, cx));
+                                        let _ = pin_weak.update(cx, |this, cx| this.toggle_pin(cx));
+                                    }))
                                 .child(h_flex().id("focus-mode").px_2().h(px(28.)).gap_2()
                                     .items_center().rounded_md().cursor_pointer().text_sm()
                                     .hover(|row| row.bg(theme.secondary))
@@ -4348,6 +4435,7 @@ impl Render for Enso {
             .on_action(cx.listener(|this, action: &spellcheck::ReplaceSpelling, w, cx| this.replace_spelling(action, w, cx)))
             .on_action(cx.listener(|this, _: &ExportNote, w, cx| this.open_export(w, cx)))
             .on_action(cx.listener(|this, _: &ToggleLock, _, cx| this.toggle_lock(cx)))
+            .on_action(cx.listener(|this, _: &TogglePin, _, cx| this.toggle_pin(cx)))
             .on_action(cx.listener(|this, _: &ToggleSidebar, _, cx| this.toggle_sidebar(cx)))
             .on_action(cx.listener(|this, _: &NextTab, _, cx| this.cycle_tab(1, cx)))
             .on_action(cx.listener(|this, _: &PreviousTab, _, cx| this.cycle_tab(-1, cx)))
@@ -5971,6 +6059,123 @@ mod transition_tests {
         assert_eq!(showing(cx), ["Busy…"]);
         cx.update(|cx| view.update(cx, |app, cx| app.dismiss_toast(&"w".into(), cx)));
         assert!(showing(cx).is_empty());
+    }
+
+    #[gpui_kit::test]
+    fn pinned_tabs_stay_first_and_ignore_close_until_unpinned(cx: &mut TestAppContext) {
+        cx.update(|cx| { gpui_kit::init(cx); bind_view_keys(cx); });
+        let paths: Vec<_> = ["a.md", "b.md", "c.md", "d.md"].iter().map(PathBuf::from).collect();
+        let (handle, view) = cx.update(|cx| gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+            cx.new(|cx| {
+                let mut app = Enso::new(window, cx);
+                for path in &paths { app.add_document(Some(path.clone()), String::new(), None, window, cx); }
+                // d is active; pinning another tab must keep d active.
+                app.toggle_tab_pin(2, cx);
+                app.toggle_tab_pin(2, cx);
+                assert_eq!(app.documents.iter().map(|d| d.title()).collect::<Vec<_>>(), ["c.md", "b.md", "a.md", "d.md"]);
+                assert_eq!(app.documents[app.active.unwrap()].title(), "d.md");
+                // Both drag directions stay on their side of the pin boundary.
+                app.move_tab(3, 0, cx);
+                app.move_tab(0, 3, cx);
+                assert_eq!(app.documents.iter().map(|d| d.title()).collect::<Vec<_>>(), ["b.md", "c.md", "d.md", "a.md"]);
+                assert_eq!(app.documents[app.active.unwrap()].title(), "d.md");
+                // The close-button path must not even queue a save-and-close.
+                app.documents[0].dirty = true;
+                app.close_document(0, cx);
+                assert!(!app.documents[0].close_after_save);
+                assert_eq!(app.documents.len(), 4);
+                app.documents[0].dirty = false;
+                app.active = Some(0);
+                app
+            })
+        }).unwrap());
+        draw(cx, handle);
+        let close = if cfg!(target_os = "macos") { "cmd-w" } else { "ctrl-w" };
+        cx.simulate_keystrokes(handle, close);
+        draw(cx, handle);
+        cx.update(|cx| view.update(cx, |app, cx| {
+            assert_eq!(app.documents.len(), 4);
+            assert!(app.closed_tabs.is_empty());
+            // Unpinning places b after the remaining pin and keeps it active.
+            app.toggle_pin(cx);
+            assert_eq!(app.documents.iter().map(|d| d.title()).collect::<Vec<_>>(), ["c.md", "b.md", "d.md", "a.md"]);
+            assert_eq!(app.active, Some(1));
+        }));
+        draw(cx, handle);
+        cx.simulate_keystrokes(handle, close);
+        draw(cx, handle);
+        cx.update(|cx| {
+            let app = view.read(cx);
+            assert_eq!(app.documents.iter().map(|d| d.title()).collect::<Vec<_>>(), ["c.md", "d.md", "a.md"]);
+            assert!(app.documents[0].pinned);
+            assert_eq!(app.closed_tabs.len(), 1);
+        });
+        cx.update_window(handle, |_, window, cx| {
+            view.update(cx, |app, cx| {
+                app.close_document(2, cx);
+                app.close_document(1, cx);
+                app.set_mode(Mode::Edit, window, cx);
+            });
+        }).unwrap();
+        draw(cx, handle);
+        for _ in 0..3 {
+            cx.simulate_keystrokes(handle, close);
+            draw(cx, handle);
+        }
+        cx.update(|cx| view.update(cx, |app, cx| {
+            assert_eq!(app.documents.len(), 1, "the last pin survives close from the editor too");
+            app.toggle_pin(cx);
+        }));
+        draw(cx, handle);
+        cx.simulate_keystrokes(handle, close);
+        draw(cx, handle);
+        assert!(cx.update(|cx| view.read(cx).documents.is_empty()));
+    }
+
+    #[gpui_kit::test]
+    fn pinned_tabs_restore_in_order_after_switching_workspaces(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx); bind_view_keys(cx);
+            cx.set_global(super::session::Sessions::default());
+        });
+        let root = std::env::temp_dir().join(format!("enso-pinned-session-{}", std::process::id()));
+        let one = root.join("one");
+        let two = root.join("two");
+        std::fs::create_dir_all(&one).unwrap();
+        std::fs::create_dir_all(&two).unwrap();
+        let paths: Vec<_> = ["a.md", "b.md", "c.md", "d.md"].iter().map(|name| one.join(name)).collect();
+        for path in &paths { std::fs::write(path, "text").unwrap(); }
+        let (handle, view) = cx.update(|cx| gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+            cx.new(|cx| {
+                let mut app = Enso::new(window, cx);
+                app.open_folder(one.clone(), cx);
+                for path in &paths { app.add_document(Some(path.clone()), "text".into(), None, window, cx); }
+                app.toggle_tab_pin(2, cx);
+                app.toggle_tab_pin(2, cx);
+                app.active = Some(2); // a, after c and b.
+                app
+            })
+        }).unwrap());
+        draw(cx, handle);
+        cx.update_window(handle, |_, window, cx| {
+            view.update(cx, |app, cx| app.switch_workspace(two.clone(), false, window, cx));
+        }).unwrap();
+        cx.run_until_parked();
+        draw(cx, handle);
+        assert!(cx.update(|cx| view.read(cx).documents.is_empty()), "workspace switching must close pins too");
+        std::fs::remove_file(&paths[3]).unwrap();
+        cx.update_window(handle, |_, window, cx| {
+            view.update(cx, |app, cx| app.switch_workspace(one.clone(), false, window, cx));
+        }).unwrap();
+        cx.run_until_parked();
+        draw(cx, handle);
+        cx.update(|cx| {
+            let app = view.read(cx);
+            assert_eq!(app.documents.iter().map(|d| d.title()).collect::<Vec<_>>(), ["c.md", "b.md", "a.md"]);
+            assert_eq!(app.documents.iter().map(|d| d.pinned).collect::<Vec<_>>(), [true, true, false]);
+            assert_eq!(app.active, Some(2));
+        });
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[gpui_kit::test]

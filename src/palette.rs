@@ -123,6 +123,7 @@ enum Choice {
     Export,
     CopyRichText,
     ToggleLock,
+    TogglePin,
     FocusMode,
     RenameFile,
     DeleteFile,
@@ -163,6 +164,7 @@ impl Choice {
             Self::Export => "export".into(),
             Self::CopyRichText => "copy-rich-text".into(),
             Self::ToggleLock => "lock-page".into(),
+            Self::TogglePin => "pin-tab".into(),
             Self::FocusMode => "focus-mode".into(),
             Self::RenameFile => "rename-file".into(),
             Self::DeleteFile => "delete-file".into(),
@@ -199,6 +201,7 @@ impl Choice {
             Self::Export => Box::new(ExportNote),
             Self::CopyRichText => Box::new(CopyRichText),
             Self::ToggleLock => Box::new(ToggleLock),
+            Self::TogglePin => Box::new(TogglePin),
             Self::FocusMode => Box::new(ToggleFocusMode),
             _ => return None,
         })
@@ -447,6 +450,14 @@ impl Enso {
                 &["directory", "create"],
                 Choice::NewFolder,
                 Some("⇧N"),
+            ));
+        }
+        if let Some(index) = self.active {
+            app.push(entry(
+                if self.documents[index].pinned { "Unpin Tab" } else { "Pin Tab" },
+                &["pin", "unpin", "keep", "favorite", "note", "tab"],
+                Choice::TogglePin,
+                None,
             ));
         }
         if self.active.is_some_and(|i| self.documents[i].markdown) {
@@ -755,6 +766,7 @@ impl Enso {
             Choice::Settings => settings::open(cx),
             Choice::Export => self.open_export(window, cx),
             Choice::ToggleLock => self.toggle_lock(cx),
+            Choice::TogglePin => self.toggle_pin(cx),
             Choice::FocusMode => self.toggle_focus_mode(window, cx),
             Choice::RenameFile => {
                 if let Some(path) = self.active.and_then(|i| self.documents[i].path.clone()) {
@@ -1515,6 +1527,7 @@ fn is_insert(choice: &Choice) -> bool {
             | Choice::Export
             | Choice::CopyRichText
             | Choice::ToggleLock
+            | Choice::TogglePin
             | Choice::FocusMode
             | Choice::RenameFile
             | Choice::DeleteFile
