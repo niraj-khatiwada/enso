@@ -19,9 +19,12 @@ Features:
 - **Watched Folders**: The sidebar follows files added, removed or renamed outside enso, and open files changed on disk reload quietly, or ask when you have unsaved edits.
 - **Drag and Drop**: Move files and folders in the sidebar, drop or paste files from Finder, drop images on a note to insert them, and reorder tabs by dragging.
 - **Reopen Closed Tabs**: Bring back the last tab you closed with Cmd/Ctrl + Shift + T, and keep pressing for earlier ones.
+- **Update Notice**: enso checks for a new version once a day and shows a toast with a Download button. Turn it off in Settings › General › Check for Updates.
+- **More Packages**: An Intel disk image for macOS, an installer for Windows, and an AppImage, .deb and .rpm for Linux, for x64 and ARM64.
 
 Enhancements:
 
+- Cmd/Ctrl + B collapses or expands the sidebar, remembered for every window and session.
 - In Split, clicking or selecting in the reader moves the editor's cursor there.
 - Swap the editor and reader sides of Split from the divider, or with Cmd/Ctrl + Shift + \.
 - Edit Table also works for simple HTML tables.
@@ -33,6 +36,7 @@ Enhancements:
 
 Bug Fixes:
 
+- Fixed Windows opening a console window behind enso.
 - Fixed the Linux launcher icon sometimes showing as a generic icon.
 - Fixed repeated Reopen Closed Tab presses going to a tab that wasn't shown.
 - Fixed task checkboxes not lining up with their text.
