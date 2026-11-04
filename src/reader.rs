@@ -209,7 +209,7 @@ impl LargeReader {
     pub fn replace(&mut self, source: Arc<String>, sections: Vec<Section>, cx: &mut Context<Self>) {
         let offset = self.list.logical_scroll_top();
         self.list
-            .reset_with_uniform_height(sections.len(), px(900.));
+            .reset_with_uniform_height(sections.len() + 1, px(900.));
         self.list.scroll_to(offset);
         self.source = source;
         self.sections = Arc::new(sections);
@@ -219,12 +219,15 @@ impl LargeReader {
         cx.notify();
     }
 
+    pub fn set_base(&mut self, base: Option<PathBuf>, cx: &mut Context<Self>) {
+        self.base = base; self.list.remeasure(); cx.notify();
+    }
     pub fn set_controls(&mut self, owner: WeakEntity<crate::Enso>, editor: EntityId) {
         self.controls = Some((owner, editor));
     }
 
     pub fn new(source: Arc<String>, sections: Vec<Section>, base: Option<PathBuf>) -> Self {
-        let list = ListState::new(sections.len(), ListAlignment::Top, px(400.))
+        let list = ListState::new(sections.len() + 1, ListAlignment::Top, px(400.))
             .with_uniform_item_height(px(900.));
         Self {
             source,
@@ -266,6 +269,12 @@ impl Render for LargeReader {
         let controls = self.controls.clone();
         let last = sections.len().saturating_sub(1);
         let content = list(self.list.clone(), move |index, _, cx| {
+            if index == sections.len() {
+                return div().pl(px(TEXT_INSET_X)).pr_4().child(
+                    controls.as_ref().and_then(|(owner, editor)| owner.update(cx, |app, cx| app.linked_from(*editor, cx)).ok())
+                        .unwrap_or_else(|| div().into_any_element())
+                ).into_any_element();
+            }
             let section = &sections[index];
             let text = format!(
                 "{}{}{}",
@@ -274,7 +283,7 @@ impl Render for LargeReader {
                 section.suffix
             );
             let image_base = base.clone();
-            let link_base = base.clone();
+            let link_controls = controls.clone();
             div()
                 .w_full()
                 .min_h(px(24.))
@@ -312,23 +321,15 @@ impl Render for LargeReader {
                                 let source = uri.to_string();
                                 if !source.contains(':') {
                                     if let Some(base) = &image_base {
-                                        return ImageSource::from(base.join(source));
+                                        return ImageSource::from(base.join(crate::links::decode(&source)));
                                     }
                                 }
                                 ImageSource::from(uri.clone())
                             })
-                            .on_link_click(move |url, event, _, cx| {
-                                if event.is_right_click() {
-                                    return;
-                                }
-                                if url.starts_with("https://")
-                                    || url.starts_with("http://")
-                                    || url.starts_with("mailto:")
-                                {
-                                    cx.open_url(url);
-                                } else if !url.contains(':') && !url.starts_with('#') {
-                                    if let Some(base) = &link_base {
-                                        cx.reveal_path(&base.join(url.as_ref()));
+                            .on_link_click(move |url, event, window, cx| {
+                                if !event.is_right_click() {
+                                    if let Some((owner, editor)) = &link_controls {
+                                        let _ = owner.update(cx, |app, cx| app.follow_note_link(*editor, url, window, cx));
                                     }
                                 }
                             }),

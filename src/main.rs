@@ -11,6 +11,8 @@ mod find;
 mod focus;
 mod http;
 mod lock;
+mod links;
+mod wiki;
 mod markdown_edit;
 mod media;
 mod onboarding;
@@ -78,6 +80,10 @@ actions!(
         PasteFiles,
         FindInPage,
         ToggleFocusMode,
+        ConfirmWikiLink,
+        NextWikiLink,
+        PreviousWikiLink,
+        DismissWikiLinks,
         CopySelected,
         CutSelected,
         ExportNote,
@@ -568,6 +574,12 @@ struct Enso {
     _disk_watch: Task<()>,
     /// Note texts kept between "Search everything" queries.
     search_cache: Arc<search::Cache>,
+    link_index: Arc<std::sync::Mutex<links::Index>>,
+    link_snapshot: links::Snapshot,
+    link_moves: Vec<links::Move>,
+    link_task: Option<Task<()>>,
+    repairing_links: bool,
+    wiki_completion: Option<wiki::Completion>,
     /// A cursor position to show once its document is laid out: the
     /// document, the byte offset, and frames left to wait.
     pending_jump: Option<(EntityId, usize, u8)>,
@@ -704,6 +716,12 @@ impl Enso {
             restoring_session: false,
             _disk_watch: Self::watch_disk(window, cx),
             search_cache: Default::default(),
+            link_index: Default::default(),
+            link_snapshot: Default::default(),
+            link_moves: Vec::new(),
+            link_task: None,
+            repairing_links: false,
+            wiki_completion: None,
             pending_jump: None,
             pending_flash: None,
             flash_task: None,
@@ -819,7 +837,7 @@ impl Enso {
             // Large files read through `large_reader`; their editor may not be
             // filled yet, and the preview stays empty either way.
             if text.len() < reader::LARGE_DOCUMENT_BYTES {
-                doc.preview.update(cx, |preview, cx| preview.set_text(&text, cx));
+                doc.preview.update(cx, |preview, cx| preview.set_text(&wiki::preview_source(&text, self.root.is_some()), cx));
                 doc.preview_loaded = true;
             }
         }
@@ -1274,7 +1292,7 @@ impl Enso {
                             && editor.read(cx).text().len() < reader::LARGE_DOCUMENT_BYTES
                         {
                             let value = editor.read(cx).value();
-                            preview_ref.update(cx, |view, cx| view.set_text(&value, cx));
+                            preview_ref.update(cx, |view, cx| view.set_text(&wiki::preview_source(&value, this.root.is_some()), cx));
                         }
                     }
                     let editor_id = editor.entity_id();
@@ -1291,6 +1309,7 @@ impl Enso {
             },
         );
         let cursor_subscription = cx.observe(&editor, |this, editor, cx| {
+            if this.wiki_completion.is_some() { cx.notify(); }
             if this.mode != Mode::Split {
                 return;
             }
@@ -1512,7 +1531,14 @@ impl Enso {
     }
 
     fn open_folder(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        self.link_task = None;
+        self.link_index = Default::default();
+        self.link_snapshot = Default::default();
+        self.link_moves.clear();
+        self.repairing_links = false;
+        self.wiki_completion = None;
         self.root = Some(path.clone());
+        self.refresh_links(cx);
         self.folders.clear();
         self.expanded.clear();
         self.selected = None;
@@ -1568,6 +1594,7 @@ impl Enso {
                         });
                     }
                 }
+                let _ = this.update(cx, |this, cx| this.refresh_links(cx));
                 if !shown.is_empty() {
                     let changed = cx
                         .background_executor()
@@ -1712,7 +1739,7 @@ impl Enso {
             .detach();
         }
         if doc.preview_loaded && doc.large_reader.is_none() {
-            doc.preview.update(cx, |preview, cx| preview.set_text(&text, cx));
+            doc.preview.update(cx, |preview, cx| preview.set_text(&wiki::preview_source(&text, self.root.is_some()), cx));
         }
         doc.revision += 1;
         self.schedule_word_count(index, true, cx);
@@ -1901,6 +1928,18 @@ impl Enso {
         }
         if new_window {
             cx.defer(move |cx| open_workspace_window(Some(path), cx));
+            return;
+        }
+        if self.repairing_links || !self.link_moves.is_empty() {
+            let handle = self.window_handle;
+            self.after_tree_change(move |_, cx| {
+                let weak = cx.entity().downgrade();
+                cx.defer(move |cx| {
+                    let _ = handle.update(cx, |_, window, cx| {
+                        let _ = weak.update(cx, |app, cx| app.switch_workspace(path, false, window, cx));
+                    });
+                });
+            }, cx);
             return;
         }
         // Tabs belong to the workspace they were opened from. Closing flushes
@@ -2422,11 +2461,7 @@ impl Enso {
             return;
         };
         let name = self.rename_input.read(cx).value().to_string();
-        match files::rename(&old, &name) {
-            Ok(new) if new != old => self.entry_moved(&old, &new, cx),
-            Ok(_) => {}
-            Err(error) => self.message(error.to_string(), true, cx),
-        }
+        self.rename_entry_when_ready(old, name, cx);
         self.focus.focus(window, cx);
         cx.notify();
     }
@@ -2435,6 +2470,11 @@ impl Enso {
     /// tabs, the selection and expanded folders follow it, and both folders
     /// it touched are listed again.
     fn entry_moved(&mut self, old: &PathBuf, new: &PathBuf, cx: &mut Context<Self>) {
+        self.follow_entry_move(old, new, cx);
+        self.queue_link_move(old, new, cx);
+    }
+
+    fn follow_entry_move(&mut self, old: &PathBuf, new: &PathBuf, cx: &mut Context<Self>) {
         lock::moved(old, new, cx);
         let moved = |path: &PathBuf| {
             path.strip_prefix(old)
@@ -2452,7 +2492,12 @@ impl Enso {
         for doc in &mut self.documents {
             if let Some(path) = doc.path.as_ref().and_then(|p| moved(p)) {
                 doc.markdown = files::is_markdown(&path);
+                if let Some(reader) = &doc.large_reader {
+                    let base = path.parent().map(PathBuf::from);
+                    reader.update(cx, |reader, cx| reader.set_base(base, cx));
+                }
                 doc.path = Some(path);
+                doc.missing = false;
             }
         }
         self.folders.retain(|path, _| !path.starts_with(old));
@@ -2476,6 +2521,10 @@ impl Enso {
     /// Drag and drop in the sidebar: move a file or folder into `dir`.
     fn move_entry(&mut self, path: PathBuf, dir: PathBuf, cx: &mut Context<Self>) -> Option<PathBuf> {
         self.tree_drop = None;
+        if self.tree_change_busy() {
+            self.after_tree_change(move |app, cx| { app.move_entry(path, dir, cx); }, cx);
+            return None;
+        }
         // Let go where it already is (or on itself): nothing to do.
         if path.parent() == Some(dir.as_path()) || path == dir {
             return None;
@@ -2543,7 +2592,12 @@ impl Enso {
         if !self.root.as_ref().is_some_and(|root| dir.starts_with(root)) || paths.is_empty() {
             return;
         }
+        if self.tree_change_busy() || !self.link_moves.is_empty() {
+            self.after_tree_change(move |app, cx| app.copy_into_folder(paths, dir, cx), cx);
+            return;
+        }
         let target = dir.clone();
+        let root = self.root.clone().unwrap();
         let count = paths.len();
         let busy = self.busy(
             format!("copy-in:{}", dir.display()),
@@ -2551,22 +2605,27 @@ impl Enso {
             cx,
         );
         let task = cx.background_executor().spawn(async move {
-            paths
+            let results = paths
                 .iter()
-                .map(|path| files::copy_into(path, &target))
-                .collect::<Vec<_>>()
+                .map(|path| (path.clone(), files::copy_into(path, &target)))
+                .collect::<Vec<_>>();
+            results
         });
         cx.spawn(async move |this, cx| {
             let results = task.await;
             let _ = this.update(cx, |this, cx| {
                 this.finish(busy, None, cx);
+                if this.root.as_ref() != Some(&root) { return; }
                 let mut copied = Vec::new();
-                for result in results {
+                for (_, result) in results {
                     match result {
                         Ok(path) => copied.push(path),
                         Err(error) => this.message(error.to_string(), true, cx),
                     }
                 }
+                // Wake the same filesystem reconciliation used for external
+                // file-manager changes and sync arrivals. No link rewriting here.
+                this.refresh_links(cx);
                 // Show the copies: the folder and the folders above it open.
                 this.reveal_in_tree(&dir, cx);
                 this.expanded.insert(dir.clone());
@@ -2656,7 +2715,7 @@ impl Enso {
 
     fn close_document(&mut self, index: usize, cx: &mut Context<Self>) {
         let doc = &mut self.documents[index];
-        if doc.dirty || doc.saving {
+        if doc.dirty || doc.saving || self.repairing_links || !self.link_moves.is_empty() {
             doc.close_after_save = true;
             self.start_save(index, cx);
         } else {
@@ -2752,6 +2811,7 @@ impl Enso {
     }
 
     fn start_save(&mut self, index: usize, cx: &mut Context<Self>) {
+        if self.repairing_links || !self.link_moves.is_empty() { return; }
         let doc = &mut self.documents[index];
         if !doc.dirty || doc.saving {
             return;
@@ -2814,6 +2874,10 @@ impl Enso {
     /// pending edit first, and ask only when auto-save has already failed.
     fn request_close(&mut self, target: CloseTarget, window: &mut Window, cx: &mut Context<Self>) {
         if self.closing.is_some() {
+            return;
+        }
+        if self.repairing_links || !self.link_moves.is_empty() {
+            self.closing = Some(target);
             return;
         }
         if !self.documents.iter().any(|d| d.dirty(cx)) {
@@ -2910,6 +2974,7 @@ impl Enso {
 
 impl Render for Enso {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.wiki_frame(window, cx);
         self.save_session(cx);
         if self.refocus {
             self.refocus = false;
@@ -3936,7 +4001,7 @@ impl Render for Enso {
                         .as_ref()
                         .and_then(|p| p.parent())
                         .map(PathBuf::from);
-                    let link_base = base.clone();
+                    let link_owner = cx.entity().downgrade();
                     let editor_id = document.editor.entity_id();
                     reading_pane = Some(
                         div()
@@ -3975,24 +4040,14 @@ impl Render for Enso {
                                             let source = uri.to_string();
                                             if !source.contains(':') {
                                                 if let Some(base) = &base {
-                                                    return ImageSource::from(base.join(source));
+                                                    return ImageSource::from(base.join(links::decode(&source)));
                                                 }
                                             }
                                             ImageSource::from(uri.clone())
                                         })
-                                        .on_link_click(move |url, event, _, cx| {
-                                            if event.is_right_click() {
-                                                return;
-                                            }
-                                            if url.starts_with("https://")
-                                                || url.starts_with("http://")
-                                                || url.starts_with("mailto:")
-                                            {
-                                                cx.open_url(url);
-                                            } else if !url.contains(':') && !url.starts_with('#') {
-                                                if let Some(base) = &link_base {
-                                                    cx.reveal_path(&base.join(url.as_ref()));
-                                                }
+                                        .on_link_click(move |url, event, window, cx| {
+                                            if !event.is_right_click() {
+                                                let _ = link_owner.update(cx, |app, cx| app.follow_note_link(editor_id, url, window, cx));
                                             }
                                         }),
                                 ),
@@ -4146,6 +4201,9 @@ impl Render for Enso {
                             let dismiss_controls = controls.clone();
                             let dismiss_popover = popover.clone();
                             let lock_weak = weak.clone();
+                            let focus_weak = weak.clone();
+                            let focus_popover = popover.clone();
+                            let focusing = weak.upgrade().is_some_and(|enso| enso.read(cx).focus_mode);
                             let locked = weak.upgrade().is_some_and(|enso| {
                                 let enso = enso.read(cx);
                                 enso.active.is_some_and(|i| enso.documents[i].locked)
@@ -4167,6 +4225,18 @@ impl Render for Enso {
                                 })
                                 .child(controls)
                                 .child(div().h(px(1.)).mx_1().my_1().bg(theme.border))
+                                .child(h_flex().id("focus-mode").px_2().h(px(28.)).gap_2()
+                                    .items_center().rounded_md().cursor_pointer().text_sm()
+                                    .hover(|row| row.bg(theme.secondary))
+                                    .child(Icon::new(IconName::Maximize)
+                                        .size_4().text_color(theme.muted_foreground))
+                                    .child(div().flex_1().child("Focus Mode"))
+                                    .child(gpui_kit::component::switch::Switch::new("focus-mode-switch")
+                                        .checked(focusing).small().accessibility_label("Focus Mode"))
+                                    .on_click(move |_, window, cx| {
+                                        let _ = focus_popover.update(cx, |state, cx| state.dismiss(window, cx));
+                                        let _ = focus_weak.update(cx, |this, cx| this.toggle_focus_mode(window, cx));
+                                    }))
                                 // The switch shows the state; the whole row flips it.
                                 .child(h_flex().id("lock-page").px_2().h(px(28.)).gap_2()
                                     .items_center().rounded_md().cursor_pointer().text_sm()
@@ -4246,7 +4316,7 @@ impl Render for Enso {
             .unwrap_or_default();
         v_flex()
             .id("enso")
-            .key_context("Enso")
+            .key_context(if self.wiki_is_open() { "Enso WikiCompleting" } else { "Enso" })
             .track_focus(&self.focus)
             .relative()
             .size_full()
@@ -4254,6 +4324,10 @@ impl Render for Enso {
             // content column paints its own opaque background.
             .when(!backdrop, |view| view.bg(theme.background))
             .text_color(theme.foreground)
+            .on_action(cx.listener(|this, _: &ConfirmWikiLink, window, cx| this.wiki_accept(window, cx)))
+            .on_action(cx.listener(|this, _: &NextWikiLink, _, cx| this.wiki_navigate(1, cx)))
+            .on_action(cx.listener(|this, _: &PreviousWikiLink, _, cx| this.wiki_navigate(-1, cx)))
+            .on_action(cx.listener(|this, _: &DismissWikiLinks, _, cx| this.wiki_dismiss(cx)))
             .on_action(cx.listener(|this, _: &OpenCommandPalette, w, cx| this.open_palette(w, cx)))
             .on_action(cx.listener(|this, _: &SearchEverything, w, cx| this.toggle_content_search(w, cx)))
             .on_action(cx.listener(|this, _: &PasteFiles, w, cx| this.paste_files(w, cx)))
@@ -4437,12 +4511,14 @@ impl Render for Enso {
             .when_some(self.controls_overlay(window, cx), |view, overlay| view.child(overlay))
             .when_some(self.export_overlay(window, cx), |view, overlay| view.child(overlay))
             .when_some(self.lightbox_overlay(window, cx), |view, overlay| view.child(overlay))
+            .when_some(self.wiki_overlay(window, cx), |view, overlay| view.child(overlay))
             .when_some(self.toast_layer(window, cx), |view, layer| view.child(layer))
     }
 }
 
 fn bind_view_keys(cx: &mut App) {
     cx.bind_keys([
+        KeyBinding::new("f2", RenameSelected, Some("Enso")),
         KeyBinding::new("escape", DismissCommandPalette, Some("CommandPalette > Input")),
         KeyBinding::new("escape", DismissRichControls, Some("RichControls > Input")),
         KeyBinding::new("escape", DismissRichControls, Some("RichControls")),
@@ -4571,6 +4647,13 @@ fn bind_markdown_keys(cx: &mut App) {
         KeyBinding::new("enter", ContinueList, context),
         KeyBinding::new("tab", IndentListItem, context),
         KeyBinding::new("shift-tab", OutdentListItem, context),
+    ]);
+    cx.bind_keys([
+        KeyBinding::new("enter", ConfirmWikiLink, Some("WikiCompleting > MarkdownEditor > Input")),
+        KeyBinding::new("tab", ConfirmWikiLink, Some("WikiCompleting > MarkdownEditor > Input")),
+        KeyBinding::new("down", NextWikiLink, Some("WikiCompleting > MarkdownEditor > Input")),
+        KeyBinding::new("up", PreviousWikiLink, Some("WikiCompleting > MarkdownEditor > Input")),
+        KeyBinding::new("escape", DismissWikiLinks, Some("WikiCompleting > MarkdownEditor > Input")),
     ]);
 }
 
@@ -4879,17 +4962,12 @@ fn main() {
             ]);
             // Act on the selected tree row. Bound on the window, not in text
             // fields, so they never take over these keys while typing.
-            cx.bind_keys(if cfg!(target_os = "macos") {
-                [
-                    KeyBinding::new("cmd-backspace", DeleteSelected, Some("Enso")),
-                    KeyBinding::new("enter", RenameSelected, Some("Enso")),
-                ]
-            } else {
-                [
-                    KeyBinding::new("delete", DeleteSelected, Some("Enso")),
-                    KeyBinding::new("f2", RenameSelected, Some("Enso")),
-                ]
-            });
+            cx.bind_keys([
+                KeyBinding::new(if cfg!(target_os = "macos") { "cmd-backspace" } else { "delete" }, DeleteSelected, Some("Enso")),
+            ]);
+            if cfg!(target_os = "macos") {
+                cx.bind_keys([KeyBinding::new("enter", RenameSelected, Some("Enso"))]);
+            }
             cx.bind_keys([
                 KeyBinding::new(if cfg!(target_os = "macos") { "cmd-shift-n" } else { "ctrl-shift-n" }, NewFolder, Some("Enso")),
             ]);
@@ -5768,6 +5846,8 @@ mod transition_tests {
             assert!(app.expanded.contains(&root.join("folder")));
         });
         assert!(root.join("folder/note.md").is_file() && !root.join("note.md").exists());
+        cx.executor().advance_clock(std::time::Duration::from_millis(200));
+        draw(cx, handle);
         // A Finder item dropped on the folder is copied in, twice with a number.
         for _ in 0..2 {
             cx.update(|cx| view.update(cx, |app, cx| {
@@ -6401,15 +6481,7 @@ mod transition_tests {
         std::fs::write(&note, "hi").unwrap();
         cx.update(|cx| {
             gpui_kit::init(cx);
-            let (delete, rename) = if cfg!(target_os = "macos") {
-                ("cmd-backspace", "enter")
-            } else {
-                ("delete", "f2")
-            };
-            cx.bind_keys([
-                gpui_kit::KeyBinding::new(delete, super::DeleteSelected, Some("Enso")),
-                gpui_kit::KeyBinding::new(rename, super::RenameSelected, Some("Enso")),
-            ]);
+            bind_view_keys(cx);
         });
         let (handle, view) = cx.update(|cx| {
             gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
@@ -6423,15 +6495,9 @@ mod transition_tests {
             .unwrap()
         });
         draw(cx, handle);
-        let keys = if cfg!(target_os = "macos") {
-            ("cmd-backspace", "enter")
-        } else {
-            ("delete", "f2")
-        };
-
         // Rename opens the name field on the selected row, which stays open
         // to type in, and Enter renames the file on disk.
-        cx.simulate_keystrokes(handle, keys.1);
+        cx.simulate_keystrokes(handle, "f2");
         cx.update(|cx| assert_eq!(view.read(cx).renaming.as_ref(), Some(&note)));
         draw(cx, handle);
         cx.update(|cx| assert_eq!(view.read(cx).renaming.as_ref(), Some(&note)));
