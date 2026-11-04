@@ -184,6 +184,19 @@ jobs:
           version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
           tag="v$version"
           ls -l dist
+          # The release text: .github/release-template.md, with the version
+          # and its CHANGELOG.md section (### <version> up to the next ###).
+          changelog=$(awk -v v="### $version" '
+            $0 ~ /^### / && !/^#### / { if (found) exit; if ($0 == v) { found = 1; next } }
+            found { print }
+          ' CHANGELOG.md | sed -e '/./,$!d')
+          [ -n "$changelog" ] || changelog="No changelog available"
+          CHANGELOG="$changelog" VERSION="$version" python3 -c '
+          import os, sys
+          text = open(".github/release-template.md").read()
+          text = text.replace("{{version}}", os.environ["VERSION"]).replace("{{changelog}}", os.environ["CHANGELOG"].strip())
+          open("release-notes.md", "w").write(text)
+          '
           if draft=$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft 2>/dev/null); then
             if [ "$draft" != "true" ]; then
               echo "::error::$tag is already published. Bump the version in Cargo.toml for a new release."
@@ -191,6 +204,7 @@ jobs:
             fi
             # Already drafted for this version: refresh its files.
             gh release upload "$tag" dist/* --repo "$GITHUB_REPOSITORY" --clobber
+            gh release edit "$tag" --repo "$GITHUB_REPOSITORY" --notes-file release-notes.md
           else
             # A draft: nothing is public, and the tag is only created on publish.
             gh release create "$tag" dist/* \
@@ -198,5 +212,5 @@ jobs:
               --draft \
               --target "$GITHUB_SHA" \
               --title "enso $tag" \
-              --generate-notes
+              --notes-file release-notes.md
           fi
