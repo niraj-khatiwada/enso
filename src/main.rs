@@ -4,6 +4,8 @@
 
 mod app_icon;
 mod brand;
+mod callout;
+mod math;
 mod diagram;
 mod export;
 mod files;
@@ -4035,7 +4037,7 @@ impl Render for Enso {
                                         .pl(px(reader::TEXT_INSET_X))
                                         .pr_4()
                                         .pt(px(reader::TEXT_INSET_Y))
-                                        .pb_8()
+                                        .pb(px(reader::TEXT_INSET_Y))
                                         .image_source(move |uri| {
                                             let source = uri.to_string();
                                             if !source.contains(':') {
@@ -4458,6 +4460,7 @@ impl Render for Enso {
                         )
                         .child(
                             v_flex()
+                                .relative()
                                 .flex_1()
                                 .min_w_0()
                                 .h_full()
@@ -4482,24 +4485,24 @@ impl Render for Enso {
                                 } else {
                                     h_flex().flex_1().min_h_0().min_w_0().relative().child(self.outline_rail(window,cx)).child(body.h_full().min_w_0())
                                 })
-                                .when(!focusing, |view| view.child(
-                                    h_flex()
-                                        .relative()
+                                .when(!focusing && self.active.is_some(), |view| view.child(
+                                    // Only the count occupies space; the document
+                                    // can use the former status bar's full height.
+                                    div()
+                                        .id("word-count-pill")
+                                        .absolute()
+                                        .bottom_2()
+                                        .right_3()
                                         .h(px(20.))
-                                        .flex_shrink_0()
+                                        .flex()
                                         .items_center()
-                                        .overflow_hidden()
-                                        .px_3()
-                                        .py_0()
-                                        .gap_3()
-                                        .justify_end()
-                                        .border_t_1()
-                                        .border_color(theme.border)
+                                        .px_2()
+                                        .rounded_full()
+                                        .bg(theme.background)
                                         .text_size(px(10.))
                                         .line_height(relative(1.))
-                                        .child(
-                                            div().text_color(theme.muted_foreground).child(stats),
-                                        ),
+                                        .text_color(theme.muted_foreground)
+                                        .child(stats),
                                 )),
                         ),
                 ),

@@ -76,6 +76,7 @@ resvg = { version = "0.46", default-features = false, features = ["text", "syste
 # rather than a bundled TLS stack.
 ureq = { version = "3.5", default-features = false, features = ["native-tls-no-default"] }
 bytes = "1"
+latex-rust = { version = "=2.1.1", default-features = false, features = ["std"] }
 
 # Moving deleted files to the Trash: the trash crate on macOS and Linux;
 # Windows goes through the shell itself (see files::move_to_trash).

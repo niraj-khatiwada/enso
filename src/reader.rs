@@ -5,6 +5,7 @@ use gpui_kit::{prelude::FluentBuilder, *};
 use std::{ops::Range, path::PathBuf, sync::Arc};
 
 const SECTION_BYTES: usize = 2048;
+const EXTENSION_BYTES: usize = 16 * 1024;
 pub const LARGE_DOCUMENT_BYTES: usize = 256 * 1024;
 /// Where text starts in the reading view, matching where GPUI Kit's editor
 /// draws it with line numbers off (6 px padding + 6 px gutter margin across,
@@ -16,6 +17,33 @@ pub const TEXT_INSET_Y: f32 = 8.;
 /// front, which stalls on files this big. Below it, long lines wrap like the
 /// reading view does.
 pub const NO_WRAP_BYTES: usize = 4 * 1024 * 1024;
+
+/// Look ahead only at extension openers, within a fixed parsing budget.
+fn extension_end(source: &str, offset: usize) -> Option<usize> {
+    let rest = &source[offset..];
+    let first = rest.split_inclusive('\n').next()?;
+    let trimmed = first.trim();
+    if trimmed.starts_with("$$") {
+        if trimmed.len() > 4 && trimmed[2..].contains("$$") { return Some(offset + first.len()); }
+        let mut bytes = first.len();
+        for line in rest[first.len()..].split_inclusive('\n') {
+            bytes += line.len();
+            if bytes > EXTENSION_BYTES { return None; }
+            if line.trim_start().starts_with("$$") { return Some(offset + bytes); }
+        }
+    } else if let Some(marker) = trimmed.strip_prefix("> [!") {
+        let end = marker.find(']')?;
+        crate::callout::Kind::parse(&marker[..end])?;
+        let mut bytes = first.len();
+        for line in rest[first.len()..].split_inclusive('\n') {
+            if !line.trim_start().starts_with('>') { break; }
+            bytes += line.len();
+            if bytes > EXTENSION_BYTES { return None; }
+        }
+        return Some(offset + bytes);
+    }
+    None
+}
 
 pub struct Section {
     range: Range<usize>,
@@ -52,11 +80,23 @@ impl LargeReader {
         let mut offset = 0;
         let mut fence: Option<(char, usize, String)> = None;
         let mut prefix = String::new();
+        let mut protected_end = 0;
         for line in source.split_inclusive('\n') {
+            if offset >= protected_end && fence.is_none() {
+                if let Some(end) = extension_end(source, offset) {
+                    // Keep an equation or small callout in one parsing unit.
+                    if offset > start {
+                        sections.push(Section { range: start..offset, prefix, suffix: String::new() });
+                        prefix = String::new();
+                        start = offset;
+                    }
+                    protected_end = end;
+                }
+            }
             // Flush before the next line exceeds the synchronous parsing budget.
             // Prefer paragraph boundaries below, but never require an enormous
             // paragraph or a single long line to be laid out as one element.
-            if offset > start && offset - start + line.len() > SECTION_BYTES {
+            if offset >= protected_end && offset > start && offset - start + line.len() > SECTION_BYTES {
                 let suffix = fence
                     .as_ref()
                     .map(|(c, n, _)| format!("\n{}\n", c.to_string().repeat(*n)))
@@ -99,7 +139,7 @@ impl LargeReader {
                 }
             }
             let end = offset + line.len();
-            while end - start > SECTION_BYTES {
+            while offset >= protected_end && end - start > SECTION_BYTES {
                 let mut boundary = start + SECTION_BYTES;
                 while !source.is_char_boundary(boundary) {
                     boundary -= 1;
@@ -120,7 +160,7 @@ impl LargeReader {
                 start = boundary;
             }
             offset = end;
-            if offset - start >= SECTION_BYTES / 2 && line.trim().is_empty() && fence.is_none() {
+            if offset >= protected_end && offset - start >= SECTION_BYTES / 2 && line.trim().is_empty() && fence.is_none() {
                 sections.push(Section {
                     range: start..offset,
                     prefix,
@@ -293,7 +333,7 @@ impl Render for LargeReader {
                 // Breathing room above the first section and below the last;
                 // part of the list, so it scrolls away with the text.
                 .when(index == 0, |d| d.pt(px(TEXT_INSET_Y)))
-                .when(index == last, |d| d.pb_8())
+                .when(index == last, |d| d.pb(px(TEXT_INSET_Y)))
                 .child(
                     div().w_full().child(
                         match &highlighted {
@@ -399,5 +439,22 @@ mod tests {
             read,
             total
         );
+    }
+}
+
+#[cfg(test)]
+mod extension_tests {
+    #[test]
+    fn large_readers_keep_equations_and_callouts_whole() {
+        let math = format!("$$\n{}\n$$\n", "x + ".repeat(600) + "y");
+        let callout = format!("> [!NOTE]\n{}", "> A paragraph.\n".repeat(190));
+        let source = "text\n\n".repeat(400) + &math + "\n" + &callout + "\nAfter.\n";
+        let sections = super::LargeReader::index(&source);
+        let restored: String = sections.iter().map(|s| &source[s.range.clone()]).collect();
+        assert_eq!(restored, source);
+        for block in [&math, &callout] {
+            let start = source.find(block.as_str()).unwrap();
+            assert!(sections.iter().any(|s| s.range.start <= start && s.range.end >= start + block.len()));
+        }
     }
 }

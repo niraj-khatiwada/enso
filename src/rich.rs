@@ -203,11 +203,16 @@ pub(crate) fn decorate_mapped(
     let footer_owner = owner.clone();
     let image_mapping = mapping.clone();
     let task_mapping = mapping.clone();
-    view.plugin(inline).plugin(wiki)
+    let callouts = crate::callout::Plugin { owner: owner.clone(), editor: editor_id, base: base.clone(), mapping: mapping.clone() };
+    view.plugin(inline).plugin(wiki).plugin(callouts).plugin(crate::math::InlineMath)
         .markdown_block_parser(|node, context| {
             let source = context.node_source(node)?;
             if matches!(node, Node::Html(_)) && source.trim() == "<!--enso-backlinks-->" {
                 return Some(MarkdownNode::new("enso-backlinks", ()).markdown(source.to_owned()));
+            }
+            if let Node::Math(math) = node {
+                return Some(MarkdownNode::new("enso-math", crate::math::Equation::new(&math.value, true))
+                    .text(math.value.clone()).markdown(source.to_owned()));
             }
             if let Node::Code(code) = node {
                 if crate::diagram::is_mermaid(code.lang.as_deref()) {
@@ -231,6 +236,9 @@ pub(crate) fn decorate_mapped(
                     .text(picture.alt)
                     .markdown(source.to_owned()),
             )
+        })
+        .markdown_block_renderer("enso-math", |node, _, cx| {
+            crate::math::block(node.data::<crate::math::Equation>().unwrap(), cx)
         })
         .markdown_block_renderer("enso-backlinks", move |_, _, cx| {
             footer_owner.update(cx, |app, cx| app.linked_from(editor_id, cx))

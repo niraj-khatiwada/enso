@@ -115,7 +115,7 @@ pub fn pdf(source: &str, base: Option<&Path>, title: &str, settings: PdfLayout) 
         for (y, item) in page_items {
             let top = MARGIN_TOP + y;
             paint(&mut surface, item, top, &mut links);
-            if let Item::Line(Line { heading: Some((level, text)), .. }) = item {
+            if let Some(Line { heading: Some((level, text)), .. }) = item.line() {
                 headings.push((*level, text.clone(), index, top));
             }
         }
@@ -145,7 +145,7 @@ fn page_size(settings: PdfLayout) -> (f32, f32) {
 /// top of the page's content area.
 fn typeset(source: &str, base: Option<&Path>, settings: PdfLayout) -> Result<Vec<Vec<(f32, Item)>>, String> {
     let mut options = markdown::ParseOptions::gfm();
-    // As the reader: `$$` blocks show as code, `$x$` stays literal.
+    // Match the reader's block and inline math syntax.
     options.constructs.math_flow = true;
     options.constructs.math_text = true;
     let tree = markdown::to_mdast(source, &options).map_err(|e| e.to_string())?;
@@ -164,9 +164,9 @@ fn paginate(items: Vec<Item>, height: f32) -> Vec<Vec<(f32, Item)>> {
     // Headings, and a table's header row, stay with what follows them.
     let keeps: Vec<bool> = items
         .iter()
-        .map(|i| matches!(i, Item::Line(l) if l.keep_with_next) || matches!(i, Item::Row(r) if r.header))
+        .map(Item::keep_with_next)
         .collect();
-    let spaces: Vec<bool> = items.iter().map(|i| matches!(i, Item::Space { panel: None, .. })).collect();
+    let spaces: Vec<bool> = items.iter().map(Item::spacer).collect();
     let mut pages: Vec<Vec<(f32, Item)>> = vec![Vec::new()];
     let mut y = 0f32;
     for (i, item) in items.into_iter().enumerate() {
@@ -281,6 +281,12 @@ fn paint(surface: &mut Surface, item: &Item, top: f32, links: &mut Vec<(Rect, St
             paint_bars(surface, bars, top, *height);
         }
         Item::Line(line) => paint_line(surface, line, 0., top, links),
+        Item::Formula{x,width,height:_,formula}=>paint_formula(surface,formula,MARGIN_X+x,top,*width/formula.width.max(1.)),
+        Item::Callout{panel,accent,item}=>{
+            let height=item.height();paint_panel(surface,&Some(*panel),top,height);
+            fill(surface,*accent,0.65);draw(surface,rect(MARGIN_X+panel.x,top-0.3,2.,height+0.6));
+            paint(surface,item,top,links);
+        },
         Item::Rule { x, width } => {
             fill(surface, layout::BORDER, 1.);
             draw(surface, rect(MARGIN_X + x, top + 7.5, *width, 0.8));
@@ -315,6 +321,36 @@ fn paint(surface: &mut Surface, item: &Item, top: f32, links: &mut Vec<(Rect, St
             }
         }
     }
+}
+
+fn paint_formula(surface:&mut Surface,formula:&crate::math::Formula,x:f32,y:f32,scale:f32){
+    surface.push_transform(&krilla::geom::Transform::from_translate(x,y));
+    surface.push_transform(&krilla::geom::Transform::from_scale(scale,scale));
+    paint_math_group(surface,formula.tree.root());
+    surface.pop();surface.pop();
+}
+fn paint_math_group(surface:&mut Surface,group:&resvg::usvg::Group){
+    use resvg::usvg::{Node,Paint};
+    use resvg::tiny_skia::PathSegment;
+    for node in group.children(){match node{
+        Node::Group(group)=>paint_math_group(surface,group),
+        Node::Path(path)=>{
+            let Some(paint)=path.fill()else{continue};
+            let Paint::Color(c)=paint.paint()else{continue};
+            fill(surface,(c.red,c.green,c.blue),paint.opacity().get());
+            let mut builder=PathBuilder::new();
+            for segment in path.data().segments(){match segment{
+                PathSegment::MoveTo(p)=>builder.move_to(p.x,p.y),
+                PathSegment::LineTo(p)=>builder.line_to(p.x,p.y),
+                PathSegment::QuadTo(a,b)=>builder.quad_to(a.x,a.y,b.x,b.y),
+                PathSegment::CubicTo(a,b,c)=>builder.cubic_to(a.x,a.y,b.x,b.y,c.x,c.y),
+                PathSegment::Close=>builder.close(),
+            }}
+            let t=path.abs_transform();
+            surface.push_transform(&krilla::geom::Transform::from_row(t.sx,t.ky,t.kx,t.sy,t.tx,t.ty));
+            draw(surface,builder.finish());surface.pop();
+        },_=>{},
+    }}
 }
 
 fn circle(cx: f32, cy: f32, r: f32) -> Option<Shape> {
@@ -364,6 +400,9 @@ fn paint_line(surface: &mut Surface, line: &Line, dx: f32, top: f32, links: &mut
         let x = MARGIN_X + dx + frag.x;
         let size = frag.style.size;
         let y = baseline - frag.style.raise;
+        if let Some(formula)=&frag.math {
+            let scale=size/16.;paint_formula(surface,formula,x,y-formula.baseline*scale,scale);
+        }
         if !frag.text.trim().is_empty() {
             fill(surface, frag.style.color, 1.);
             surface.draw_text(Point::from_xy(x, y), frag.face.font.clone(), size, &frag.text, false, TextDirection::Auto);
@@ -571,6 +610,45 @@ mod tests {
             assert!(contents.contains(name), "selected {name} font must be embedded");
             assert!(contents.contains("/FontFile2") || contents.contains("/FontFile3"), "PDF must contain font data");
         }
+    }
+
+    #[test]
+    fn math_and_callouts_export_as_vectors_even_with_images_disabled() {
+        let source = r"# Math and callouts
+
+> [!NOTE]
+> A calm note with **formatted** text and $x^2$.
+
+> [!TIP] A useful identity
+> Inline $e^{i\pi}+1=0$ fits within this sentence.
+
+> [!WARNING]
+> Keep the original files before replacing a workspace.
+
+$$
+\frac{-b\pm\sqrt{b^2-4ac}}{2a}
+$$
+
+$$
+\begin{pmatrix}a&b\\c&d\end{pmatrix}
+$$
+";
+        let layout = PdfLayout { images:false, ..LAYOUT };
+        let pages = typeset(source,None,layout).unwrap();
+        assert!(pages.iter().flatten().any(|(_,item)|matches!(item,Item::Formula{..})));
+        assert!(pages.iter().flatten().any(|(_,item)|matches!(item,Item::Callout{..})));
+        fn has_math(item:&Item)->bool {
+            match item {Item::Line(line)=>line.frags.iter().any(|f|f.math.is_some()),Item::Callout{item,..}=>has_math(item),_=>false}
+        }
+        assert!(pages.iter().flatten().any(|(_,item)|has_math(item)));
+        let bytes = pdf(source,None,"Math and callouts",layout).unwrap();
+        assert!(bytes.starts_with(b"%PDF"));
+        std::fs::write("/tmp/enso-callout-math.pdf",bytes).unwrap();
+        let long=format!("> [!NOTE] Long note\n{}", "> A paragraph that flows across pages.\n>\n".repeat(160));
+        let pages=typeset(&long,None,layout).unwrap();
+        assert!(pages.len()>1);
+        let height=page_size(layout).1-MARGIN_TOP-MARGIN_BOTTOM;
+        for page in pages {for (top,item) in page {assert!(top+item.height()<=height+0.5);}}
     }
 
     const SAMPLE: &str = r##"# Heading 1
