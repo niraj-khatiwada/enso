@@ -115,6 +115,26 @@ pub fn download(uri: &str) -> http_client::Result<(Vec<u8>, Option<String>)> {
     Ok((bytes, content_type))
 }
 
+/// Fetch a small text document such as a JSON API reply (blocking: call it
+/// off the window's thread). Not governed by Load Web Images, which is only
+/// about pictures in notes; callers have their own switch.
+pub fn get_text(uri: &str, accept: &str) -> http_client::Result<String> {
+    let client = Client::new();
+    let mut response = client
+        .agent
+        .get(uri)
+        .header("User-Agent", client.user_agent.to_str().unwrap_or("enso"))
+        .header("Accept", accept)
+        .call()
+        .map_err(|e| http_client::anyhow!("{e}"))?;
+    response
+        .body_mut()
+        .with_config()
+        .limit(1024 * 1024)
+        .read_to_string()
+        .map_err(|e| http_client::anyhow!("{e}"))
+}
+
 fn fetch(agent: &ureq::Agent, uri: &str, user_agent: &HeaderValue) -> http_client::Result<Response<AsyncBody>> {
     let mut response = agent
         .get(uri)

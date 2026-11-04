@@ -19,6 +19,7 @@ mod spellcheck;
 mod stats;
 mod typography;
 mod ui;
+mod update;
 mod workspaces;
 
 use gpui_kit::assets::IconName;
@@ -4380,6 +4381,36 @@ fn open_urls(urls: Vec<String>, cx: &mut App) {
     }
 }
 
+/// Look for a newer enso in the background (at most once a day, if allowed
+/// in Settings) and say so in the front window. Never holds up startup;
+/// a failed check stays silent.
+fn check_for_updates(cx: &mut App) {
+    if !settings::check_updates(cx) || !update::due() {
+        return;
+    }
+    let found = cx.background_executor().spawn(async { update::check() });
+    cx.spawn(async move |cx| {
+        let Some(release) = found.await else { return };
+        cx.update(|cx| {
+            let active = cx.active_window();
+            let views = open_views(cx);
+            let Some((_, view)) = views
+                .iter()
+                .find(|(handle, _)| Some(*handle) == active)
+                .or(views.first())
+                .cloned()
+            else {
+                return;
+            };
+            let url = release.url;
+            let toast = ui::toast::info("update", format!("enso {} is available", release.version))
+                .action(IconName::Download, "Download", move |_, cx| cx.open_url(&url));
+            view.update(cx, |app, cx| app.toast(toast, cx));
+        });
+    })
+    .detach();
+}
+
 fn open_workspace_window(root: Option<PathBuf>, cx: &mut App) {
     open_enso_window(cx, move |app, _, cx| {
         if let Some(root) = root {
@@ -4516,6 +4547,7 @@ fn main() {
                     }),
                 }
             }
+            check_for_updates(cx);
             cx.spawn(async move |cx| {
                 use futures::StreamExt as _;
                 while let Some(urls) = opened_rx.next().await {

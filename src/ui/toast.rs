@@ -25,6 +25,8 @@ pub enum Mark {
     Done,
     Working,
     Error,
+    /// News, such as a newer enso: an "i" in the theme's info color.
+    Info,
 }
 
 /// A button on a toast: an icon, with its label as the tooltip.
@@ -84,6 +86,18 @@ pub fn working(id: impl Into<SharedString>, text: impl Into<SharedString>) -> To
     }
 }
 
+/// News that waits to be read: it stays until dismissed.
+pub fn info(id: impl Into<SharedString>, title: impl Into<SharedString>) -> Toast {
+    Toast {
+        id: id.into(),
+        mark: Mark::Info,
+        title: title.into(),
+        detail: SharedString::default(),
+        action: None,
+        autohide: false,
+    }
+}
+
 /// Something went wrong. The same message again replaces the toast rather
 /// than stacking another.
 pub fn error(text: impl Into<SharedString>) -> Toast {
@@ -124,6 +138,10 @@ pub fn render(
         Mark::Error => Icon::new(IconName::CircleX)
             .size_4()
             .text_color(theme.danger)
+            .into_any_element(),
+        Mark::Info => Icon::new(IconName::Info)
+            .size_4()
+            .text_color(theme.info)
             .into_any_element(),
     };
     let id = ElementId::from(toast.id.clone());

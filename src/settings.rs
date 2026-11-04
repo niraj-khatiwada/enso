@@ -53,6 +53,8 @@ pub struct Preferences {
     pub(crate) split_order_path: Option<PathBuf>,
     /// The sidebar is open; every window and workspace opens it this way.
     pub sidebar_open: bool,
+    /// Ask GitHub once a day whether a newer enso is out.
+    pub check_updates: bool,
     window: Option<AnyWindowHandle>,
     path: Option<PathBuf>,
 }
@@ -100,6 +102,24 @@ fn set_confirm_delete(on: bool, cx: &mut App) -> io::Result<()> {
     if !cx.has_global::<Preferences>() { init(cx); }
     cx.update_global::<Preferences, _>(|prefs, _| prefs.confirm_delete = on);
     if let Some(path) = confirm_delete_path() {
+        if let Some(parent) = path.parent() { std::fs::create_dir_all(parent)?; }
+        std::fs::write(path, if on { "on" } else { "off" })?;
+    }
+    Ok(())
+}
+fn check_updates_path() -> Option<PathBuf> {
+    dirs::config_dir().map(|p| crate::files::app_folder(p).join("check-for-updates"))
+}
+/// Whether enso looks for a newer release on launch; on unless turned off.
+pub fn check_updates(cx: &App) -> bool {
+    cx.try_global::<Preferences>().is_none_or(|p| p.check_updates)
+}
+fn set_check_updates(on: bool, cx: &mut App) -> io::Result<()> {
+    // Tests mustn't change the real preference.
+    if cfg!(test) { return Ok(()); }
+    if !cx.has_global::<Preferences>() { init(cx); }
+    cx.update_global::<Preferences, _>(|prefs, _| prefs.check_updates = on);
+    if let Some(path) = check_updates_path() {
         if let Some(parent) = path.parent() { std::fs::create_dir_all(parent)?; }
         std::fs::write(path, if on { "on" } else { "off" })?;
     }
@@ -238,6 +258,7 @@ pub fn init(cx: &mut App) {
     let split_order_path = split_order_path();
     let reader_first = split_order_path.as_deref().is_some_and(load_reader_first);
     let sidebar_open = sidebar_path().as_deref().is_none_or(load_sidebar_open);
+    let check_updates = check_updates_path().as_deref().is_none_or(load_document_outline);
     let reading_path = crate::typography::preference_path();
     let reading = reading_path.as_deref()
         .map(crate::typography::ReadingStyle::load).unwrap_or_default();
@@ -253,6 +274,7 @@ pub fn init(cx: &mut App) {
         reader_first,
         split_order_path,
         sidebar_open,
+        check_updates,
         window: None,
         path,
     });
@@ -431,7 +453,7 @@ pub fn open(cx: &mut App) {
                 focus.focus(window, cx);
                 SettingsWindow {
                     focus,
-                    category: Category::Appearance,
+                    category: Category::General,
                     error: None,
                     _appearance: watch_system(window),
                     _preferences: cx.observe_global::<Preferences>(|_, cx| cx.notify()),
@@ -446,15 +468,17 @@ pub fn open(cx: &mut App) {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Category {
+    General,
     Appearance,
     Editor,
 }
 
 impl Category {
-    const ALL: [Category; 2] = [Category::Appearance, Category::Editor];
+    const ALL: [Category; 3] = [Category::General, Category::Appearance, Category::Editor];
 
     fn label(self) -> &'static str {
         match self {
+            Self::General => "General",
             Self::Appearance => "Appearance",
             Self::Editor => "Editor",
         }
@@ -462,6 +486,7 @@ impl Category {
 
     fn icon(self) -> IconName {
         match self {
+            Self::General => IconName::Settings,
             Self::Appearance => IconName::Palette,
             Self::Editor => IconName::Pencil,
         }
@@ -524,6 +549,27 @@ fn page_header(title: &'static str, description: &'static str, muted: Hsla) -> i
 }
 
 impl SettingsWindow {
+    fn general_page(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme().clone();
+        let weak = cx.entity().downgrade();
+        v_flex()
+            .gap_6()
+            .child(page_header("General", "How enso behaves on this device.", theme.muted_foreground))
+            .child(
+                h_flex().gap_4().items_center().justify_between().py_3()
+                    .child(v_flex().gap_0p5()
+                        .child(div().text_sm().font_weight(FontWeight::MEDIUM).child("Check for Updates"))
+                        .child(div().text_xs().text_color(theme.muted_foreground).child(
+                            "Once a day, ask GitHub whether a newer enso is out. Nothing downloads on its own.")))
+                    .child(Switch::new("check-updates").checked(check_updates(cx))
+                        .accessibility_label("Check for Updates")
+                        .on_change(move |on, _, cx| {
+                            let error = set_check_updates(*on, cx).err().map(|e| format!("Could not save general settings: {e}"));
+                            let _ = weak.update(cx, |this, cx| { this.error = error; cx.notify(); });
+                        })),
+            )
+    }
+
     fn appearance_page(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
         let selected = current(cx);
@@ -723,6 +769,7 @@ impl Render for SettingsWindow {
         let theme = cx.theme().clone();
         let category = self.category;
         let page = match category {
+            Category::General => self.general_page(cx).into_any_element(),
             Category::Appearance => self.appearance_page(cx).into_any_element(),
             Category::Editor => self.editor_page(cx).into_any_element(),
         };
