@@ -13,6 +13,8 @@ Enhancements:
 - Search everything finds text in large notes too: files over 4 MB are searched straight from disk, without slowing the search down.
 - Find in Read view: Cmd/Ctrl + F opens a find bar over the page, highlights every match, and steps through them with Enter and Shift + Enter. The editor keeps its own Find and Replace.
 - Opening a search result selects the match in the editor and highlights it in the reader for a few seconds, so it's easy to spot.
+- Focus Mode (Cmd/Ctrl + Shift + Enter, or the command palette): the sidebar, tabs, outline and status bar step away and the page sits in a centred column. While writing, the line with the cursor stays in the middle of the view and the other paragraphs fade. Escape leaves it.
+- Pasting a web address over selected words turns them into a link.
 - Moving a file into a folder that already has one by that name keeps both, numbering the moved one, instead of refusing.
 
 ### 1.0.0

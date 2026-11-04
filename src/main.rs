@@ -8,6 +8,7 @@ mod diagram;
 mod export;
 mod files;
 mod find;
+mod focus;
 mod http;
 mod lock;
 mod markdown_edit;
@@ -76,6 +77,7 @@ actions!(
         SearchEverything,
         PasteFiles,
         FindInPage,
+        ToggleFocusMode,
         CopySelected,
         CutSelected,
         ExportNote,
@@ -463,6 +465,35 @@ fn outermost(paths: Vec<PathBuf>) -> Vec<PathBuf> {
     kept
 }
 
+/// A web address alone on the clipboard, pasted over a selection on one
+/// line: the selection becomes `[selection](address)`. False when the paste
+/// is anything else, to go ahead as usual.
+fn link_pasted_url(editor: &Entity<EditorState>, item: &ClipboardItem, window: &mut Window, cx: &mut App) -> bool {
+    let Some(url) = item.text().map(|t| t.trim().to_string()).filter(|t| is_web_address(t)) else {
+        return false;
+    };
+    let state = editor.read(cx);
+    let range = state.selected_range();
+    if range.is_empty() || !state.is_editable() {
+        return false;
+    }
+    let value = state.value();
+    let Some(selected) = value.get(range) else { return false };
+    if selected.contains('\n') || is_web_address(selected.trim()) {
+        return false;
+    }
+    let label = selected.replace('[', "\\[").replace(']', "\\]");
+    let link = format!("[{label}]({url})");
+    editor.update(cx, |state, cx| state.replace(link, window, cx));
+    true
+}
+
+fn is_web_address(text: &str) -> bool {
+    (text.starts_with("https://") || text.starts_with("http://"))
+        && text.len() > "https://".len()
+        && !text.chars().any(char::is_whitespace)
+}
+
 /// Files copied or cut in the sidebar, with the text the clipboard got (all
 /// it keeps on Linux and Windows, where paste recognises it as these files).
 struct CopiedFiles {
@@ -544,6 +575,14 @@ struct Enso {
     pending_flash: Option<(EntityId, Vec<std::ops::Range<usize>>)>,
     flash_task: Option<Task<()>>,
     page_find: Option<find::PageFind>,
+    /// Focus Mode: only the page, centred.
+    focus_mode: bool,
+    focus_track: Option<focus::FocusTrack>,
+    /// Split was on when Focus Mode began; it comes back when it ends.
+    split_before_focus: bool,
+    /// The cursor last moved by a click: Focus Mode leaves the view where it
+    /// is then, and only centres on moves from the keyboard.
+    clicked: bool,
     /// While a tab is dragged: where it came from and the tab it's over.
     dragging_tab: Option<usize>,
     tab_drop: Option<usize>,
@@ -669,6 +708,10 @@ impl Enso {
             pending_flash: None,
             flash_task: None,
             page_find: None,
+            focus_mode: false,
+            focus_track: None,
+            split_before_focus: false,
+            clicked: false,
             dragging_tab: None,
             tab_drop: None,
             tree_drop: None,
@@ -720,6 +763,10 @@ impl Enso {
         let Some(index) = self.active else {
             return;
         };
+        // Focus Mode is one page: Read or Edit, never Split.
+        if self.focus_mode && mode == Mode::Split {
+            return;
+        }
         if !self.documents[index].markdown {
             return;
         }
@@ -2880,9 +2927,11 @@ impl Render for Enso {
         let theme = cx.theme().clone();
         let backdrop = backdrop_visible(window, cx);
         let motion = theme.motion_tokens();
+        self.focus_frame(window, cx);
+        let focusing = self.focus_mode;
         let sidebar_reveal = transition(
             "sidebar-reveal",
-            if self.sidebar_open { 1.0_f32 } else { 0.0_f32 },
+            if self.sidebar_open && !focusing { 1.0_f32 } else { 0.0_f32 },
             Transition::new(motion.duration_normal).easing(motion.easing_move.clone()),
             window,
             cx,
@@ -3126,6 +3175,8 @@ impl Render for Enso {
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_else(|| "No workspace".into());
             Popover::new("workspace-switcher")
+                // Rows sit close to the edge, like the other menus.
+                .p_1()
                 .open(self.switcher_open)
                 .on_open_change({
                     let weak = weak.clone();
@@ -3198,7 +3249,6 @@ impl Render for Enso {
                     };
                     v_flex()
                         .w(px(240.))
-                        .p_1()
                         .children(recent.iter().enumerate().map(|(i, recent)| {
                             let path = recent.path.clone();
                             let current = current_root.as_ref() == Some(&recent.path);
@@ -3294,7 +3344,7 @@ impl Render for Enso {
                                     });
                                 })
                         }))
-                        .child(div().my_1().h(px(1.)).bg(theme.border))
+                        .child(div().mx_1().my_1().h(px(1.)).bg(theme.border))
                         .child({
                             let weak = weak.clone();
                             item("workspace-open".into())
@@ -3826,7 +3876,12 @@ impl Render for Enso {
                                 .on_paste({
                                     let weak = cx.entity().downgrade();
                                     let editor = document.editor.clone();
+                                    let markdown = document.markdown;
                                     move |item, window, cx| {
+                                        // A web address pasted over selected words links them.
+                                        if markdown && link_pasted_url(&editor, item, window, cx) {
+                                            return true;
+                                        }
                                         // Text pastes as usual. Image data (a screenshot)
                                         // or image files (copied in Finder) are saved into
                                         // the workspace and linked instead.
@@ -4179,11 +4234,11 @@ impl Render for Enso {
                                 ),
                         )
                         .child(div().flex_shrink_0().w(px(header_offset)))
-                        .child(document_header),
+                        .when(!focusing, |bar| bar.child(document_header)),
                 ));
             (Some(titlebar.into_any_element()), None)
         } else {
-            (None, Some(document_header.into_any_element()))
+            (None, (!focusing).then(|| document_header.into_any_element()))
         };
         let stats = self
             .active
@@ -4203,6 +4258,15 @@ impl Render for Enso {
             .on_action(cx.listener(|this, _: &SearchEverything, w, cx| this.toggle_content_search(w, cx)))
             .on_action(cx.listener(|this, _: &PasteFiles, w, cx| this.paste_files(w, cx)))
             .on_action(cx.listener(|this, _: &FindInPage, w, cx| this.open_page_find(w, cx)))
+            .on_action(cx.listener(|this, _: &ToggleFocusMode, w, cx| this.toggle_focus_mode(w, cx)))
+            .capture_any_mouse_down(cx.listener(|this, _: &MouseDownEvent, _, _| this.clicked = true))
+            .capture_key_down(cx.listener(|this, _: &KeyDownEvent, _, _| this.clicked = false))
+            // Escape leaves Focus Mode, once nothing nearer wanted it.
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, w, cx| {
+                if this.focus_mode && event.keystroke.key == "escape" {
+                    this.toggle_focus_mode(w, cx);
+                }
+            }))
             .on_action(cx.listener(|this, _: &CopySelected, w, cx| this.copy_selected(false, w, cx)))
             .on_action(cx.listener(|this, _: &CutSelected, w, cx| this.copy_selected(true, w, cx)))
             .on_action(cx.listener(|this, action: &spellcheck::ReplaceSpelling, w, cx| this.replace_spelling(action, w, cx)))
@@ -4336,8 +4400,15 @@ impl Render for Enso {
                                     )
                                 })
                                 .when_some(standard_header, |view, header| view.child(header))
-                                .child(h_flex().flex_1().min_h_0().min_w_0().relative().child(self.outline_rail(window,cx)).child(body.h_full().min_w_0()))
-                                .child(
+                                .child(if focusing {
+                                    // The page alone, in a centred column.
+                                    h_flex().flex_1().min_h_0().min_w_0().justify_center().child(
+                                        div().h_full().w_full().max_w(px(focus::COLUMN_WIDTH)).child(body.size_full()),
+                                    )
+                                } else {
+                                    h_flex().flex_1().min_h_0().min_w_0().relative().child(self.outline_rail(window,cx)).child(body.h_full().min_w_0())
+                                })
+                                .when(!focusing, |view| view.child(
                                     h_flex()
                                         .relative()
                                         .h(px(20.))
@@ -4355,7 +4426,7 @@ impl Render for Enso {
                                         .child(
                                             div().text_color(theme.muted_foreground).child(stats),
                                         ),
-                                ),
+                                )),
                         ),
                 ),
             )
@@ -4407,6 +4478,7 @@ fn bind_view_keys(cx: &mut App) {
             KeyBinding::new(primary("cmd-\\", "ctrl-\\"), ToggleSplit, Some(context)),
             // Ctrl+Tab on every platform: on macOS, Cmd+Tab belongs to the
             // system's app switcher, and browsers use Ctrl+Tab there too.
+            KeyBinding::new(primary("cmd-shift-enter", "ctrl-shift-enter"), ToggleFocusMode, Some(context)),
             KeyBinding::new("ctrl-tab", NextTab, Some(context)),
             KeyBinding::new("ctrl-shift-tab", PreviousTab, Some(context)),
         ]);
@@ -5522,6 +5594,120 @@ mod transition_tests {
         cx.executor().advance_clock(std::time::Duration::from_secs(4));
         cx.run_until_parked();
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn focus_mode_hides_the_chrome_and_fades_other_paragraphs(cx: &mut TestAppContext) {
+        cx.update(|cx| { gpui_kit::init(cx); bind_view_keys(cx); super::bind_markdown_keys(cx); });
+        let source = "# Title\n\nThe first paragraph.\n\nThe second one.\n";
+        let (handle, view) = cx.update(|cx| gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+            cx.new(|cx| {
+                let mut app = Enso::new(window, cx);
+                app.add_document(Some(PathBuf::from("focus.md")), source.into(), None, window, cx);
+                app.mode = Mode::Edit;
+                app
+            })
+        }).unwrap());
+        for _ in 0..3 { draw(cx, handle); cx.run_until_parked(); }
+        let editor = cx.update(|cx| view.read(cx).documents[0].editor.clone());
+        let at = source.find("first").unwrap();
+        cx.update_window(handle, |_, window, cx| {
+            editor.focus_handle(cx).focus(window, cx);
+            editor.update(cx, |e, cx| e.set_selected_range(at..at, cx));
+        }).unwrap();
+        let sidebar = cx.update(|cx| view.read(cx).sidebar_open);
+        let toggle = if cfg!(target_os = "macos") { "cmd-shift-enter" } else { "ctrl-shift-enter" };
+        cx.simulate_keystrokes(handle, toggle);
+        for _ in 0..4 { draw(cx, handle); cx.run_until_parked(); }
+        cx.update(|cx| {
+            let app = view.read(cx);
+            assert!(app.focus_mode);
+            // The sidebar setting itself is untouched; it only steps aside.
+            assert_eq!(app.sidebar_open, sidebar);
+            let track = app.focus_track.as_ref().unwrap();
+            let paragraph = crate::focus::paragraph_at(source, at);
+            assert_eq!(track.decorations.get_ranges(cx), vec![0..paragraph.start, paragraph.end..source.len()]);
+        });
+        // Escape (with nothing else to close) leaves, and the fading goes.
+        cx.simulate_keystrokes(handle, "escape");
+        draw(cx, handle);
+        cx.update(|cx| {
+            let app = view.read(cx);
+            assert!(!app.focus_mode && app.focus_track.is_none());
+        });
+    }
+
+    #[gpui_kit::test]
+    fn focus_mode_is_one_page_and_split_comes_back_after(cx: &mut TestAppContext) {
+        cx.update(|cx| { gpui_kit::init(cx); bind_view_keys(cx); super::bind_markdown_keys(cx); });
+        let (handle, view) = cx.update(|cx| gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+            cx.new(|cx| {
+                let mut app = Enso::new(window, cx);
+                app.add_document(Some(PathBuf::from("split.md")), "# Split\n\nText.\n".into(), None, window, cx);
+                app
+            })
+        }).unwrap());
+        for _ in 0..3 { draw(cx, handle); cx.run_until_parked(); }
+        let mode = |cx: &mut TestAppContext| cx.update(|cx| view.read(cx).mode);
+        let primary = if cfg!(target_os = "macos") { "cmd" } else { "ctrl" };
+        // Edit, then Split.
+        let _ = handle.update(cx, |_, window, cx| view.update(cx, |app, cx| {
+            app.set_mode(Mode::Edit, window, cx);
+            app.set_mode(Mode::Split, window, cx);
+        }));
+        draw(cx, handle);
+        assert!(mode(cx) == Mode::Split);
+        // Focus Mode shows the side Split came from, and won't split.
+        cx.simulate_keystrokes(handle, &format!("{primary}-shift-enter"));
+        draw(cx, handle);
+        assert!(mode(cx) == Mode::Edit);
+        cx.simulate_keystrokes(handle, &format!("{primary}-\\"));
+        draw(cx, handle);
+        assert!(mode(cx) == Mode::Edit);
+        // Leaving brings Split back.
+        cx.simulate_keystrokes(handle, &format!("{primary}-shift-enter"));
+        draw(cx, handle);
+        assert!(mode(cx) == Mode::Split);
+    }
+
+    #[gpui_kit::test]
+    fn a_web_address_pasted_over_words_links_them(cx: &mut TestAppContext) {
+        cx.update(|cx| { gpui_kit::init(cx); bind_view_keys(cx); super::bind_markdown_keys(cx); });
+        let source = "Read the guide today.";
+        let (handle, view) = cx.update(|cx| gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+            cx.new(|cx| {
+                let mut app = Enso::new(window, cx);
+                app.add_document(Some(PathBuf::from("links.md")), source.into(), None, window, cx);
+                app.mode = Mode::Edit;
+                app
+            })
+        }).unwrap());
+        for _ in 0..3 { draw(cx, handle); cx.run_until_parked(); }
+        let editor = cx.update(|cx| view.read(cx).documents[0].editor.clone());
+        let paste = if cfg!(target_os = "macos") { "cmd-v" } else { "ctrl-v" };
+        let at = source.find("guide").unwrap();
+        cx.update_window(handle, |_, window, cx| {
+            editor.focus_handle(cx).focus(window, cx);
+            editor.update(cx, |e, cx| e.set_selected_range(at..at + 5, cx));
+        }).unwrap();
+        cx.update(|cx| cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(" https://example.com/guide \n".into())));
+        cx.simulate_keystrokes(handle, paste);
+        draw(cx, handle);
+        let text = |cx: &mut TestAppContext| cx.update(|cx| editor.read(cx).value().to_string());
+        assert_eq!(text(cx), "Read the [guide](https://example.com/guide) today.");
+        // With nothing selected, the address pastes as text.
+        let end = text(cx).len();
+        cx.update_window(handle, |_, _, cx| editor.update(cx, |e, cx| e.set_selected_range(end..end, cx))).unwrap();
+        cx.update(|cx| cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string("https://a.io".into())));
+        cx.simulate_keystrokes(handle, paste);
+        draw(cx, handle);
+        assert!(text(cx).ends_with("today.https://a.io"));
+        // Ordinary text over a selection replaces it as usual.
+        cx.update_window(handle, |_, _, cx| editor.update(cx, |e, cx| e.set_selected_range(0..4, cx))).unwrap();
+        cx.update(|cx| cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string("Skim".into())));
+        cx.simulate_keystrokes(handle, paste);
+        draw(cx, handle);
+        assert!(text(cx).starts_with("Skim the [guide]"));
     }
 
     #[gpui_kit::test]
