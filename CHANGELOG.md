@@ -5,6 +5,7 @@
 Enhancements:
 
 - Ctrl + Tab moves to the next tab and Ctrl + Shift + Tab to the previous one, on every platform.
+- Ctrl + Shift + \ swaps the sides of Split on macOS too, like Ctrl + \ opens it.
 
 ### 1.0.0
 

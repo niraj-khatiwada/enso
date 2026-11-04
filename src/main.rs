@@ -4080,6 +4080,10 @@ fn bind_view_keys(cx: &mut App) {
             // Shift. Accept both representations from platform keyboards.
             KeyBinding::new(if cfg!(target_os = "macos") { "cmd-|" } else { "ctrl-|" }, SwapSplitSides, Some(context)),
             KeyBinding::new(if cfg!(target_os = "macos") { "cmd-shift-|" } else { "ctrl-shift-|" }, SwapSplitSides, Some(context)),
+            // Control works on macOS as well as Command, like Ctrl+\ for Split.
+            KeyBinding::new("ctrl-shift-\\", SwapSplitSides, Some(context)),
+            KeyBinding::new("ctrl-|", SwapSplitSides, Some(context)),
+            KeyBinding::new("ctrl-shift-|", SwapSplitSides, Some(context)),
             KeyBinding::new("ctrl-e", ToggleView, Some(context)),
             // Ctrl+Tab on every platform: on macOS, Cmd+Tab belongs to the
             // system's app switcher, and browsers use Ctrl+Tab there too.
@@ -5252,6 +5256,24 @@ mod transition_tests {
         draw(cx, handle);
         assert!(cx.update(|cx| view.read(cx).lightbox.is_none()));
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn ctrl_shift_backslash_swaps_the_split_sides(cx: &mut TestAppContext) {
+        // Control as well as Command on macOS, as with Ctrl+\ for Split; the
+        // shifted key also arrives as `|` from some keyboards.
+        cx.update(|cx| {
+            bind_view_keys(cx);
+            let keymap = cx.key_bindings();
+            let keymap = keymap.borrow();
+            for typed in ["ctrl-shift-\\", "ctrl-|"] {
+                let keystroke = gpui_kit::Keystroke::parse(typed).unwrap();
+                let bound = keymap
+                    .bindings_for_action(&super::SwapSplitSides)
+                    .any(|binding| binding.match_keystrokes(&[keystroke.clone()]) == Some(false));
+                assert!(bound, "{typed} doesn't swap the split sides");
+            }
+        });
     }
 
     #[gpui_kit::test]
