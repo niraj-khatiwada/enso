@@ -1,0 +1,74 @@
+---
+import Logo from "./Logo.astro";
+import { REPO_URL } from "../consts";
+
+const year = new Date().getFullYear();
+const links = [
+  { href: "/changelog", label: "Changelog" },
+  { href: REPO_URL, label: "Source Code" },
+  { href: `${REPO_URL}/releases`, label: "Releases" },
+  { href: `${REPO_URL}/issues`, label: "Report an Issue" },
+];
+---
+
+<footer class="site-footer">
+  <div class="container row">
+    <a href="/" class="brand" aria-label="enso Home">
+      <Logo size={22} />
+      <span>enso</span>
+    </a>
+    <nav class="links">
+      {links.map((l) => <a href={l.href}>{l.label}</a>)}
+    </nav>
+    <span class="copy">© {year} enso</span>
+  </div>
+</footer>
+
+<style>
+  .site-footer {
+    border-top: 1px solid var(--line);
+    padding: 28px 0 34px;
+    font-size: 13px;
+    color: var(--ink-soft);
+  }
+  .row {
+    display: flex;
+    align-items: center;
+    gap: 28px;
+  }
+  .brand {
+    display: inline-flex;
+    align-items: center;
+    gap: 9px;
+    font-family: var(--font-display);
+    font-size: 18px;
+    color: var(--ink);
+  }
+  .links {
+    display: flex;
+    gap: 22px;
+    margin-left: auto;
+  }
+  .links a {
+    transition: color 0.3s var(--ease);
+  }
+  .links a:hover {
+    color: var(--ink);
+  }
+  @media (max-width: 640px) {
+    .row {
+      flex-wrap: wrap;
+      gap: 16px 24px;
+    }
+    .links {
+      order: 3;
+      width: 100%;
+      margin-left: 0;
+      flex-wrap: wrap;
+      gap: 10px 20px;
+    }
+    .copy {
+      margin-left: auto;
+    }
+  }
+</style>

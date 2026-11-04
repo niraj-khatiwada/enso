@@ -1,0 +1,821 @@
+---
+import BaseHead from "../components/BaseHead.astro";
+import Header from "../components/Header.astro";
+import Footer from "../components/Footer.astro";
+import Enso from "../components/Enso.astro";
+import AppWindow from "../components/AppWindow.astro";
+import Brushmark from "../components/Brushmark.astro";
+import Icon from "../components/Icon.astro";
+import { SITE_TITLE, SITE_DESCRIPTION, REPO_URL } from "../consts";
+import { getPlatforms } from "../utils/github";
+
+const { version, releaseUrl, platforms } = await getPlatforms();
+
+/** The four parts of the app, each with its own ink drawing */
+const movements: {
+  id: "read" | "write" | "keep" | "share";
+  title: string;
+  line: string;
+  items: { title: string; text: string; keys?: string }[];
+}[] = [
+  {
+    id: "read",
+    title: "Read",
+    line: "A page, not a preview.",
+    items: [
+      { title: "Split View", text: "The source beside the page. The page follows your cursor, and a click on the page moves the cursor there." },
+      { title: "Mermaid Diagrams", text: "Flowcharts and diagrams drawn right on the page, and carried into every export." },
+      { title: "Outline Rail", text: "Every heading in a slim rail beside the page. Hover to preview a section, click to go there." },
+    ],
+  },
+  {
+    id: "write",
+    title: "Write",
+    line: "Plain text, gently helped.",
+    items: [
+      { title: "Live Preview", text: "Write Markdown and watch the page take shape as you type, right beside the source." },
+      { title: "Command Palette", text: "Every action in one search, found by name or everyday words like “todo” or “photo”." },
+      { title: "Slash Menu", text: "Type / on an empty line for tables, images, diagrams, footnotes and more." },
+    ],
+  },
+  {
+    id: "keep",
+    title: "Keep",
+    line: "Your files, where you put them.",
+    items: [
+      { title: "Workspace Sidebar", text: "Open any folder as a workspace. enso watches it and keeps up with changes on disk." },
+      { title: "Auto-Save", text: "Every change is saved a moment after you pause. There is nothing to remember." },
+      { title: "Lock Page", text: "Lock a finished note so it can't be changed by accident, across restarts and renames." },
+    ],
+  },
+  {
+    id: "share",
+    title: "Share",
+    line: "Out into the world, intact.",
+    items: [
+      { title: "PDF", text: "Typeset with your reading font, embedded so it looks the same everywhere." },
+      { title: "HTML", text: "A portable folder with its styles, images and fonts. Open it, or send it whole." },
+      { title: "Rich Text", text: "Formatting that pastes cleanly into mail and documents." },
+      { title: "Diagrams Included", text: "Mermaid diagrams travel with every export as crisp vector art." },
+    ],
+  },
+];
+
+const fonts = [
+  { name: "Default", family: "-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" },
+  { name: "Inter", family: "Inter" },
+  { name: "Lora", family: "Lora" },
+  { name: "JetBrains Mono", family: "'JetBrains Mono'" },
+  { name: "Poppins", family: "Poppins" },
+  { name: "Fira Code", family: "'Fira Code'" },
+];
+
+const palette = [
+  { group: "Insert", name: "Checkbox", hint: "- [ ]", active: true },
+  { group: "Format", name: "Task List", hint: "⌘⇧L" },
+  { group: "Files", name: "Todo.md", hint: "Journal/" },
+];
+
+const facts = [
+  { value: "Native", label: "Rust, drawn by the GPU" },
+  { value: "0", label: "Accounts or servers" },
+  { value: "500 ms", label: "From pause to saved" },
+  { value: "3", label: "Platforms, one codebase" },
+];
+---
+
+<html lang="en" class="no-js">
+  <head>
+    <BaseHead title={SITE_TITLE} description={SITE_DESCRIPTION} />
+  </head>
+  <body>
+    <Header />
+
+    <main>
+      <!-- Hero -->
+      <section class="hero container">
+        <div class="hero-copy">
+          <h1 class="display hero-title" data-rise style="--delay:.08s">
+            A little space <br class="br-wide" />for your thoughts.
+          </h1>
+          <p class="hero-lede" data-rise style="--delay:.16s">
+            enso is a quiet, fast, native Markdown workspace. Read your notes like a book, write in plain text, and keep
+            every page an ordinary file on your computer.
+          </p>
+          <div class="hero-actions" data-rise style="--delay:.24s">
+            <a href="#download" class="btn btn-ink" data-os-download>
+              <Icon name="arrowDown" size={16} />
+              <span>Download</span>
+            </a>
+            <a href={REPO_URL} class="btn btn-quiet">
+              <Icon name="github" size={16} />
+              View Source
+            </a>
+          </div>
+        </div>
+
+        <figure class="hero-art">
+          <Enso id="hero" animate />
+          <figcaption class="definition">
+            <span class="eyebrow">ensō · 円相</span>
+            <span>A circle drawn in a single breath.</span>
+          </figcaption>
+        </figure>
+      </section>
+
+      <!-- Views -->
+      <section id="views" class="views container">
+        <header class="section-head" data-rise>
+          <h2 class="display">Read. Write. Make room.</h2>
+          <p>Read like a book, edit the source, or keep both side by side, where the page follows your cursor.</p>
+        </header>
+        <div data-rise style="--delay:.1s">
+          <AppWindow />
+        </div>
+      </section>
+
+      <!-- Quiet by design -->
+      <section class="quiet container">
+        <p class="display quiet-text" data-rise>
+          No Electron, no Webview, No Account. <span>enso is native software, written in Rust, and your notes stay plain
+          Markdown in folders you already own.</span>
+        </p>
+        <dl class="facts">
+          {
+            facts.map((f, i) => (
+              <div class="fact" data-rise style={`--delay:${0.06 * i}s`}>
+                <dt class="display">{f.value}</dt>
+                <dd>{f.label}</dd>
+              </div>
+            ))
+          }
+        </dl>
+      </section>
+
+      <!-- Features -->
+      <section id="features" class="features container">
+        {
+          movements.map((m, index) => (
+            <article class="movement" id={m.id}>
+              <header class="movement-head" data-rise>
+                <span class="eyebrow">0{index + 1}</span>
+                <Brushmark name={m.id} class="movement-mark" />
+                <h2 class="display">{m.title}</h2>
+                <p class="movement-line">{m.line}</p>
+              </header>
+
+              <div class="movement-body">
+                <ul class="items">
+                  {m.items.map((item, i) => (
+                    <li data-rise style={`--delay:${i * 0.05}s`}>
+                      <h3>
+                        {item.title}
+                        {item.keys && <kbd>{item.keys}</kbd>}
+                      </h3>
+                      <p>{item.text}</p>
+                    </li>
+                  ))}
+                </ul>
+
+                {m.id === "read" && (
+                  <div class="specimens" data-rise>
+                    {fonts.map((font) => (
+                      <div class="specimen">
+                        <span class="specimen-glyph" style={`font-family:${font.family}`}>
+                          Aa
+                        </span>
+                        <span class="specimen-name">{font.name}</span>
+                      </div>
+                    ))}
+                  </div>
+                )}
+
+                {m.id === "write" && (
+                  <div class="palette" data-rise aria-hidden="true">
+                    <div class="palette-input">
+                      <svg viewBox="0 0 16 16">
+                        <circle cx="7" cy="7" r="4.3" fill="none" stroke="currentColor" stroke-width="1.3" />
+                        <path d="m10.3 10.3 3 3" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" />
+                      </svg>
+                      <span>todo</span>
+                      <i class="palette-caret" />
+                    </div>
+                    <ul>
+                      {palette.map((p) => (
+                        <li class:list={{ "is-active": p.active }}>
+                          <span class="palette-group">{p.group}</span>
+                          <span>{p.name}</span>
+                          <span class="palette-hint">{p.hint}</span>
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
+
+                {m.id === "share" && (
+                  <div class="formats" data-rise>
+                    {["PDF", "HTML", "Rich Text"].map((f) => (
+                      <span>{f}</span>
+                    ))}
+                  </div>
+                )}
+              </div>
+            </article>
+          ))
+        }
+      </section>
+
+      <!-- Download -->
+      <section id="download" class="download container">
+        <div class="download-mark" data-rise>
+          <Enso id="download" seed={12} orbits={false} />
+        </div>
+        <h2 class="display" data-rise style="--delay:.06s">Make room.</h2>
+        <p class="download-lede" data-rise style="--delay:.12s">
+          enso {version} for every desktop. <a href={releaseUrl}>Release Notes</a>
+        </p>
+
+        <div class="platforms">
+          {
+            platforms.map((p, i) => (
+              <div class="platform" data-platform={p.id} data-rise style={`--delay:${0.06 * i}s`}>
+                <div class="platform-head">
+                  <Icon name={p.id === "macos" ? "apple" : p.id} size={20} />
+                  <h3>{p.name}</h3>
+                </div>
+                <div class="platform-files">
+                  {p.downloads.map((d) => (
+                    <a href={d.href} class="file" download={d.href.includes("/download/") ? "" : undefined}>
+                      <span class="file-label">{d.label}</span>
+                      <span class="file-name">
+                        {d.file.split(".").slice(-1)[0] === "gz" ? ".tar.gz" : `.${d.file.split(".").pop()}`}
+                        {d.size && ` · ${d.size} MB`}
+                      </span>
+                      <Icon name="arrowDown" size={15} />
+                    </a>
+                  ))}
+                </div>
+                <p class="platform-note">{p.note}</p>
+              </div>
+            ))
+          }
+        </div>
+      </section>
+    </main>
+
+    <Footer />
+
+    <script>
+      // Content rises in once, as it reaches the view
+      const rise = new IntersectionObserver(
+        (entries) =>
+          entries.forEach((e) => {
+            if (e.isIntersecting) {
+              e.target.classList.add("is-in");
+              rise.unobserve(e.target);
+            }
+          }),
+        { rootMargin: "0px 0px -8% 0px" }
+      );
+      document.querySelectorAll("[data-rise]").forEach((el) => rise.observe(el));
+
+      // The visitor's own platform comes first, and names the hero's button
+      const ua = navigator.userAgent;
+      const os = /Mac/.test(ua) && !/iPhone|iPad/.test(ua) ? "macos" : /Win/.test(ua) ? "windows" : /Linux|X11/.test(ua) && !/Android/.test(ua) ? "linux" : null;
+      const names = { macos: "macOS", windows: "Windows", linux: "Linux" } as const;
+      if (os) {
+        const label = document.querySelector("[data-os-download] span");
+        if (label) label.textContent = `Download for ${names[os]}`;
+        document.querySelector(`[data-platform="${os}"]`)?.classList.add("is-yours");
+      }
+    </script>
+  </body>
+</html>
+
+<style>
+  main {
+    overflow: clip;
+  }
+
+  .section-head {
+    display: grid;
+    justify-items: center;
+    gap: 14px;
+    margin-bottom: 44px;
+    text-align: center;
+  }
+  .section-head h2 {
+    font-size: clamp(32px, 4.6vw, 52px);
+  }
+  .section-head p {
+    max-width: 520px;
+    font-size: 16.5px;
+    color: var(--ink-muted);
+  }
+
+  /* Hero */
+  .hero {
+    display: grid;
+    grid-template-columns: minmax(0, 1.05fr) minmax(0, 1fr);
+    align-items: center;
+    gap: 40px;
+    min-height: min(860px, 100svh);
+    padding-top: 110px;
+    padding-bottom: 60px;
+  }
+  .hero-title {
+    font-size: clamp(44px, 6.4vw, 82px);
+    letter-spacing: -0.032em;
+    line-height: 1.02;
+  }
+  .hero-lede {
+    max-width: 470px;
+    margin-top: 26px;
+    font-size: 17.5px;
+    line-height: 1.62;
+    color: var(--ink-muted);
+  }
+  .hero-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 12px;
+    margin-top: 38px;
+  }
+  .hero-art {
+    position: relative;
+    justify-self: end;
+    width: min(100%, 540px);
+  }
+  .definition {
+    position: absolute;
+    right: 4%;
+    bottom: -2%;
+    display: grid;
+    gap: 3px;
+    font-family: var(--font-display);
+    font-style: italic;
+    font-size: 14px;
+    color: var(--ink-soft);
+    text-align: right;
+  }
+  .definition .eyebrow {
+    font-style: normal;
+  }
+
+  /* Views */
+  .views {
+    padding-top: 90px;
+    padding-bottom: 60px;
+  }
+
+  /* Quiet */
+  .quiet {
+    padding-top: 150px;
+    padding-bottom: 130px;
+  }
+  .quiet-text {
+    max-width: 900px;
+    margin: 0 auto;
+    font-size: clamp(28px, 3.6vw, 44px);
+    line-height: 1.22;
+    text-align: center;
+    text-wrap: balance;
+  }
+  .quiet-text span {
+    color: var(--ink-soft);
+  }
+  .facts {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    max-width: 900px;
+    margin: 80px auto 0;
+    border-top: 1px solid var(--line);
+  }
+  .fact {
+    padding: 24px 20px 0;
+    border-left: 1px solid var(--line);
+  }
+  .fact:first-child {
+    border-left: 0;
+  }
+  .fact dt {
+    font-size: 30px;
+  }
+  .fact dd {
+    margin-top: 4px;
+    font-size: 13.5px;
+    color: var(--ink-soft);
+  }
+
+  /* Features */
+  .features {
+    display: grid;
+  }
+  .movement {
+    display: grid;
+    grid-template-columns: 300px minmax(0, 1fr);
+    gap: 60px;
+    padding: 76px 0 84px;
+    border-top: 1px solid var(--line);
+  }
+  .movement-head {
+    position: sticky;
+    top: 110px;
+    align-self: start;
+    display: grid;
+    justify-items: start;
+  }
+  .movement-mark {
+    margin: 26px 0 18px -6px;
+  }
+  .movement-head h2 {
+    font-size: 46px;
+  }
+  .movement-line {
+    margin-top: 6px;
+    font-family: var(--font-display);
+    font-style: italic;
+    font-size: 18px;
+    color: var(--ink-muted);
+  }
+  .items {
+    list-style: none;
+    display: grid;
+    border-top: 1px solid var(--line);
+  }
+  .items li {
+    display: grid;
+    grid-template-columns: 240px minmax(0, 1fr);
+    gap: 24px;
+    padding: 26px 0;
+    border-bottom: 1px solid var(--line);
+  }
+  .items h3 {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    font-family: var(--font-display);
+    font-size: 22px;
+    font-weight: 400;
+    line-height: 1.3;
+    letter-spacing: -0.015em;
+  }
+  .items h3 kbd {
+    height: 20px;
+    font-size: 11px;
+    color: var(--ink-muted);
+  }
+  .items p {
+    font-size: 15.5px;
+    line-height: 1.65;
+    color: var(--ink-muted);
+  }
+
+  .specimens {
+    display: grid;
+    grid-template-columns: repeat(6, minmax(0, 1fr));
+    margin-top: 36px;
+    border: 1px solid var(--line);
+    border-radius: 14px;
+    overflow: hidden;
+  }
+  .specimen {
+    display: grid;
+    justify-items: center;
+    gap: 8px;
+    padding: 22px 6px 16px;
+    border-left: 1px solid var(--line);
+    transition: background-color 0.4s var(--ease);
+  }
+  .specimen:first-child {
+    border-left: 0;
+  }
+  .specimen:hover {
+    background: var(--paper-raised);
+  }
+  .specimen-glyph {
+    font-size: 34px;
+    line-height: 1;
+  }
+  .specimen-name {
+    font-size: 11.5px;
+    color: var(--ink-soft);
+    white-space: nowrap;
+  }
+
+  .palette {
+    max-width: 440px;
+    margin-top: 36px;
+    padding: 6px;
+    border: 1px solid var(--line-strong);
+    border-radius: 14px;
+    background: var(--paper-raised);
+    box-shadow: var(--shadow);
+    font-size: 13px;
+  }
+  .palette-input {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    height: 40px;
+    padding: 0 12px;
+    margin-bottom: 4px;
+    border-bottom: 1px solid var(--line);
+  }
+  .palette-input svg {
+    width: 16px;
+    height: 16px;
+    color: var(--ink-soft);
+  }
+  .palette-caret {
+    width: 1.5px;
+    height: 16px;
+    margin-left: -8px;
+    background: var(--accent);
+    animation: caret 1.1s steps(1) infinite;
+  }
+  @keyframes caret {
+    50% {
+      opacity: 0;
+    }
+  }
+  .palette ul {
+    list-style: none;
+  }
+  .palette li {
+    display: grid;
+    grid-template-columns: 62px 1fr auto;
+    align-items: center;
+    height: 34px;
+    padding: 0 12px;
+    border-radius: 8px;
+    color: var(--ink-muted);
+  }
+  .palette li.is-active {
+    color: var(--ink);
+    background: color-mix(in srgb, var(--ink) 6%, transparent);
+  }
+  .palette-group {
+    font-size: 11px;
+    color: var(--ink-soft);
+  }
+  .palette-hint {
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    color: var(--ink-soft);
+  }
+
+  .formats {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px;
+    margin-top: 36px;
+  }
+  .formats span {
+    padding: 8px 16px;
+    font-family: var(--font-display);
+    font-size: 16px;
+    border: 1px solid var(--line-strong);
+    border-radius: 999px;
+  }
+
+  /* Download */
+  .download {
+    display: grid;
+    justify-items: center;
+    padding-top: 140px;
+    padding-bottom: 130px;
+    text-align: center;
+  }
+  .download-mark {
+    width: 132px;
+    margin-bottom: 18px;
+  }
+  .download h2 {
+    font-size: clamp(40px, 5.6vw, 64px);
+  }
+  .download-lede {
+    margin-top: 12px;
+    font-size: 16.5px;
+    color: var(--ink-muted);
+  }
+  .download-lede a {
+    margin-left: 6px;
+    color: var(--ink);
+    border-bottom: 1px solid var(--line-strong);
+    transition: border-color 0.3s var(--ease);
+  }
+  .download-lede a:hover {
+    border-color: var(--ink);
+  }
+  .platforms {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 16px;
+    width: 100%;
+    max-width: 960px;
+    margin-top: 56px;
+    text-align: left;
+  }
+  .platform {
+    display: grid;
+    grid-template-rows: auto 1fr auto;
+    gap: 18px;
+    padding: 22px;
+    border: 1px solid var(--line);
+    border-radius: 18px;
+    transition: border-color 0.4s var(--ease), background-color 0.4s var(--ease);
+  }
+  .platform.is-yours {
+    border-color: var(--line-strong);
+    background: var(--paper-raised);
+  }
+  .platform-head {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+  .platform-head h3 {
+    font-size: 16px;
+    font-weight: 600;
+  }
+  .platform-files {
+    display: grid;
+    align-content: start;
+    gap: 8px;
+  }
+  .file {
+    display: grid;
+    grid-template-columns: 1fr auto auto;
+    align-items: center;
+    gap: 12px;
+    height: 44px;
+    padding: 0 14px;
+    font-size: 14px;
+    border: 1px solid var(--line);
+    border-radius: 11px;
+    transition: border-color 0.3s var(--ease), background-color 0.3s var(--ease);
+  }
+  .file:hover {
+    border-color: var(--ink-soft);
+  }
+  .is-yours .file:first-child {
+    color: var(--paper);
+    background: var(--ink);
+    border-color: var(--ink);
+  }
+  .is-yours .file:first-child .file-name {
+    color: color-mix(in srgb, var(--paper) 65%, transparent);
+  }
+  .file-label {
+    font-weight: 600;
+  }
+  .file-name {
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    color: var(--ink-soft);
+  }
+  .platform-note {
+    font-size: 13px;
+    color: var(--ink-soft);
+  }
+
+  @media (max-width: 960px) {
+    .movement {
+      grid-template-columns: 1fr;
+      gap: 34px;
+    }
+    .movement-head {
+      position: static;
+      grid-template-columns: auto 1fr;
+      grid-template-areas: "mark num" "mark title" "mark line";
+      column-gap: 22px;
+      align-items: end;
+    }
+    .movement-head .eyebrow {
+      grid-area: num;
+    }
+    .movement-mark {
+      grid-area: mark;
+      margin: 0;
+      align-self: center;
+    }
+    .movement-head h2 {
+      grid-area: title;
+      font-size: 40px;
+    }
+    .movement-line {
+      grid-area: line;
+      align-self: start;
+    }
+  }
+
+  @media (max-width: 820px) {
+    .hero {
+      grid-template-columns: 1fr;
+      min-height: 0;
+      gap: 24px;
+      padding-top: 96px;
+      text-align: center;
+    }
+    .hero-art {
+      order: -1;
+      justify-self: center;
+      width: min(72vw, 320px);
+    }
+    .definition {
+      display: none;
+    }
+    .hero-lede {
+      margin-left: auto;
+      margin-right: auto;
+    }
+    .hero-actions {
+      justify-content: center;
+    }
+    .br-wide {
+      display: none;
+    }
+    .platforms {
+      grid-template-columns: 1fr;
+      max-width: 460px;
+    }
+    .facts {
+      grid-template-columns: repeat(2, 1fr);
+    }
+    .fact:nth-child(3) {
+      border-left: 0;
+    }
+    .fact:nth-child(n + 3) {
+      margin-top: 24px;
+      border-top: 1px solid var(--line);
+    }
+  }
+
+  @media (max-width: 640px) {
+    .hero-title {
+      font-size: 42px;
+    }
+    .hero-lede {
+      font-size: 16px;
+    }
+    .views {
+      padding-top: 60px;
+    }
+    .section-head {
+      margin-bottom: 30px;
+    }
+    .quiet {
+      padding-top: 100px;
+      padding-bottom: 90px;
+    }
+    .quiet-text {
+      font-size: 26px;
+    }
+    .facts {
+      margin-top: 52px;
+    }
+    .fact {
+      padding: 20px 14px 0;
+    }
+    .fact dt {
+      font-size: 25px;
+    }
+    .movement {
+      padding: 56px 0 60px;
+    }
+    .movement-head {
+      grid-template-columns: 1fr;
+      grid-template-areas: "mark" "num" "title" "line";
+    }
+    .movement-mark {
+      width: 96px;
+      height: 64px;
+      margin: 0 0 14px -4px;
+    }
+    .movement-head .eyebrow {
+      margin-bottom: 4px;
+    }
+    .items li {
+      grid-template-columns: 1fr;
+      gap: 6px;
+      padding: 22px 0;
+    }
+    .items h3 {
+      font-size: 20px;
+    }
+    .specimens {
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+    }
+    .specimen:nth-child(4) {
+      border-left: 0;
+    }
+    .specimen:nth-child(n + 4) {
+      border-top: 1px solid var(--line);
+    }
+    .download {
+      padding-top: 100px;
+      padding-bottom: 90px;
+    }
+  }
+</style>

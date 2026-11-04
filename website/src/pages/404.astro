@@ -1,0 +1,40 @@
+---
+import BaseHead from "../components/BaseHead.astro";
+import Header from "../components/Header.astro";
+import Footer from "../components/Footer.astro";
+import Enso from "../components/Enso.astro";
+import { SITE_NAME } from "../consts";
+---
+
+<html lang="en" class="no-js">
+  <head>
+    <BaseHead title={`Page Not Found · ${SITE_NAME}`} description="This page doesn't exist." />
+  </head>
+  <body>
+    <Header />
+    <main class="container lost">
+      <div class="circle"><Enso id="lost" animate caret={false} seed={21} /></div>
+      <h1 class="display">Nothing here but space.</h1>
+      <a href="/" class="btn btn-quiet">Back Home</a>
+    </main>
+    <Footer />
+  </body>
+</html>
+
+<style>
+  .lost {
+    min-height: calc(100svh - 90px);
+    display: grid;
+    place-content: center;
+    justify-items: center;
+    gap: 28px;
+    padding-top: 64px;
+    text-align: center;
+  }
+  .circle {
+    width: 200px;
+  }
+  h1 {
+    font-size: clamp(30px, 5vw, 44px);
+  }
+</style>

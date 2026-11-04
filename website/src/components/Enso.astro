@@ -1,0 +1,164 @@
+---
+import { arc, enso, polyline } from "../utils/brush";
+
+/**
+ * The ensō, drawn in code like enso's logo: one brushstroke around the circle, the dashed orbits
+ * of its echo, and the orange caret waiting in the gap.
+ */
+interface Props {
+  id: string;
+  /** Draw the stroke in, the way a brush would, when the page opens */
+  animate?: boolean;
+  orbits?: boolean;
+  caret?: boolean;
+  class?: string;
+  seed?: number;
+}
+
+const { id, animate = false, orbits = true, caret = true, class: className, seed = 7 } = Astro.props;
+const size = 400;
+const e = enso(size, seed);
+const c = e.center;
+
+const inner = polyline(arc(c, c, () => e.radius - e.width * 0.92, -104, 168, 120));
+const outer = polyline(arc(c, c, () => e.radius + e.width * 0.86, -66, 140, 120));
+
+const caretH = e.radius * 0.42;
+const caretW = e.radius * 0.095;
+const caretAngle = (95 * Math.PI) / 180;
+const caretX = c + Math.cos(caretAngle) * e.radius;
+const caretY = c + Math.sin(caretAngle) * (e.radius + e.width * 0.05);
+---
+
+<svg
+  class:list={["enso", className, { "is-animated": animate }]}
+  viewBox={`0 0 ${size} ${size}`}
+  role="img"
+  aria-label="An ensō: a circle drawn in one brushstroke"
+>
+  <defs>
+    <filter id={`${id}-ink`} x="-10%" y="-10%" width="120%" height="120%">
+      <feTurbulence type="fractalNoise" baseFrequency="0.035" numOctaves="2" seed={seed} result="flow" />
+      <feDisplacementMap in="SourceGraphic" in2="flow" scale="4" xChannelSelector="R" yChannelSelector="G" />
+    </filter>
+    <mask id={`${id}-reveal`} maskUnits="userSpaceOnUse" x="0" y="0" width={size} height={size}>
+      <path
+        class="enso-trace"
+        d={e.path}
+        pathLength="1"
+        fill="none"
+        stroke="#fff"
+        stroke-width={e.width * 1.7}
+        stroke-linecap="round"
+      />
+      {
+        e.streaks.map((s) => (
+          <path d={s.d} fill="none" stroke="#000" stroke-width={s.width} stroke-linecap="round" stroke-dasharray="0.3 0.04 0.12 0.06 0.5" pathLength="1" />
+        ))
+      }
+    </mask>
+  </defs>
+
+  {
+    orbits && (
+      <g class="enso-orbits" fill="none" stroke="currentColor" stroke-linecap="round">
+        <path d={inner} stroke-width="2.6" pathLength="100" stroke-dasharray="7 3.2 1.4 3.2 9 3.2 5 3.2" />
+        <path d={outer} stroke-width="2.4" pathLength="100" stroke-dasharray="5 4 9 4 1.2 4 7 4" />
+      </g>
+    )
+  }
+
+  <g mask={`url(#${id}-reveal)`}>
+    <path class="enso-stroke" d={e.stroke} filter={`url(#${id}-ink)`} />
+  </g>
+
+  {
+    caret && (
+      <rect
+        class="enso-caret"
+        x={caretX - caretW / 2}
+        y={caretY - caretH / 2}
+        width={caretW}
+        height={caretH}
+        rx={caretW / 2}
+      />
+    )
+  }
+</svg>
+
+<style>
+  .enso {
+    display: block;
+    width: 100%;
+    height: auto;
+    overflow: visible;
+    color: var(--ink);
+  }
+  .enso-stroke {
+    fill: var(--ink);
+  }
+  .enso-orbits {
+    color: var(--ink-faint);
+    transform-origin: 50% 50%;
+    animation: enso-breathe 22s ease-in-out infinite alternate;
+  }
+  .enso-caret {
+    fill: var(--accent);
+    animation: enso-blink 1.25s ease-in-out infinite alternate;
+  }
+
+  .is-animated .enso-trace {
+    stroke-dasharray: 1 1;
+    stroke-dashoffset: 1;
+    animation: enso-draw 2.4s cubic-bezier(0.55, 0.05, 0.25, 1) 0.25s forwards;
+  }
+  .is-animated .enso-orbits {
+    opacity: 0;
+    animation:
+      enso-fade 1.6s ease 1.7s forwards,
+      enso-breathe 22s ease-in-out 1.7s infinite alternate;
+  }
+  .is-animated .enso-caret {
+    opacity: 0;
+    animation:
+      enso-fade 0.5s ease 2.5s forwards,
+      enso-blink 1.25s ease-in-out 3s infinite alternate;
+  }
+
+  @keyframes enso-draw {
+    to {
+      stroke-dashoffset: 0;
+    }
+  }
+  @keyframes enso-fade {
+    to {
+      opacity: 1;
+    }
+  }
+  @keyframes enso-blink {
+    0%,
+    35% {
+      opacity: 1;
+    }
+    100% {
+      opacity: 0.12;
+    }
+  }
+  @keyframes enso-breathe {
+    from {
+      transform: rotate(-4deg);
+    }
+    to {
+      transform: rotate(5deg);
+    }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .enso *,
+    .is-animated * {
+      animation: none !important;
+      opacity: 1 !important;
+      stroke-dashoffset: 0 !important;
+    }
+  }
+</style>
