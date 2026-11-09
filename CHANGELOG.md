@@ -12,6 +12,12 @@ Features:
   - The editing keys of the system (word and line moves and deletes) and the editor's formatting keys: bold, italic, strikethrough, inline code (Cmd/Ctrl + E), links, headings, lists, checkboxes, quote and code block.
   - Links open on click; resting the pointer on one, or Cmd/Ctrl + K, shows a card to edit its text and address.
   - Backspace or Delete in an empty block removes it; the slash menu works on an empty line.
+  - Tables like Notion's: each cell is its own field, the arrow keys stay in it, a click anywhere in a cell lands there, and + bars under and beside the table add a row or column. Hovering a cell shows its column's alignment and a ⋯ menu to insert, align and delete rows and columns.
+  - Inline HTML formatting (`<b>`, `<u>`, `<mark>`…), entities, reference links, footnotes and inline math are edited in place; a footnote mark or a formula moves and deletes as one, and Cmd/Ctrl + K edits a formula's TeX.
+  - Hovering a highlight shows its colours and a colour picker.
+  - A click on an image (or a diagram, a rule…) selects it; Backspace or Delete removes it.
+  - **Cmd/Ctrl + Shift + E** shows the block at the caret as its Markdown, to edit as text; again, Escape or moving away draws it again.
+  - **Cmd/Ctrl + /** opens actions for what the caret is in: formatting buttons (bold, italic, underline, strikethrough, code, link, highlight, math, clear formatting), highlight colours, letter case, Turn Into, Mark as Done, table rows and columns, and Duplicate, Delete or Edit as Markdown for the block.
 - The outline's section previews read as text in Live Preview, without Markdown.
 
 ### 1.2.0

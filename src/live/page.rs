@@ -61,6 +61,8 @@ pub enum Shape {
     /// A table: its cells' leaves, row by row, how each column aligns, and
     /// where its last row ends (new rows go after).
     Table { rows: Vec<Vec<usize>>, aligns: Vec<Align>, end: usize },
+    /// A footnote's text (`[^1]: …`): its leaf and its number.
+    Note { leaf: usize, number: String },
     /// Anything else: drawn as the reader draws it, with its own controls.
     Other,
 }
@@ -96,15 +98,59 @@ pub struct Page {
 }
 
 impl Page {
+    #[cfg(test)]
     pub fn read(source: &str) -> Self {
+        Self::read_with_raw(source, None)
+    }
+
+    /// The page, with the blocks in `raw` shown as their Markdown, edited
+    /// as text (⌘⇧E).
+    pub fn read_with_raw(source: &str, raw: Option<Range<usize>>) -> Self {
         let mut options = markdown::ParseOptions::gfm();
         options.constructs.math_flow = true;
         options.constructs.math_text = true;
+        let Ok(tree) = markdown::to_mdast(source, &options) else { return Page::default() };
+        // The note's `[id]: url` definitions, for reference links.
+        let definitions = tree
+            .children()
+            .into_iter()
+            .flatten()
+            .filter_map(|node| match node {
+                Node::Definition(d) => Some((d.identifier.to_lowercase(), d.url.clone())),
+                _ => None,
+            })
+            .collect();
+        // Footnotes are numbered in the order the note first marks them.
+        let mut footnotes = std::collections::HashMap::new();
+        fn number(node: &Node, footnotes: &mut std::collections::HashMap<String, usize>) {
+            if let Node::FootnoteReference(note) = node {
+                let next = footnotes.len() + 1;
+                footnotes.entry(note.identifier.to_lowercase()).or_insert(next);
+            }
+            for child in node.children().into_iter().flatten() {
+                number(child, footnotes);
+            }
+        }
+        number(&tree, &mut footnotes);
+        flow::with_definitions(definitions, footnotes, || Self::read_tree(source, &tree, raw))
+    }
+
+    fn read_tree(source: &str, tree: &Node, raw: Option<Range<usize>>) -> Self {
         let mut page = Page::default();
-        let Ok(tree) = markdown::to_mdast(source, &options) else { return page };
+        let mut raw_placed = false;
         for node in tree.children().into_iter().flatten() {
             let Some(position) = node.position() else { continue };
             let range = position.start.offset..position.end.offset;
+            // The raw Markdown: one block of text where these blocks were.
+            if let Some(raw) = raw.as_ref().filter(|r| range.start < r.end.max(r.start + 1) && r.start < range.end.max(range.start + 1)) {
+                if !raw_placed {
+                    raw_placed = true;
+                    let flow = Flow::plain(source, raw.clone());
+                    page.leaves.push(Leaf { span: raw.clone(), flow, kind: Kind::Code { lang: Some("markdown".into()) } });
+                    page.blocks.push((raw.clone(), Shape::Code(page.leaves.len() - 1)));
+                }
+                continue;
+            }
             let shape = match node {
                 Node::Paragraph(p) => text(&mut page, source, None, &p.children, range.clone()),
                 Node::Heading(h) => text(&mut page, source, Some(h.depth), &h.children, range.clone()),
@@ -162,6 +208,22 @@ impl Page {
                         }
                     }
                 }
+                // A footnote of one paragraph: its text, after its number.
+                Node::FootnoteDefinition(note) => match note.children.as_slice() {
+                    [Node::Paragraph(p)] => {
+                        let at = p.position.as_ref().map(|p| p.start.offset..p.end.offset);
+                        match at.and_then(|at| flow::from_inline(source, None, &p.children, at.end).map(|f| (at, f))) {
+                            Some((at, mut flow)) => {
+                                let end = flow.take_trailing_spaces(source, at.end);
+                                page.leaves.push(Leaf { span: at.start..end, flow, kind: Kind::Text { block: range.clone() } });
+                                let number = flow::footnote_number(&note.identifier, note.label.as_deref());
+                                Shape::Note { leaf: page.leaves.len() - 1, number }
+                            }
+                            None => Shape::Other,
+                        }
+                    }
+                    _ => Shape::Other,
+                },
                 Node::Code(code) if code.lang.as_deref() != Some("mermaid") => match code_content(source, range.clone(), &code.value) {
                     Some(content) => {
                         let flow = Flow::plain(source, content.clone());
@@ -202,16 +264,12 @@ fn table_rows(page: &mut Page, source: &str, table: &markdown::mdast::Table) -> 
             let raw = &source[at.start.offset..at.end.offset];
             let after_pipe = at.start.offset + usize::from(raw.starts_with('|'));
             let empty_at = after_pipe + usize::from(source[after_pipe..].starts_with(' ') && !source[after_pipe..].starts_with(" |"));
-            let mut flow = flow::from_inline(source, None, &cell.children, empty_at)?;
+            let flow = flow::from_inline(source, None, &cell.children, empty_at)?;
             let start = cell.children.first().and_then(|n| n.position()).map_or(empty_at, |p| p.start.offset);
             let text_end = cell.children.last().and_then(|n| n.position()).map_or(empty_at, |p| p.end.offset);
-            // The cell runs up to its closing `|`: the caret stays in it on the
-            // padding. Spaces typed after the text show, less the one space of
-            // padding before the `|`.
+            // The cell runs up to its closing `|`, so the caret stays in it on
+            // the padding (which isn't drawn: aligned tables pad with spaces).
             let pipe = source[text_end..].find('|').map_or(text_end, |n| text_end + n);
-            if !flow.text.is_empty() && pipe > text_end + 1 {
-                flow.take_trailing_spaces(&source[..pipe - 1], text_end);
-            }
             let span = start..pipe.max(start);
             page.leaves.push(Leaf { span, flow, kind: Kind::Cell { row: r, col: c } });
             cells.push(page.leaves.len() - 1);

@@ -10,20 +10,24 @@
 //! without text editing yet (tables, images, code, Mermaid) stay drawn with
 //! their own controls.
 
+mod actions;
 mod element;
 mod flow;
 mod page;
 
 use crate::{Enso, rich, typography};
+use crate::ui::SurfaceExt;
 use element::{GAP_LEAF, LiveElement, leaf_key};
-use flow::{Flow, LinkAt, Wrap};
+use flow::{Flow, LinkAt, MarkAt, Wrap};
 use gpui_kit::base::text::editor_host::{
-    BlockNode, CodeBlock, ColumnAlign, FlowPosition, InlineNode, LeafGeometry, Paragraph, RenderContext, Table,
+    BlockNode, CodeBlock, FlowPosition, InlineNode, LeafGeometry, Paragraph, RenderContext,
 };
 use gpui_kit::component::checkbox::Checkbox;
+use gpui_kit::component::color_picker::{ColorPicker, ColorPickerEvent, ColorPickerState};
+use gpui_kit::component::command::{Command, CommandGroup, CommandItem, CommandState};
 use gpui_kit::component::input::{EditorState, Input, InputEvent, InputState};
 use gpui_kit::component::text::TextView;
-use gpui_kit::component::{ActiveTheme, h_flex, v_flex};
+use gpui_kit::component::{ActiveTheme, Icon, h_flex, v_flex};
 use gpui_kit::*;
 use gpui_kit::assets::IconName;
 use gpui_kit::component::Sizable;
@@ -35,7 +39,7 @@ actions!(
     live,
     [
         Backspace, Delete, Enter, SoftBreak, Left, Right, Up, Down, Home, End, Indent, Outdent,
-        StopEditing, Undo, Redo, DeleteWordBack, DeleteWordForward, DeleteLineBack,
+        StopEditing, ToggleMarkdown, OpenActions, Undo, Redo, DeleteWordBack, DeleteWordForward, DeleteLineBack,
         DeleteLineForward, WordLeft, WordRight, LineStart, LineEnd, PageStart, PageEnd,
         SelectLeft, SelectRight, SelectUp, SelectDown, SelectWordLeft, SelectWordRight,
         SelectLineStart, SelectLineEnd, SelectPageStart, SelectPageEnd, SelectAll, Copy, CopyMarkdown, Cut, Paste,
@@ -93,6 +97,8 @@ pub fn init(cx: &mut App) {
         KeyBinding::new(primary("cmd-i", "ctrl-i"), Italic, Some(CONTEXT)),
         KeyBinding::new(primary("cmd-shift-x", "ctrl-shift-x"), Strike, Some(CONTEXT)),
         KeyBinding::new(primary("cmd-e", "ctrl-e"), InlineCode, Some(CONTEXT)),
+        KeyBinding::new(primary("cmd-shift-e", "ctrl-shift-e"), ToggleMarkdown, Some(CONTEXT)),
+        KeyBinding::new(primary("cmd-/", "ctrl-/"), OpenActions, Some(CONTEXT)),
         KeyBinding::new(primary("cmd-k", "ctrl-k"), EditLink, Some(CONTEXT)),
         KeyBinding::new(primary("cmd-1", "ctrl-1"), Heading1, Some(CONTEXT)),
         KeyBinding::new(primary("cmd-2", "ctrl-2"), Heading2, Some(CONTEXT)),
@@ -129,6 +135,37 @@ pub fn init(cx: &mut App) {
 /// Markdown, so a paste back into a note keeps the formatting.
 const MARKDOWN_COPY: &str = "enso-markdown:";
 
+/// The highlight card: the highlight, where it shows, and whether hovering
+/// opened it (then it goes when the pointer leaves).
+struct MarkCard {
+    mark: MarkAt,
+    at: Point<Pixels>,
+    hover: bool,
+    /// Held open (its colour picker in use): it stays until a colour is
+    /// chosen, Escape, or a click elsewhere.
+    pinned: bool,
+    picker: Entity<ColorPickerState>,
+    _picker: Subscription,
+}
+
+/// The ⌘/ menu: what it offers, where it was opened, and where it shows.
+struct ActionMenu {
+    state: Entity<CommandState>,
+    buttons: Vec<actions::Button>,
+    actions: Vec<actions::Action>,
+    scope: actions::Scope,
+    at: Point<Pixels>,
+}
+
+/// The math card (⌘K on inline math): its Markdown, its TeX being edited,
+/// and where it shows.
+struct MathCard {
+    source: Range<usize>,
+    input: Entity<InputState>,
+    at: Point<Pixels>,
+    _subscription: Subscription,
+}
+
 /// The link card: what's edited, and where it shows (under the link).
 struct LinkCard {
     /// The link's Markdown (or, for a new link, the selected text's).
@@ -143,6 +180,58 @@ struct LinkCard {
     /// Shown by hovering (it goes when the pointer leaves), not by ⌘K.
     hover: bool,
     _subscriptions: Vec<Subscription>,
+}
+
+/// A change to a table's shape.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum TableOp {
+    RowAbove,
+    RowBelow,
+    DeleteRow,
+    ColumnLeft,
+    ColumnRight,
+    DeleteColumn,
+    Align(Align),
+    /// The + under the table.
+    AddRow,
+    /// The + beside it.
+    AddColumn,
+}
+
+/// A table as its cells' Markdown, to change its shape and write it back.
+struct Grid {
+    range: Range<usize>,
+    cells: Vec<Vec<String>>,
+    aligns: Vec<Align>,
+}
+
+impl Grid {
+    fn markdown(&self) -> String {
+        let width = self.cells.iter().map(Vec::len).max().unwrap_or(1).max(1);
+        let row = |cells: &[String]| {
+            let mut line = String::from("|");
+            for i in 0..width {
+                let cell = cells.get(i).map_or("", String::as_str);
+                line.push_str(&format!(" {cell} |"));
+            }
+            line
+        };
+        let mut lines = vec![row(self.cells.first().map_or(&[][..], Vec::as_slice))];
+        let mut delimiter = String::from("|");
+        for i in 0..width {
+            delimiter.push_str(match self.aligns.get(i).copied().unwrap_or(Align::None) {
+                Align::Left => " :--- |",
+                Align::Center => " :---: |",
+                Align::Right => " ---: |",
+                Align::None => " --- |",
+            });
+        }
+        lines.push(delimiter);
+        for cells in self.cells.iter().skip(1) {
+            lines.push(row(cells));
+        }
+        lines.join("\n")
+    }
 }
 
 /// Edits closer together than this undo as one.
@@ -176,8 +265,26 @@ pub struct LiveView {
     dragging: bool,
     /// The card for a link: its text and address, to edit.
     link_card: Option<LinkCard>,
+    math_card: Option<MathCard>,
+    mark_card: Option<MarkCard>,
+    action_menu: Option<ActionMenu>,
+    /// The table card (⌘K in a cell): the cell, and where the card shows.
+    table_card: Option<(usize, Point<Pixels>)>,
+    /// The table cell under the pointer: its toolbar shows.
+    hovered_cell: Option<usize>,
     /// A link the pointer rests on, and the wait before its card shows.
     hovering: Option<(Range<usize>, Task<()>)>,
+    /// The block shown as its Markdown (⌘⇧E), edited as text: its range,
+    /// kept up to date as it's typed in.
+    raw: Option<Range<usize>>,
+    /// A block without text (an image, a diagram) picked by a click, by its
+    /// start: Backspace or Delete removes it.
+    picked: Option<usize>,
+    /// The pointer is over the link card: it stays.
+    over_card: bool,
+    /// The hover card closing, a moment after the pointer left the link (so
+    /// the pointer can cross over to it).
+    closing: Option<Task<()>>,
     /// Where each line of text was laid out last frame, by its key.
     geometry: Rc<RefCell<HashMap<u64, LeafGeometry>>>,
     undo: Vec<(String, usize)>,
@@ -217,7 +324,16 @@ impl LiveView {
             anchor: None,
             dragging: false,
             link_card: None,
+            table_card: None,
+            math_card: None,
+            mark_card: None,
+            action_menu: None,
+            hovered_cell: None,
             hovering: None,
+            over_card: false,
+            raw: None,
+            picked: None,
+            closing: None,
             geometry: Rc::default(),
             undo: Vec::new(),
             redo: Vec::new(),
@@ -236,7 +352,13 @@ impl LiveView {
         if value.as_ref() != self.source.as_str() {
             self.source = value.to_string();
             self.revision += 1;
-            self.page = Page::read(&self.source);
+            // Changed from elsewhere: the raw block may be gone.
+            if self.raw.as_ref().is_some_and(|r| {
+                r.end > self.source.len() || !self.source.is_char_boundary(r.start) || !self.source.is_char_boundary(r.end)
+            }) {
+                self.raw = None;
+            }
+            self.page = Page::read_with_raw(&self.source, self.raw.clone());
             if self.caret.is_some() {
                 let at = self.editor.read(cx).selected_range().end;
                 self.caret = Some(floor_boundary(&self.source, at.min(self.source.len())));
@@ -301,9 +423,131 @@ impl LiveView {
         self.caret
     }
 
+    /// Where the text of the line holding `at` was drawn.
+    #[cfg(all(test, feature = "ui-tests"))]
+    pub(crate) fn text_bounds_for_test(&self, at: usize) -> Bounds<Pixels> {
+        let leaf = self.page.leaves.iter().position(|l| l.span.start <= at && at <= l.span.end).unwrap();
+        self.geometry.borrow()[&leaf_key(leaf)].bounds()
+    }
+
+    /// A point inside the link card.
+    #[cfg(all(test, feature = "ui-tests"))]
+    pub(crate) fn link_card_point_for_test(&self) -> Option<Point<Pixels>> {
+        self.link_card.as_ref().map(|c| point(c.at.x + px(40.), c.at.y + px(20.)))
+    }
+
+    /// A click on the block starting at `start` (an image).
+    #[cfg(all(test, feature = "ui-tests"))]
+    pub(crate) fn click_block_for_test(&mut self, start: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.click_other(start, window, cx);
+    }
+
+    #[cfg(all(test, feature = "ui-tests"))]
+    pub(crate) fn picked_for_test(&self) -> Option<usize> {
+        self.picked
+    }
+
+    /// The math card's input, while it shows.
+    #[cfg(all(test, feature = "ui-tests"))]
+    pub(crate) fn math_input_for_test(&self) -> Option<Entity<InputState>> {
+        self.math_card.as_ref().map(|c| c.input.clone())
+    }
+
+    #[cfg(all(test, feature = "ui-tests"))]
+    pub(crate) fn raw_for_test(&self) -> Option<Range<usize>> {
+        self.raw.clone()
+    }
+
+    /// Whether the highlight card shows, and whether hovering opened it.
+    #[cfg(all(test, feature = "ui-tests"))]
+    pub(crate) fn mark_card_for_test(&self) -> Option<bool> {
+        self.mark_card.as_ref().map(|c| c.hover)
+    }
+
+    /// A swatch (by its place) or Remove (`None`) pressed on the highlight card.
+    #[cfg(all(test, feature = "ui-tests"))]
+    pub(crate) fn recolor_for_test(&mut self, swatch: Option<usize>, window: &mut Window, cx: &mut Context<Self>) {
+        let color = swatch.map(|i| rgb(rich::HIGHLIGHTS[i].1).into());
+        self.recolor_mark(color, window, cx);
+    }
+
+    /// A point on the first highlight's text.
+    #[cfg(all(test, feature = "ui-tests"))]
+    pub(crate) fn mark_point_for_test(&self) -> Option<Point<Pixels>> {
+        let geometry = self.geometry.borrow();
+        self.page.leaves.iter().enumerate().find_map(|(i, leaf)| {
+            let at = (0..leaf.flow.text.len()).find(|a| leaf.flow.mark_at(*a, true).is_some())?;
+            let g = geometry.get(&leaf_key(i))?;
+            let p = g.position_for_index(at + 1);
+            Some(point(p.x, p.y + g.line_height() / 2.))
+        })
+    }
+
+    /// The ⌘/ menu's actions, while it shows.
+    #[cfg(all(test, feature = "ui-tests"))]
+    pub(crate) fn actions_for_test(&self) -> Option<Vec<String>> {
+        self.action_menu.as_ref().map(|m| m.actions.iter().map(|a| a.label.clone()).collect())
+    }
+
+    /// The ⌘/ menu's formatting buttons: each one's label and whether it's lit.
+    #[cfg(all(test, feature = "ui-tests"))]
+    pub(crate) fn buttons_for_test(&self) -> Vec<(String, bool)> {
+        self.action_menu.as_ref().map_or(Vec::new(), |m| m.buttons.iter().map(|b| (b.label.to_string(), b.active)).collect())
+    }
+
+    /// Press the ⌘/ menu's button labelled `label`.
+    #[cfg(all(test, feature = "ui-tests"))]
+    pub(crate) fn press_for_test(&mut self, label: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let menu = self.action_menu.as_ref().expect("the actions menu");
+        let act = menu.buttons.iter().find(|b| b.label == label).unwrap_or_else(|| panic!("no {label}")).act.clone();
+        self.press_button(act, window, cx);
+    }
+
+    /// Choose the ⌘/ menu's action labelled `label`.
+    #[cfg(all(test, feature = "ui-tests"))]
+    pub(crate) fn choose_for_test(&mut self, label: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let menu = self.action_menu.as_ref().expect("the actions menu");
+        let index = menu.actions.iter().position(|a| a.label == label).unwrap_or_else(|| panic!("no {label}"));
+        self.choose_action(index, window, cx);
+    }
+
+    #[cfg(all(test, feature = "ui-tests"))]
+    pub(crate) fn select_for_test(&mut self, range: Range<usize>) {
+        self.anchor = Some(range.start);
+        self.caret = Some(range.end);
+    }
+
+    #[cfg(all(test, feature = "ui-tests"))]
+    pub(crate) fn table_card_for_test(&self) -> bool {
+        self.table_card.is_some()
+    }
+
+    /// A table change at the caret's cell, as its card or + bar would make it.
+    #[cfg(all(test, feature = "ui-tests"))]
+    pub(crate) fn table_op_for_test(&mut self, op: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(Spot::Leaf(i)) = self.spot() else { panic!("not in a cell") };
+        let Kind::Cell { row, col } = self.page.leaves[i].kind else { panic!("not in a cell") };
+        let start = self.page.blocks.iter().find_map(|(range, shape)| match shape {
+            Shape::Table { rows, .. } if rows.iter().flatten().any(|l| *l == i) => Some(range.start),
+            _ => None,
+        });
+        let op = match op {
+            "row-above" => TableOp::RowAbove,
+            "delete-row" => TableOp::DeleteRow,
+            "column-right" => TableOp::ColumnRight,
+            "delete-column" => TableOp::DeleteColumn,
+            "align-center" => TableOp::Align(Align::Center),
+            "add-row" => TableOp::AddRow,
+            "add-column" => TableOp::AddColumn,
+            _ => panic!("{op}"),
+        };
+        self.table_op(start.unwrap(), row, col, op, window, cx);
+    }
+
     #[cfg(all(test, feature = "ui-tests"))]
     pub(crate) fn set_caret_for_test(&mut self, caret: usize) {
         self.caret = Some(caret);
+        self.anchor = None;
     }
 
     #[cfg(all(test, feature = "ui-tests"))]
@@ -361,6 +605,10 @@ impl LiveView {
             return;
         }
         self.parked = None;
+        self.picked = None;
+        self.math_card = None;
+        self.mark_card = None;
+        self.action_menu = None;
         window.focus(&self.focus, cx);
         let at = self.source_at_point(leaf, event.position).unwrap_or(self.page.leaves[leaf].span.start);
         let flow = self.page.leaves[leaf].flow.clone();
@@ -424,37 +672,205 @@ impl LiveView {
         })
     }
 
+    /// The highlight under the pointer, and its line.
+    fn mark_under(&self, at: Point<Pixels>) -> Option<(usize, MarkAt)> {
+        let geometry = self.geometry.borrow();
+        self.page.leaves.iter().enumerate().find_map(|(i, leaf)| {
+            let g = geometry.get(&leaf_key(i))?;
+            if !g.bounds().contains(&at) {
+                return None;
+            }
+            leaf.flow.mark_at(g.index_for_position(at), true).map(|mark| (i, mark))
+        })
+    }
+
+    /// The highlight's card, under its start: its colours, and Remove.
+    fn open_mark_card(&mut self, mark: MarkAt, leaf: usize, hover: bool, pinned: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let at = {
+            let geometry = self.geometry.borrow();
+            let flow = &self.page.leaves[leaf].flow;
+            geometry.get(&leaf_key(leaf)).map(|g| {
+                let top = g.position_for_index(flow.shown_for(mark.open.end));
+                point(top.x, top.y + g.line_height() + px(4.))
+            })
+        }
+        .unwrap_or(point(px(120.), px(120.)));
+        self.over_card = false;
+        self.closing = None;
+        self.link_card = None;
+        let color = mark.color;
+        let picker = cx.new(|cx| ColorPickerState::new(window, cx).default_value(color));
+        let subscription = cx.subscribe_in(&picker, window, |this, _, event: &ColorPickerEvent, window, cx| {
+            let ColorPickerEvent::Change(Some(color)) = event else { return };
+            this.recolor_mark(Some(*color), window, cx);
+        });
+        self.mark_card = Some(MarkCard { mark, at, hover, pinned, picker, _picker: subscription });
+        cx.notify();
+    }
+
+    /// The highlight card for the highlight at the caret. False when the
+    /// caret isn't in one.
+    fn open_mark_card_at_caret(&mut self, pinned: bool, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let (Some(caret), Some(Spot::Leaf(i))) = (self.caret, self.spot()) else { return false };
+        let flow = &self.page.leaves[i].flow;
+        let Some(mark) = flow.mark_at(flow.shown_for(caret), false) else { return false };
+        self.open_mark_card(mark, i, false, pinned, window, cx);
+        true
+    }
+
+    /// ⌘/: what can be done to what the caret is in.
+    fn open_actions(&mut self, _: &OpenActions, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.editor.read(cx).is_editable() {
+            return;
+        }
+        if self.action_menu.take().is_some() {
+            self.focus_page(window, cx);
+            cx.notify();
+            return;
+        }
+        let actions = self.actions();
+        let buttons = self.buttons();
+        if actions.is_empty() && buttons.is_empty() {
+            return;
+        }
+        // Under the caret (or the picked block's top).
+        let at = self
+            .active_key()
+            .zip(self.caret_in_active())
+            .and_then(|(key, local)| {
+                let geometry = self.geometry.borrow();
+                let g = geometry.get(&key)?;
+                let p = g.position_for_index(local);
+                Some(point(p.x, p.y + g.line_height() + px(6.)))
+            })
+            .unwrap_or(point(px(120.), px(120.)));
+        let scope = actions::Scope { caret: self.caret, anchor: self.anchor, picked: self.picked };
+        let state = cx.new(|cx| CommandState::new(window, cx));
+        state.update(cx, |state, cx| state.focus(window, cx));
+        self.link_card = None;
+        self.mark_card = None;
+        self.table_card = None;
+        self.action_menu = Some(ActionMenu { state, buttons, actions, scope, at });
+        cx.notify();
+    }
+
+    fn close_actions(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(menu) = self.action_menu.take() {
+            self.caret = menu.scope.caret;
+            self.anchor = menu.scope.anchor;
+            self.picked = menu.scope.picked;
+            self.parked = None;
+            self.focus_page(window, cx);
+            cx.notify();
+        }
+    }
+
+    /// Run one of the menu's formatting buttons.
+    fn press_button(&mut self, act: actions::Act, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(menu) = self.action_menu.take() else { return };
+        self.run_action(act, menu.scope, window, cx);
+    }
+
+    /// Run the menu's `index`th action.
+    fn choose_action(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(menu) = self.action_menu.take() else { return };
+        let Some(action) = menu.actions.get(index).cloned() else { return };
+        self.run_action(action.act, menu.scope, window, cx);
+    }
+
+    /// Recolour the card's highlight (`None`: remove it, keeping its text).
+    fn recolor_mark(&mut self, color: Option<Hsla>, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(card) = self.mark_card.take() else { return };
+        let mark = card.mark;
+        if self.source.get(mark.source.clone()).is_none() {
+            return;
+        }
+        let caret = self.caret;
+        self.focus_page(window, cx);
+        match color {
+            Some(color) => {
+                let tag = format!("<mark color=\"{}\">", rich::highlight_hex(color));
+                let delta = tag.len() as isize - mark.open.len() as isize;
+                self.edit(mark.open.clone(), &tag, window, cx);
+                self.caret = caret.map(|c| if c >= mark.open.end { (c as isize + delta) as usize } else { c });
+            }
+            None => {
+                self.edit(mark.close.clone(), "", window, cx);
+                self.last_edit = Some(Instant::now());
+                self.edit(mark.open.clone(), "", window, cx);
+                self.caret = caret.map(|c| {
+                    let c = if c >= mark.close.end { c - mark.close.len() } else { c.min(mark.close.start) };
+                    if c >= mark.open.end { c - mark.open.len() } else { c.min(mark.open.start) }
+                });
+            }
+        }
+        cx.notify();
+    }
+
     /// The pointer resting on a link for a moment (0.8 s) shows its card; leaving
     /// the link (and not onto the card) puts a hover card away.
     fn hover(&mut self, at: Point<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
-        match self.link_under(at) {
-            Some((leaf, link)) => {
-                let shown = self.link_card.as_ref().is_some_and(|c| c.source == link.source);
-                let waiting = self.hovering.as_ref().is_some_and(|(r, _)| *r == link.source);
+        let target = match self.link_under(at) {
+            Some((leaf, link)) => Some((leaf, Ok(link))),
+            None => self.mark_under(at).map(|(leaf, mark)| (leaf, Err(mark))),
+        };
+        match target {
+            Some((leaf, target)) => {
+                let source = match &target {
+                    Ok(link) => link.source.clone(),
+                    Err(mark) => mark.source.clone(),
+                };
+                let shown = self.link_card.as_ref().is_some_and(|c| c.source == source)
+                    || self.mark_card.as_ref().is_some_and(|c| c.mark.source == source);
+                if shown {
+                    self.closing = None;
+                }
+                let waiting = self.hovering.as_ref().is_some_and(|(r, _)| *r == source);
                 if shown || waiting {
                     return;
                 }
-                let source = link.source.clone();
                 let task = cx.spawn_in(window, async move |this, cx| {
                     cx.background_executor().timer(std::time::Duration::from_millis(800)).await;
                     let _ = this.update_in(cx, |this, window, cx| {
                         this.hovering = None;
-                        this.open_link_card(link, leaf, false, window, cx);
+                        match target {
+                            Ok(link) => this.open_link_card(link, leaf, false, window, cx),
+                            Err(mark) => this.open_mark_card(mark, leaf, true, false, window, cx),
+                        }
                     });
                 });
                 self.hovering = Some((source, task));
             }
             None => {
                 self.hovering = None;
-                if let Some(card) = &self.link_card {
-                    let typing = card.text_input.focus_handle(cx).is_focused(window) || card.url_input.focus_handle(cx).is_focused(window);
-                    if card.hover && !typing {
-                        self.link_card = None;
-                        cx.notify();
-                    }
-                }
+                self.close_hover_card_soon(window, cx);
             }
         }
+    }
+
+    /// Close the hover card shortly, unless the pointer reaches it (or comes
+    /// back to the link) first, or it's being typed in.
+    fn close_hover_card_soon(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let hovered = self.link_card.as_ref().is_some_and(|c| c.hover) || self.mark_card.as_ref().is_some_and(|c| c.hover);
+        if self.over_card || self.closing.is_some() || !hovered {
+            return;
+        }
+        self.closing = Some(cx.spawn_in(window, async move |this, cx| {
+            cx.background_executor().timer(std::time::Duration::from_millis(300)).await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                this.closing = None;
+                if this.mark_card.as_ref().is_some_and(|c| c.hover && !c.pinned) && !this.over_card {
+                    this.mark_card = None;
+                    cx.notify();
+                }
+                let Some(card) = &this.link_card else { return };
+                let typing = card.text_input.focus_handle(cx).is_focused(window) || card.url_input.focus_handle(cx).is_focused(window);
+                if card.hover && !typing && !this.over_card {
+                    this.link_card = None;
+                    cx.notify();
+                }
+            });
+        }));
     }
 
     fn mouse_drag(&mut self, event: &MouseMoveEvent, window: &mut Window, cx: &mut Context<Self>) {
@@ -462,7 +878,13 @@ impl LiveView {
             self.hover(event.position, window, cx);
             return;
         }
-        if let Some(at) = self.leaf_near(event.position).and_then(|leaf| self.source_at_point(leaf, event.position))
+        let mut target = self.leaf_near(event.position).and_then(|leaf| self.source_at_point(leaf, event.position));
+        // Started in a table cell: the selection stays in that cell.
+        if let Some(cell) = self.anchor.and_then(|a| self.page.leaf_at(a)).filter(|i| matches!(self.page.leaves[*i].kind, Kind::Cell { .. })) {
+            let span = self.page.leaves[cell].span.clone();
+            target = target.map(|at| at.clamp(span.start, span.end));
+        }
+        if let Some(at) = target
             && self.caret != Some(at)
         {
             self.caret = Some(at);
@@ -472,14 +894,81 @@ impl LiveView {
 
     /// A click on a block typed into only through its own controls (a table,
     /// an image): editing stops.
-    fn click_other(&mut self, cx: &mut Context<Self>) {
+    fn click_other(&mut self, start: usize, window: &mut Window, cx: &mut Context<Self>) {
         if self.editor.read(cx).value().as_ref() != self.source.as_str() {
             self.refresh(cx);
         }
         self.anchor = None;
-        if self.caret.take().is_some() {
-            cx.notify();
-        }
+        self.caret = None;
+        self.parked = None;
+        self.picked = self.editor.read(cx).is_editable().then_some(start);
+        window.focus(&self.focus, cx);
+        cx.notify();
+    }
+
+    /// The picked block's range, while it's still there.
+    fn picked_range(&self) -> Option<Range<usize>> {
+        let start = self.picked?;
+        self.page.blocks.iter().find(|(r, s)| r.start == start && matches!(s, Shape::Other)).map(|(r, _)| r.clone())
+    }
+
+    /// Remove the picked block with the blank line after it (or, last on the
+    /// page, before it), and put the caret by where it was.
+    fn remove_picked(&mut self, forward: bool, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let Some(range) = self.picked_range() else {
+            self.picked = None;
+            return false;
+        };
+        self.remove_block(range, forward, window, cx);
+        true
+    }
+
+    /// Remove the Markdown `range` (a block, a list item) with the blank
+    /// line after it (or, last on the page, before it), the caret going to
+    /// the line after (`forward`) or before where it was.
+    fn remove_block(&mut self, range: Range<usize>, forward: bool, window: &mut Window, cx: &mut Context<Self>) {
+        self.picked = None;
+        // Blank lines only: the next line's indent stays.
+        let after = self.source[range.end..].len() - self.source[range.end..].trim_start_matches(['\n', '\r']).len();
+        let gone = if range.end + after < self.source.len() {
+            range.start..range.end + after
+        } else {
+            let before = self.source[..range.start].len() - self.source[..range.start].trim_end_matches(['\n', '\r', ' ', '\t']).len();
+            // The last block: the blank line before it goes; the note's
+            // final newline stays.
+            range.start - before..range.end
+        };
+        let previous = self.page.leaves.iter().rposition(|l| l.span.end <= range.start);
+        // Removing a block undoes on its own, apart from any typing.
+        self.last_edit = None;
+        self.edit(gone.clone(), "", window, cx);
+        self.last_edit = None;
+        let next = self.page.leaves.iter().position(|l| l.span.start >= gone.start);
+        let previous = previous.filter(|p| *p < self.page.leaves.len());
+        let to = if forward { next.or(previous) } else { previous.or(next) };
+        self.caret = Some(match to {
+            Some(i) if Some(i) == next => self.page.leaves[i].flow.source_for(0),
+            Some(i) => {
+                let flow = &self.page.leaves[i].flow;
+                flow.source_for(flow.text.len())
+            }
+            None => gone.start.min(self.source.len()),
+        });
+        cx.notify();
+    }
+
+    /// An arrow key with a block picked: the caret goes to the line before
+    /// (or after) it. False when nothing is picked.
+    fn leave_picked(&mut self, forward: bool, cx: &mut Context<Self>) -> bool {
+        let Some(range) = self.picked_range() else { return false };
+        self.picked = None;
+        self.caret = if forward {
+            self.page.leaves.iter().find(|l| l.span.start >= range.end).map(|l| l.flow.source_for(0))
+        } else {
+            self.page.leaves.iter().rev().find(|l| l.span.end <= range.start).map(|l| l.flow.source_for(l.flow.text.len()))
+        };
+        cx.notify();
+        true
     }
 
     /// Remove the selection from the note, leaving the caret where it began.
@@ -654,6 +1143,21 @@ impl LiveView {
         }
         self.last_edit = Some(now);
         self.redo.clear();
+        self.picked = None;
+        // The raw block grows and shrinks with what's typed in it.
+        if let Some(raw) = self.raw.clone() {
+            let delta = text.len() as isize - range.len() as isize;
+            let moved = |at: usize| (at as isize + delta).max(0) as usize;
+            self.raw = if raw.start <= range.start && range.end <= raw.end {
+                Some(raw.start..moved(raw.end))
+            } else if range.end <= raw.start {
+                Some(moved(raw.start)..moved(raw.end))
+            } else if range.start >= raw.end {
+                Some(raw)
+            } else {
+                None
+            };
+        }
         let text = text.to_string();
         self.editor.update(cx, |editor, cx| {
             editor.set_selected_range(range.clone(), cx);
@@ -683,6 +1187,7 @@ impl LiveView {
 
     fn restore(&mut self, to: (String, usize), window: &mut Window, cx: &mut Context<Self>) {
         let (text, caret) = to;
+        self.raw = None;
         self.editor.update(cx, |editor, cx| editor.set_value(text.as_str(), window, cx));
         self.refresh(cx);
         self.caret = Some(caret.min(self.source.len()));
@@ -812,6 +1317,20 @@ impl LiveView {
             }
             _ => {}
         }
+        // Right after an image (or another block without text): pick it, so
+        // the next Backspace removes it.
+        let block = self.page.blocks.iter().position(|(r, _)| r.start <= start && start <= r.end);
+        if let Some(b) = block.and_then(|b| b.checked_sub(1))
+            && let (range, Shape::Other) = &self.page.blocks[b]
+            && self.source[range.end..start].trim().is_empty()
+            && matches!(leaf.kind, Kind::Text { .. })
+        {
+            self.picked = Some(range.start);
+            self.caret = None;
+            self.anchor = None;
+            cx.notify();
+            return;
+        }
         // The line before this one (never this one itself).
         let previous = i.checked_sub(1).map(|p| self.page.leaves[p].clone());
         if let Kind::Item(item) = &leaf.kind {
@@ -842,6 +1361,9 @@ impl LiveView {
     }
 
     fn backspace(&mut self, _: &Backspace, window: &mut Window, cx: &mut Context<Self>) {
+        if self.picked.is_some() && self.remove_picked(false, window, cx) {
+            return;
+        }
         if self.delete_selection(window, cx) {
             return;
         }
@@ -858,6 +1380,9 @@ impl LiveView {
     }
 
     fn delete(&mut self, _: &Delete, window: &mut Window, cx: &mut Context<Self>) {
+        if self.picked.is_some() && self.remove_picked(true, window, cx) {
+            return;
+        }
         if self.delete_selection(window, cx) {
             return;
         }
@@ -1069,13 +1594,22 @@ impl LiveView {
         let (Some(caret), Some(spot), Some(flow)) = (self.caret, self.spot(), self.active_flow()) else { return };
         let at = flow.shown_for(caret);
         let edge = if forward { at >= flow.text.len() } else { at == 0 };
+        // A table cell is an input of its own: the arrows stay in it.
+        if edge && self.in_cell() {
+            return;
+        }
         let to = if edge {
             self.neighbour(spot, forward).map(|l| {
                 let leaf = &self.page.leaves[l];
                 if forward { leaf.flow.source_for(0) } else { leaf.flow.source_for(leaf.flow.text.len()) }
             })
         } else {
-            let to = if forward { next_boundary(&flow.text, at) } else { previous_boundary(&flow.text, at) };
+            // A letter on (a whole emoji), or past a unit such as math.
+            let to = if forward {
+                flow.step(at, true).max(next_boundary(&flow.text, at))
+            } else {
+                flow.step(at, false).min(previous_boundary(&flow.text, at))
+            };
             Some(flow.source_for(to))
         };
         if let Some(to) = to {
@@ -1121,14 +1655,7 @@ impl LiveView {
                 return;
             }
         }
-        if let Spot::Leaf(i) = spot
-            && let Some(target) = self.table_vertical(i, down)
-        {
-            if let Some(l) = target {
-                let flow = &self.page.leaves[l].flow;
-                self.caret = Some(flow.source_for(local.min(flow.text.len())));
-                cx.notify();
-            }
+        if self.in_cell() {
             return;
         }
         if let Some(l) = self.neighbour(spot, down) {
@@ -1291,6 +1818,9 @@ impl LiveView {
         if focus_url {
             url_input.update(cx, |input, cx| input.focus(window, cx));
         }
+        self.over_card = false;
+        self.closing = None;
+        self.mark_card = None;
         self.link_card = Some(LinkCard {
             source: link.source,
             wiki: link.wiki,
@@ -1330,6 +1860,98 @@ impl LiveView {
         self.edit(card.source, &text, window, cx);
     }
 
+    /// ⌘K on inline math: a card to edit its TeX, under it.
+    fn open_math_card(&mut self, source: Range<usize>, tex: String, leaf: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let at = {
+            let geometry = self.geometry.borrow();
+            let flow = &self.page.leaves[leaf].flow;
+            geometry.get(&leaf_key(leaf)).map(|g| {
+                let top = g.position_for_index(flow.shown_for(source.start));
+                point(top.x, top.y + g.line_height() + px(4.))
+            })
+        }
+        .unwrap_or(point(px(120.), px(120.)));
+        let input = cx.new(|cx| InputState::new(window, cx).placeholder("TeX").default_value(tex));
+        let subscription = cx.subscribe_in(&input, window, |this, _, event: &InputEvent, window, cx| {
+            if matches!(event, InputEvent::PressEnter { .. }) {
+                this.apply_math(window, cx);
+            }
+        });
+        input.update(cx, |input, cx| input.focus(window, cx));
+        self.math_card = Some(MathCard { source, input, at, _subscription: subscription });
+        cx.notify();
+    }
+
+    /// Write the card's TeX back between the math's own `$`s (none: the
+    /// math goes).
+    fn apply_math(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(card) = self.math_card.take() else { return };
+        let tex = card.input.read(cx).value().trim().to_string();
+        let dollars = self.source[card.source.clone()].chars().take_while(|c| *c == '$').count().max(1);
+        let fence = "$".repeat(dollars);
+        let markdown = if tex.is_empty() { String::new() } else { format!("{fence}{tex}{fence}") };
+        self.focus_page(window, cx);
+        self.edit(card.source, &markdown, window, cx);
+    }
+
+    fn close_math_card(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.math_card.take().is_some() {
+            self.focus_page(window, cx);
+            cx.notify();
+        }
+    }
+
+    /// ⌘⇧E: the caret's block (or the picked one) as its Markdown, edited
+    /// as text; again, drawn as before.
+    fn toggle_markdown(&mut self, _: &ToggleMarkdown, _: &mut Window, cx: &mut Context<Self>) {
+        if self.raw.is_some() {
+            self.leave_raw(cx);
+            return;
+        }
+        if !self.editor.read(cx).is_editable() {
+            return;
+        }
+        let at = self.picked.or(self.caret);
+        let Some(at) = at else { return };
+        let Some((range, _)) = self.page.blocks.iter().find(|(r, _)| r.start <= at && at <= r.end).cloned() else { return };
+        self.raw = Some(range.clone());
+        self.page = Page::read_with_raw(&self.source, self.raw.clone());
+        self.picked = None;
+        self.caret = Some(if at < range.start || at > range.end { range.start } else { at });
+        self.anchor = self.anchor.filter(|a| range.contains(a));
+        self.link_card = None;
+        self.math_card = None;
+        self.table_card = None;
+        cx.notify();
+    }
+
+    /// The raw block drawn again; the caret stays on the same Markdown, at
+    /// the nearest place text can be typed.
+    fn leave_raw(&mut self, cx: &mut Context<Self>) {
+        let Some(raw) = self.raw.take() else { return };
+        self.page = Page::read_with_raw(&self.source, None);
+        self.anchor = None;
+        if let Some(caret) = self.caret {
+            self.caret = Some(self.nearest_caret(caret, raw));
+        }
+        cx.notify();
+    }
+
+    /// Where text can be typed nearest to `at` (Markdown), within `block`
+    /// if it has any text.
+    fn nearest_caret(&self, at: usize, block: Range<usize>) -> usize {
+        if self.page.leaf_at(at).is_some() {
+            return at;
+        }
+        let candidates = self.page.leaves.iter().filter(|l| l.span.start < block.end.max(block.start + 1) && block.start <= l.span.end);
+        let best = candidates
+            .flat_map(|l| [l.flow.source_for(0), l.flow.source_for(l.flow.text.len())])
+            .min_by_key(|p| p.abs_diff(at));
+        best.unwrap_or_else(|| {
+            self.page.leaves.iter().map(|l| l.flow.source_for(0)).min_by_key(|p| p.abs_diff(at)).unwrap_or(at)
+        })
+    }
+
     fn close_link_card(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.link_card.take().is_some() {
             self.focus_page(window, cx);
@@ -1357,6 +1979,17 @@ impl LiveView {
         let flow = self.page.leaves[i].flow.clone();
         if let Some(link) = flow.link_at(flow.shown_for(caret)) {
             self.open_link_card(link, i, true, window, cx);
+            return;
+        }
+        if self.selection().is_none()
+            && let Some((source, tex)) = flow.math_at(flow.shown_for(caret))
+        {
+            self.open_math_card(source, tex, i, window, cx);
+            return;
+        }
+        // In a table (not on a link): the table's card.
+        if matches!(self.page.leaves[i].kind, Kind::Cell { .. }) && self.selection().is_none() {
+            self.open_table_card(i, cx);
             return;
         }
         let Some(selection) = self.selection() else { return };
@@ -1424,19 +2057,111 @@ impl LiveView {
         true
     }
 
-    /// ↑ / ↓ past a cell's first or last line: the cell above or below, or
-    /// out of the table. `None` when the caret isn't in a cell.
-    fn table_vertical(&self, leaf: usize, down: bool) -> Option<Option<usize>> {
-        let Kind::Cell { row, col } = self.page.leaves[leaf].kind else { return None };
-        let (rows, _) = self.table_of(leaf)?;
-        let target = if down { rows.get(row + 1) } else { row.checked_sub(1).and_then(|r| rows.get(r)) };
-        if let Some(cell) = target.and_then(|r| r.get(col)) {
-            return Some(Some(*cell));
+    /// The table starting at `start` as a grid of its cells' Markdown.
+    fn grid(&self, start: usize) -> Option<Grid> {
+        self.page.blocks.iter().find_map(|(range, shape)| match shape {
+            Shape::Table { rows, aligns, .. } if range.start == start => Some(Grid {
+                range: range.clone(),
+                cells: rows
+                    .iter()
+                    .map(|row| row.iter().map(|i| self.source[self.page.leaves[*i].span.clone()].trim().to_string()).collect())
+                    .collect(),
+                aligns: aligns.clone(),
+            }),
+            _ => None,
+        })
+    }
+
+    /// Change the shape of the table starting at `start`, around cell
+    /// (`row`, `col`), and put the caret in the cell it lands on.
+    fn table_op(&mut self, start: usize, row: usize, col: usize, op: TableOp, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(mut grid) = self.grid(start) else { return };
+        window.focus(&self.focus, cx);
+        let width = grid.cells.iter().map(Vec::len).max().unwrap_or(1);
+        let empty_row = || vec![String::new(); width];
+        let (mut row, mut col) = (row.min(grid.cells.len().saturating_sub(1)), col.min(width.saturating_sub(1)));
+        match op {
+            TableOp::RowAbove | TableOp::RowBelow => {
+                // Never above the header.
+                let at = if op == TableOp::RowAbove && row > 0 { row } else { row + 1 };
+                grid.cells.insert(at, empty_row());
+                row = at;
+            }
+            TableOp::AddRow => {
+                grid.cells.push(empty_row());
+                row = grid.cells.len() - 1;
+                col = 0;
+            }
+            TableOp::DeleteRow => {
+                if grid.cells.len() <= 1 {
+                    return;
+                }
+                // The header goes: the next row becomes the header.
+                grid.cells.remove(row);
+                row = row.min(grid.cells.len() - 1);
+            }
+            TableOp::ColumnLeft | TableOp::ColumnRight | TableOp::AddColumn => {
+                let at = match op {
+                    TableOp::ColumnLeft => col,
+                    TableOp::ColumnRight => col + 1,
+                    _ => width,
+                };
+                for cells in &mut grid.cells {
+                    cells.insert(at.min(cells.len()), String::new());
+                }
+                grid.aligns.insert(at.min(grid.aligns.len()), Align::None);
+                col = at;
+                if op == TableOp::AddColumn {
+                    row = 0;
+                }
+            }
+            TableOp::DeleteColumn => {
+                if width <= 1 {
+                    return;
+                }
+                for cells in &mut grid.cells {
+                    if col < cells.len() {
+                        cells.remove(col);
+                    }
+                }
+                if col < grid.aligns.len() {
+                    grid.aligns.remove(col);
+                }
+                col = col.min(width - 2);
+            }
+            TableOp::Align(align) => {
+                while grid.aligns.len() <= col {
+                    grid.aligns.push(Align::None);
+                }
+                grid.aligns[col] = align;
+            }
         }
-        // Out of the table: the line after it, or before it.
-        let first = *rows.first()?.first()?;
-        let last = *rows.last()?.last()?;
-        Some(if down { (last + 1 < self.page.leaves.len()).then_some(last + 1) } else { first.checked_sub(1) })
+        let range = grid.range.clone();
+        self.edit(range.clone(), &grid.markdown(), window, cx);
+        self.table_card = None;
+        let cell = self.page.leaves.iter().position(|l| {
+            matches!(l.kind, Kind::Cell { row: r, col: c } if r == row && c == col) && l.span.start >= range.start
+        });
+        if let Some(cell) = cell {
+            self.go_to_cell(cell, true, cx);
+        }
+    }
+
+    /// The table card for the caret's cell, under it.
+    fn open_table_card(&mut self, leaf: usize, cx: &mut Context<Self>) {
+        let at = self
+            .geometry
+            .borrow()
+            .get(&leaf_key(leaf))
+            .map(|g| point(g.bounds().left(), g.bounds().bottom() + px(6.)))
+            .unwrap_or(point(px(120.), px(120.)));
+        self.table_card = Some((leaf, at));
+        cx.notify();
+    }
+
+    /// Whether the caret is in a table cell.
+    fn in_cell(&self) -> bool {
+        matches!(self.spot(), Some(Spot::Leaf(i)) if matches!(self.page.leaves[i].kind, Kind::Cell { .. }))
     }
 
     /// ↓ on the page's last line (out of a code block, say): a new paragraph
@@ -1447,7 +2172,7 @@ impl LiveView {
             self.caret = Some(end);
             cx.notify();
         } else if self.editor.read(cx).is_editable()
-            && matches!(self.page.blocks.last(), Some((_, Shape::Code(_) | Shape::Quote(_) | Shape::List(_) | Shape::Table { .. })))
+            && matches!(self.page.blocks.last(), Some((_, Shape::Code(_) | Shape::Quote(_) | Shape::List(_) | Shape::Table { .. } | Shape::Note { .. })))
         {
             self.edit(end..end, "\n\n", window, cx);
         }
@@ -1471,6 +2196,30 @@ impl LiveView {
     fn stop_editing(&mut self, _: &StopEditing, window: &mut Window, cx: &mut Context<Self>) {
         if self.link_card.is_some() {
             self.close_link_card(window, cx);
+            return;
+        }
+        if self.action_menu.is_some() {
+            self.close_actions(window, cx);
+            return;
+        }
+        if self.math_card.is_some() {
+            self.close_math_card(window, cx);
+            return;
+        }
+        if self.mark_card.take().is_some() {
+            cx.notify();
+            return;
+        }
+        if self.table_card.take().is_some() {
+            cx.notify();
+            return;
+        }
+        if self.picked.take().is_some() {
+            cx.notify();
+            return;
+        }
+        if self.raw.is_some() {
+            self.leave_raw(cx);
             return;
         }
         if self.caret.take().is_some() {
@@ -1497,7 +2246,11 @@ impl Render for LiveView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let focused = self.focus.is_focused(window);
         if self.was_focused && !focused {
+            if self.raw.is_some() {
+                self.leave_raw(cx);
+            }
             self.parked = self.caret.take().map(|caret| (caret, self.anchor.take(), self.revision));
+            self.picked = None;
             self.dragging = false;
         }
         self.refresh(cx);
@@ -1513,6 +2266,19 @@ impl Render for LiveView {
             }
         }
         self.was_focused = focused;
+        // The picked block's ring: cleared here, set again below if still picked.
+        if cx.try_global::<rich::PickedBlock>().and_then(|p| p.0.as_ref()).is_some_and(|(id, _)| *id == self.editor_id) {
+            cx.set_global(rich::PickedBlock(None));
+        }
+        // The caret left the raw block (a click, an arrow): it's drawn again.
+        if let Some(raw) = self.raw.clone()
+            && self.caret.is_some_and(|c| c < raw.start || c > raw.end)
+        {
+            let caret = self.caret;
+            self.raw = None;
+            self.page = Page::read_with_raw(&self.source, None);
+            self.caret = caret;
+        }
         let spot = self.spot();
         let reading = typography::current(cx);
         let render_context = {
@@ -1567,6 +2333,23 @@ impl Render for LiveView {
             let (first, last) = (b == 0, b + 1 == count);
             let element = match shape {
                 Shape::Text(leaf) => line(leaf, first, last, window, cx),
+                // A footnote: its number, then its text.
+                Shape::Note { leaf, number } => h_flex()
+                    .w_full()
+                    .items_start()
+                    .gap_2()
+                    .child(
+                        div()
+                            .h(px(reading.size as f32 * 1.618))
+                            .min_w(px(18.))
+                            .flex_shrink_0()
+                            .flex()
+                            .items_center()
+                            .text_color(muted)
+                            .child(format!("{number}.")),
+                    )
+                    .child(line(leaf, first, last, window, cx))
+                    .into_any_element(),
                 Shape::List(items) => {
                     let mut list = v_flex().w_full().gap_1().py_1();
                     for row in items {
@@ -1617,42 +2400,153 @@ impl Render for LiveView {
                         .into_any_element()
                 }
                 Shape::Table { rows: cells, aligns, .. } => {
-                    let paragraphs = cells
-                        .iter()
-                        .map(|row| {
-                            row.iter()
-                                .map(|i| {
-                                    let mut p = Paragraph::default();
-                                    let flow = &self.page.leaves[*i].flow;
-                                    p.push(InlineNode::new(flow.text.clone()).marks(flow.marks.clone()));
-                                    p.with_leaf_key(leaf_key(*i))
+                    let start = range.start;
+                    let editable = self.editor.read(cx).is_editable();
+                    let style = render_context.style();
+                    let (head, border) = (style.code_background(), style.border());
+                    let theme = cx.theme().clone();
+                    let width = cells.iter().map(Vec::len).max().unwrap_or(1);
+                    // Columns share the width by how long their text runs.
+                    let weights: Vec<f32> = (0..width)
+                        .map(|c| {
+                            let longest = cells.iter().filter_map(|r| r.get(c)).map(|i| self.page.leaves[*i].flow.text.chars().count()).max();
+                            longest.unwrap_or(0).clamp(6, 40) as f32
+                        })
+                        .collect();
+                    let mut frame = v_flex().w_full().rounded_md().border_1().border_color(border).overflow_hidden();
+                    for (r, row) in cells.iter().enumerate() {
+                        let mut line = h_flex().w_full().items_stretch().when(r + 1 < cells.len(), |l| l.border_b_1()).border_color(border);
+                        if r == 0 {
+                            line = line.bg(head).font_weight(FontWeight::SEMIBOLD);
+                        }
+                        for c in 0..width {
+                            let align = aligns.get(c).copied().unwrap_or(Align::None);
+                            let mut cell = div()
+                                .id(ElementId::Name(format!("live-cell-{start}-{r}-{c}").into()))
+                                .flex_basis(px(0.))
+                                .flex_grow(weights[c])
+                                .min_w(px(48.))
+                                .relative()
+                                .px_3()
+                                .py(px(7.))
+                                .when(c + 1 < width, |d| d.border_r_1())
+                                .border_color(border)
+                                .when(align == Align::Center, |d| d.text_center())
+                                .when(align == Align::Right, |d| d.text_right());
+                            let Some(&leaf) = row.get(c) else {
+                                line = line.child(cell);
+                                continue;
+                            };
+                            let node = Self::flow_node(&self.page.leaves[leaf].flow, leaf_key(leaf));
+                            let position = FlowPosition::at(&[&node], 0, true).first(true);
+                            let text = node.render_with_id(("live-cell-text", leaf), position, &render_context, window, cx);
+                            let weak = weak.clone();
+                            // The whole cell takes the click, wherever its
+                            // text sits in it.
+                            cell = cell
+                                .cursor_text()
+                                .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                                    if *hovered {
+                                        this.hovered_cell = Some(leaf);
+                                    } else if this.hovered_cell == Some(leaf) {
+                                        this.hovered_cell = None;
+                                    }
+                                    cx.notify();
+                                }))
+                                .on_mouse_down(MouseButton::Left, move |event, window, cx| {
+                                    let _ = weak.update(cx, |view, cx| view.mouse_down(leaf, event, window, cx));
                                 })
-                                .collect()
-                        })
-                        .collect();
-                    let aligns = aligns
-                        .iter()
-                        .map(|a| match a {
-                            Align::Left => ColumnAlign::Left,
-                            Align::Center => ColumnAlign::Center,
-                            Align::Right => ColumnAlign::Right,
-                            Align::None => ColumnAlign::None,
-                        })
-                        .collect();
-                    let node = BlockNode::Table(Table::new(paragraphs, aligns));
-                    let position = FlowPosition::at(&[&node], 0, last).first(first);
-                    let element = node.render_with_id(("live-table", range.start), position, &render_context, window, cx);
-                    let leaves: Vec<usize> = cells.iter().flatten().copied().collect();
-                    let weak = weak.clone();
-                    div()
-                        .id(("live-table-row", range.start))
+                                .child(text);
+                            // Hovered: the column's
+                            // alignment, and the table's menu, at its top right.
+                            if editable && self.hovered_cell == Some(leaf) {
+                                let mut bar = h_flex()
+                                    .absolute()
+                                    .top(px(4.))
+                                    .right(px(4.))
+                                    .gap(px(2.))
+                                    .p(px(2.))
+                                    .toolbar_surface(&theme)
+                                    .font_weight(FontWeight::NORMAL)
+                                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation());
+                                for (to, icon, label, id) in [
+                                    (Align::Left, IconName::AlignHorizontalJustifyStart, "Align Left", "live-cell-left"),
+                                    (Align::Center, IconName::AlignHorizontalJustifyCenter, "Align Center", "live-cell-center"),
+                                    (Align::Right, IconName::AlignHorizontalJustifyEnd, "Align Right", "live-cell-right"),
+                                ] {
+                                    let current = align == to || (to == Align::Left && align == Align::None);
+                                    bar = bar.child(
+                                        crate::ui::icon_button((id, leaf), icon, label)
+                                            .xsmall()
+                                            .compact()
+                                            .when(current, |b| b.bg(theme.accent))
+                                            .on_click(cx.listener(move |this, _, window, cx| {
+                                                this.table_op(start, r, c, TableOp::Align(to), window, cx)
+                                            })),
+                                    );
+                                }
+                                bar = bar.child(
+                                    crate::ui::icon_button(("live-cell-menu", leaf), IconName::Ellipsis, "Table Options")
+                                        .xsmall()
+                                        .compact()
+                                        .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
+                                            window.focus(&this.focus, cx);
+                                            this.go_to_cell(leaf, true, cx);
+                                            let at = event.position();
+                                            this.table_card = Some((leaf, point(at.x - px(180.), at.y + px(12.))));
+                                            cx.notify();
+                                        })),
+                                );
+                                cell = cell.child(bar);
+                            }
+                            line = line.child(cell);
+                        }
+                        frame = frame.child(line);
+                    }
+                    let element = div().w_full().pb(px(reading.size as f32 * 0.9)).child(frame);
+                    let group: SharedString = format!("live-table-{start}").into();
+                    // Notion's + bars: one beside the table adds a column,
+                    // one under it adds a row. They show while the pointer is
+                    // over the table.
+                    let bar = |id: &'static str, op: TableOp, label: &'static str| {
+                        div()
+                            .id((id, start))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded_sm()
+                            .opacity(0.)
+                            .cursor_pointer()
+                            .text_color(theme.muted_foreground)
+                            .hover(|s| s.bg(theme.muted))
+                            .group_hover(group.clone(), |s| s.opacity(1.))
+                            .tooltip(move |window, cx| gpui_kit::component::tooltip::Tooltip::new(label).build(window, cx))
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                            .on_click(cx.listener(move |this, _, window, cx| this.table_op(start, 0, 0, op, window, cx)))
+                            .child(Icon::new(IconName::Plus).xsmall())
+                    };
+                    let table = div().flex_1().min_w_0().child(element);
+                    v_flex()
+                        .id(("live-table-row", start))
+                        .group(group.clone())
                         .w_full()
-                        .cursor_text()
-                        .on_mouse_down(MouseButton::Left, move |event, window, cx| {
-                            let leaves = leaves.clone();
-                            let _ = weak.update(cx, |view, cx| view.mouse_down_near(&leaves, event, window, cx));
+                        .child(
+                            h_flex()
+                                .w_full()
+                                .items_stretch()
+                                .gap_1()
+                                .child(table)
+                                .when(editable, |row| row.child(bar("live-add-column", TableOp::AddColumn, "Add Column").w(px(16.)).my_2())),
+                        )
+                        .when(editable, |table| {
+                            table.child(
+                                h_flex()
+                                    .w_full()
+                                    .gap_1()
+                                    .child(bar("live-add-row", TableOp::AddRow, "Add Row").flex_1().h(px(16.)).mt_neg_1())
+                                    .child(div().w(px(16.))),
+                            )
                         })
-                        .child(element)
                         .into_any_element()
                 }
                 Shape::Code(leaf) => {
@@ -1684,13 +2578,28 @@ impl Render for LiveView {
                     let base = self.base.clone();
                     let image_base = base.clone();
                     let weak = weak.clone();
+                    let start = range.start;
+                    let picked = focused && self.picked == Some(start);
+                    // A picture rings itself; anything else rings its block.
+                    let picture = {
+                        let text = self.source[range.clone()].trim_start();
+                        text.starts_with("<img") || text.starts_with("![")
+                    };
+                    let picked_range = (focused && self.picked == Some(start)).then(|| range.clone());
+                    if let Some(range) = picked_range {
+                        cx.set_global(rich::PickedBlock(Some((self.editor_id, range))));
+                    }
+                    let picked = picked && !picture;
+                    let ring = cx.theme().ring;
                     div()
                         .id(("live-block", range.start))
                         .w_full()
-                        .on_click(move |event, window, cx| {
-                            let at = event.position();
-                            let _ = (at, window);
-                            let _ = weak.update(cx, |view, cx| view.click_other(cx));
+                        .relative()
+                        .on_click(move |_, window, cx| {
+                            let _ = weak.update(cx, |view, cx| view.click_other(start, window, cx));
+                        })
+                        .when(picked, |block| {
+                            block.child(div().absolute().top(px(-3.)).bottom(px(-3.)).left(px(-3.)).right(px(-3.)).rounded_md().border_2().border_color(ring))
                         })
                         .child(
                             rich::decorate(view, self.owner.clone(), self.editor_id, base, range.start, 0).image_source(
@@ -1742,6 +2651,14 @@ impl Render for LiveView {
                         .bg(theme.popover)
                         .shadow_md()
                         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .on_hover(cx.listener(|this, hovered: &bool, window, cx| {
+                            this.over_card = *hovered;
+                            if *hovered {
+                                this.closing = None;
+                            } else {
+                                this.close_hover_card_soon(window, cx);
+                            }
+                        }))
                         .capture_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                             if event.keystroke.key == "escape" {
                                 cx.stop_propagation();
@@ -1773,25 +2690,307 @@ impl Render for LiveView {
             )
             .with_priority(1)
         });
+        // The table card closes once the caret leaves its cell.
+        if let Some((leaf, _)) = self.table_card
+            && self.spot() != Some(Spot::Leaf(leaf))
+        {
+            self.table_card = None;
+        }
+        let table_card = self.table_card.and_then(|(leaf, at)| {
+            let Kind::Cell { row, col } = self.page.leaves.get(leaf)?.kind else { return None };
+            let start = self.page.blocks.iter().find_map(|(range, shape)| match shape {
+                Shape::Table { rows, .. } if rows.iter().flatten().any(|i| *i == leaf) => Some(range.start),
+                _ => None,
+            })?;
+            let theme = cx.theme();
+            let item = |id: &'static str, icon: Option<IconName>, label: &'static str, op: TableOp| {
+                h_flex()
+                    .id(id)
+                    .h(px(26.))
+                    .px_2()
+                    .gap_2()
+                    .items_center()
+                    .rounded_md()
+                    .text_sm()
+                    .cursor_pointer()
+                    .hover(|s| s.bg(theme.accent))
+                    .child(
+                        div()
+                            .w(px(14.))
+                            .flex()
+                            .justify_center()
+                            .text_color(theme.muted_foreground)
+                            .children(icon.map(|icon| Icon::new(icon).xsmall())),
+                    )
+                    .child(label)
+                    .on_click(cx.listener(move |this, _, window, cx| this.table_op(start, row, col, op, window, cx)))
+            };
+            let separator = || div().h_px().mx_1().my_0p5().bg(theme.border);
+            Some(
+                deferred(
+                    anchored().position(at).snap_to_window_with_margin(px(8.)).child(
+                        v_flex()
+                            .id("live-table-card")
+                            .occlude()
+                            .w(px(200.))
+                            .p_1()
+                            .rounded_lg()
+                            .border_1()
+                            .border_color(theme.border)
+                            .bg(theme.popover)
+                            .text_color(theme.popover_foreground)
+                            .shadow_md()
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                            .child(item("live-row-above", Some(IconName::ArrowUp), "Insert Row Above", TableOp::RowAbove))
+                            .child(item("live-row-below", Some(IconName::ArrowDown), "Insert Row Below", TableOp::RowBelow))
+                            .child(item("live-column-left", Some(IconName::ArrowLeft), "Insert Column Left", TableOp::ColumnLeft))
+                            .child(item("live-column-right", Some(IconName::ArrowRight), "Insert Column Right", TableOp::ColumnRight))
+                            .child(separator())
+                            .child(item("live-align-left", None, "Align Left", TableOp::Align(Align::Left)))
+                            .child(item("live-align-center", None, "Align Center", TableOp::Align(Align::Center)))
+                            .child(item("live-align-right", None, "Align Right", TableOp::Align(Align::Right)))
+                            .child(separator())
+                            .child(item("live-delete-row", Some(IconName::Trash), "Delete Row", TableOp::DeleteRow))
+                            .child(item("live-delete-column", Some(IconName::Trash), "Delete Column", TableOp::DeleteColumn)),
+                    ),
+                )
+                .with_priority(1),
+            )
+        });
+        // A highlight card opened with ⌘K goes once the caret leaves it.
+        if let Some(card) = &self.mark_card
+            && !card.hover
+            && !card.pinned
+            && !self.caret.is_some_and(|c| card.mark.source.start <= c && c <= card.mark.source.end)
+        {
+            self.mark_card = None;
+        }
+        let mark_card = self.mark_card.as_ref().map(|card| {
+            let theme = cx.theme();
+            let current = rich::highlight_hex(card.mark.color);
+            let swatches = rich::HIGHLIGHTS.iter().enumerate().map(|(i, (name, value))| {
+                let swatch: Hsla = rgb(*value).into();
+                let selected = rich::highlight_hex(swatch) == current;
+                let name: SharedString = (*name).into();
+                div()
+                    .id(("live-mark-color", i))
+                    .size(px(22.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(6.))
+                    .bg(swatch)
+                    .border_1()
+                    .border_color(if selected { theme.foreground.opacity(0.45) } else { swatch.blend(black().opacity(0.08)) })
+                    .text_color(rgb(0x303235))
+                    .cursor_pointer()
+                    .hover(move |tile| tile.bg(swatch.blend(black().opacity(0.06))))
+                    .tooltip(move |window, cx| gpui_kit::component::tooltip::Tooltip::new(name.clone()).build(window, cx))
+                    .when(selected, |tile| tile.child(Icon::new(IconName::Check).size(px(12.))))
+                    .on_click(cx.listener(move |this, _, window, cx| this.recolor_mark(Some(swatch), window, cx)))
+            });
+            deferred(
+                anchored().position(card.at).snap_to_window_with_margin(px(8.)).child(
+                    h_flex()
+                        .id("live-mark-card")
+                        .occlude()
+                        .p_1p5()
+                        .gap_1p5()
+                        .items_center()
+                        .rounded_lg()
+                        .border_1()
+                        .border_color(theme.border)
+                        .bg(theme.popover)
+                        .shadow_md()
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .on_hover(cx.listener(|this, hovered: &bool, window, cx| {
+                            this.over_card = *hovered;
+                            if *hovered {
+                                this.closing = None;
+                            } else {
+                                this.close_hover_card_soon(window, cx);
+                            }
+                        }))
+                        .children(swatches)
+                        .child(
+                            div()
+                                .id("live-mark-picker")
+                                .capture_any_mouse_down(cx.listener(|this, _, _, _| {
+                                    if let Some(card) = this.mark_card.as_mut() {
+                                        card.pinned = true;
+                                        card.hover = false;
+                                    }
+                                }))
+                                .child(
+                                    ColorPicker::new(&card.picker)
+                                        .icon(IconName::Palette)
+                                        .xsmall()
+                                        .accessibility_label("Custom highlight color"),
+                                ),
+                        )
+                        .child(div().w_px().h(px(18.)).bg(theme.border))
+                        .child(
+                            crate::ui::icon_button("live-mark-remove", IconName::CircleX, "Remove Highlight")
+                                .xsmall()
+                                .compact()
+                                .on_click(cx.listener(|this, _, window, cx| this.recolor_mark(None, window, cx))),
+                        ),
+                ),
+            )
+            .with_priority(1)
+        });
+        let action_menu = self.action_menu.as_ref().map(|menu| {
+            let theme = cx.theme().clone();
+            let mut command = Command::new(&menu.state)
+                .placeholder("Actions…")
+                .max_h(px(320.))
+                .scroll_bounce(false)
+                .rounded(crate::ui::MODAL_RADIUS - px(1.))
+                .bordered(false)
+                .bg(gpui_kit::transparent_black());
+            // Groups in the order the actions came, each action's place kept
+            // so a choice finds it again.
+            let mut groups: Vec<(&'static str, Vec<usize>)> = Vec::new();
+            for (i, action) in menu.actions.iter().enumerate() {
+                match groups.iter_mut().find(|(g, _)| *g == action.group) {
+                    Some((_, rows)) => rows.push(i),
+                    None => groups.push((action.group, vec![i])),
+                }
+            }
+            for (name, rows) in &groups {
+                let items = rows.iter().map(|&i| {
+                    let action = &menu.actions[i];
+                    let label = action.label.clone();
+                    let swatch = action.swatch;
+                    let border = theme.border;
+                    CommandItem::new()
+                        .label(label.clone())
+                        .keywords(action.keywords.iter().copied().chain(std::iter::once(*name)))
+                        .child(move |_, _| {
+                            h_flex()
+                                .w_full()
+                                .gap_2()
+                                .items_center()
+                                .when_some(swatch, |row, swatch| {
+                                    row.child(div().size(px(12.)).rounded(px(3.)).bg(swatch).border_1().border_color(border))
+                                })
+                                .child(label.clone())
+                        })
+                });
+                command = command.group(CommandGroup::new().label(*name).items(items));
+            }
+            let order: Vec<Vec<usize>> = groups.into_iter().map(|(_, rows)| rows).collect();
+            let weak = cx.entity().downgrade();
+            let cancel = weak.clone();
+            let command = command
+                .on_confirm(move |index, window, cx| {
+                    if let Some(&i) = order.get(index.section).and_then(|rows| rows.get(index.row)) {
+                        let _ = weak.update(cx, |this, cx| this.choose_action(i, window, cx));
+                    }
+                })
+                // After this key's dispatch: Escape also reaches the page's
+                // Stop Editing, which closes the menu itself and must find it
+                // open (else it would put the caret away too).
+                .on_cancel(move |window, cx| {
+                    let cancel = cancel.clone();
+                    window.defer(cx, move |window, cx| {
+                        let _ = cancel.update(cx, |this, cx| this.close_actions(window, cx));
+                    });
+                });
+            deferred(
+                anchored().position(menu.at).snap_to_window_with_margin(px(8.)).child(
+                    div()
+                        .id("live-actions")
+                        .occlude()
+                        .w(px(260.))
+                        .modal_surface(&theme)
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .on_mouse_down_out(cx.listener(|this, _, window, cx| this.close_actions(window, cx)))
+                        .when(!menu.buttons.is_empty(), |surface| {
+                            let buttons = menu.buttons.iter().map(|b| {
+                                let act = b.act.clone();
+                                crate::ui::icon_button(SharedString::from(format!("live-format-{}", b.label)), b.icon, b.label)
+                                    .small()
+                                    .when(b.active, |button| button.bg(theme.accent))
+                                    .on_click(cx.listener(move |this, _, window, cx| this.press_button(act.clone(), window, cx)))
+                            });
+                            surface.child(
+                                h_flex()
+                                    .w_full()
+                                    .px_1p5()
+                                    .pt_1p5()
+                                    .pb_1()
+                                    .gap_0p5()
+                                    .justify_between()
+                                    .children(buttons),
+                            )
+                            .child(div().h_px().mx_1p5().bg(theme.border))
+                        })
+                        .child(div().rounded(crate::ui::MODAL_RADIUS - px(1.)).overflow_hidden().child(command)),
+                ),
+            )
+            .with_priority(2)
+        });
+        let math_card = self.math_card.as_ref().map(|card| {
+            let theme = cx.theme();
+            deferred(
+                anchored().position(card.at).snap_to_window_with_margin(px(8.)).child(
+                    h_flex()
+                        .id("live-math-card")
+                        .occlude()
+                        .w(px(320.))
+                        .p_1p5()
+                        .gap_1()
+                        .items_center()
+                        .rounded_lg()
+                        .border_1()
+                        .border_color(theme.border)
+                        .bg(theme.popover)
+                        .shadow_md()
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .capture_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                            if event.keystroke.key == "escape" {
+                                cx.stop_propagation();
+                                this.close_math_card(window, cx);
+                            }
+                        }))
+                        .child(div().flex_1().min_w_0().child(Input::new(&card.input).small()))
+                        .child(
+                            crate::ui::icon_button("live-math-apply", IconName::Check, "Apply")
+                                .xsmall()
+                                .compact()
+                                .on_click(cx.listener(|this, _, window, cx| this.apply_math(window, cx))),
+                        ),
+                ),
+            )
+            .with_priority(1)
+        });
         let content = v_flex()
             .id("live-page")
             .key_context(CONTEXT)
             .track_focus(&self.focus)
             .on_action(cx.listener(Self::backspace))
+            .on_action(cx.listener(Self::toggle_markdown))
+            .on_action(cx.listener(Self::open_actions))
             .on_action(cx.listener(Self::delete))
             .on_action(cx.listener(Self::enter))
             .on_action(cx.listener(Self::soft_break))
             .on_action(cx.listener(|this, _: &Left, _, cx| {
+                if this.leave_picked(false, cx) { return }
                 if !this.collapse(false, cx) { this.moving(false, cx, |t, cx| t.horizontal(false, cx)) }
             }))
             .on_action(cx.listener(|this, _: &Right, _, cx| {
+                if this.leave_picked(true, cx) { return }
                 if !this.collapse(true, cx) { this.moving(false, cx, |t, cx| t.horizontal(true, cx)) }
             }))
-            .on_action(cx.listener(|this, _: &Up, _, cx| this.moving(false, cx, |t, cx| t.vertical(false, cx))))
+            .on_action(cx.listener(|this, _: &Up, _, cx| {
+                if !this.leave_picked(false, cx) { this.moving(false, cx, |t, cx| t.vertical(false, cx)) }
+            }))
             .on_action(cx.listener(|this, _: &Down, w, cx| {
+                if this.leave_picked(true, cx) { return }
                 let before = this.caret;
                 this.moving(false, cx, |t, cx| t.vertical(true, cx));
-                if this.caret == before {
+                if this.caret == before && !this.in_cell() {
                     this.past_the_end(w, cx);
                 }
             }))
@@ -1865,6 +3064,10 @@ impl Render for LiveView {
             .text_size(px(reading.size as f32))
             .children(rows)
             .children(card)
+            .children(table_card)
+            .children(math_card)
+            .children(mark_card)
+            .children(action_menu)
             // Below the last block: a click there writes a new paragraph at the end.
             .child(div().id("live-end").w_full().min_h(px(120.)).cursor_text().on_click(cx.listener(
                 |this, _, window, cx| {

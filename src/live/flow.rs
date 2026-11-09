@@ -25,6 +25,8 @@ pub enum Wrap {
     Code,
     Link,
     Wiki,
+    /// Inline HTML formatting: `<mark>`, `<b>`, `<u>`…
+    Html,
 }
 
 impl Wrap {
@@ -35,9 +37,18 @@ impl Wrap {
             Wrap::Emphasis => "*",
             Wrap::Delete => "~~",
             Wrap::Code => "`",
-            Wrap::Link | Wrap::Wiki => "",
+            Wrap::Link | Wrap::Wiki | Wrap::Html => "",
         }
     }
+}
+
+/// A highlight: its Markdown, its tags, and its colour.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MarkAt {
+    pub source: Range<usize>,
+    pub open: Range<usize>,
+    pub close: Range<usize>,
+    pub color: gpui_kit::Hsla,
 }
 
 /// A link under the caret: its Markdown, the text shown and where it goes.
@@ -70,6 +81,9 @@ pub struct Flow {
     wrappers: Vec<Wrapper>,
     /// Where text typed into an empty block goes (after a heading's `# `).
     empty_at: usize,
+    /// Inline math, drawn as one unit: where it's drawn, its Markdown, and
+    /// its TeX.
+    pub maths: Vec<(Range<usize>, Range<usize>, String)>,
 }
 
 /// The drawn form of the block at `range` of `source`, or `None` when it holds
@@ -100,11 +114,204 @@ pub fn from_inline(source: &str, heading: Option<u8>, children: &[Node], empty_a
     Some(flow)
 }
 
+thread_local! {
+    /// The note's link definitions (`[id]: url`), for reference links, while
+    /// a page is read.
+    static DEFINITIONS: std::cell::RefCell<std::collections::HashMap<String, String>> = Default::default();
+    static FOOTNOTES: std::cell::RefCell<std::collections::HashMap<String, usize>> = Default::default();
+}
+
+/// Run `f` with the note's link definitions known to reference links, and
+/// its footnotes' numbers (by identifier) to footnote marks.
+pub fn with_definitions<R>(
+    definitions: std::collections::HashMap<String, String>,
+    footnotes: std::collections::HashMap<String, usize>,
+    f: impl FnOnce() -> R,
+) -> R {
+    DEFINITIONS.with(|d| *d.borrow_mut() = definitions);
+    FOOTNOTES.with(|d| *d.borrow_mut() = footnotes);
+    let result = f();
+    DEFINITIONS.with(|d| d.borrow_mut().clear());
+    FOOTNOTES.with(|d| d.borrow_mut().clear());
+    result
+}
+
+/// A footnote's number as drawn: its order in the note, else its label.
+pub fn footnote_number(identifier: &str, label: Option<&str>) -> String {
+    match FOOTNOTES.with(|d| d.borrow().get(&identifier.to_lowercase()).copied()) {
+        Some(n) => n.to_string(),
+        None => label.unwrap_or(identifier).to_string(),
+    }
+}
+
+/// `text` in superscript letters where Unicode has them.
+fn superscript(text: &str) -> String {
+    text.chars()
+        .map(|c| match c {
+            '0' => '⁰', '1' => '¹', '2' => '²', '3' => '³', '4' => '⁴', '5' => '⁵', '6' => '⁶', '7' => '⁷', '8' => '⁸', '9' => '⁹',
+            '+' => '⁺', '-' => '⁻', '=' => '⁼', '(' => '⁽', ')' => '⁾', 'n' => 'ⁿ', 'i' => 'ⁱ',
+            c => c,
+        })
+        .collect()
+}
+
+fn subscript(text: &str) -> String {
+    text.chars()
+        .map(|c| match c {
+            '0' => '₀', '1' => '₁', '2' => '₂', '3' => '₃', '4' => '₄', '5' => '₅', '6' => '₆', '7' => '₇', '8' => '₈', '9' => '₉',
+            '+' => '₊', '-' => '₋', '=' => '₌', '(' => '₍', ')' => '₎',
+            c => c,
+        })
+        .collect()
+}
+
+/// TeX drawn as text: Greek letters, common symbols, simple powers and
+/// indices, `\frac{a}{b}` as a⁄b. What it can't draw stays as written.
+pub fn tex_text(tex: &str) -> String {
+    const SYMBOLS: &[(&str, &str)] = &[
+        ("alpha", "α"), ("beta", "β"), ("gamma", "γ"), ("delta", "δ"), ("epsilon", "ε"), ("zeta", "ζ"), ("eta", "η"),
+        ("theta", "θ"), ("iota", "ι"), ("kappa", "κ"), ("lambda", "λ"), ("mu", "μ"), ("nu", "ν"), ("xi", "ξ"),
+        ("pi", "π"), ("rho", "ρ"), ("sigma", "σ"), ("tau", "τ"), ("phi", "φ"), ("chi", "χ"), ("psi", "ψ"),
+        ("omega", "ω"), ("Gamma", "Γ"), ("Delta", "Δ"), ("Theta", "Θ"), ("Lambda", "Λ"), ("Pi", "Π"), ("Sigma", "Σ"),
+        ("Phi", "Φ"), ("Psi", "Ψ"), ("Omega", "Ω"), ("times", "×"), ("cdot", "·"), ("div", "÷"), ("pm", "±"),
+        ("mp", "∓"), ("le", "≤"), ("leq", "≤"), ("ge", "≥"), ("geq", "≥"), ("neq", "≠"), ("ne", "≠"),
+        ("approx", "≈"), ("equiv", "≡"), ("sim", "∼"), ("infty", "∞"), ("sum", "∑"), ("prod", "∏"), ("int", "∫"),
+        ("partial", "∂"), ("nabla", "∇"), ("sqrt", "√"), ("to", "→"), ("rightarrow", "→"), ("leftarrow", "←"),
+        ("Rightarrow", "⇒"), ("Leftarrow", "⇐"), ("leftrightarrow", "↔"), ("in", "∈"), ("notin", "∉"),
+        ("subset", "⊂"), ("subseteq", "⊆"), ("cup", "∪"), ("cap", "∩"), ("forall", "∀"), ("exists", "∃"),
+        ("emptyset", "∅"), ("ldots", "…"), ("cdots", "⋯"), ("degree", "°"), ("circ", "∘"), ("neg", "¬"),
+        ("land", "∧"), ("lor", "∨"), ("quad", " "), ("qquad", "  "), (",", " "), (";", " "), ("!", ""),
+    ];
+    // The group after `at` (`{…}` or one letter) and where it ends.
+    fn group(chars: &[char], at: usize) -> (String, usize) {
+        if chars.get(at) == Some(&'{') {
+            let mut depth = 0;
+            for (i, c) in chars.iter().enumerate().skip(at) {
+                match c {
+                    '{' => depth += 1,
+                    '}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            return (chars[at + 1..i].iter().collect(), i + 1);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            (chars[at + 1..].iter().collect(), chars.len())
+        } else {
+            (chars.get(at).map(|c| c.to_string()).unwrap_or_default(), (at + 1).min(chars.len()))
+        }
+    }
+    let chars: Vec<char> = tex.chars().collect();
+    let mut out = String::new();
+    let mut i = 0;
+    while i < chars.len() {
+        match chars[i] {
+            '\\' => {
+                let name: String = chars[i + 1..].iter().take_while(|c| c.is_ascii_alphabetic()).collect();
+                let name = if name.is_empty() { chars.get(i + 1).map(|c| c.to_string()).unwrap_or_default() } else { name };
+                i += 1 + name.len();
+                if name == "frac" {
+                    let (top, next) = group(&chars, i);
+                    let (bottom, next) = group(&chars, next);
+                    out.push_str(&format!("{}⁄{}", tex_text(&top), tex_text(&bottom)));
+                    i = next;
+                } else if name == "text" || name == "mathrm" || name == "mathbf" || name == "operatorname" {
+                    let (inner, next) = group(&chars, i);
+                    out.push_str(&inner);
+                    i = next;
+                } else if let Some((_, symbol)) = SYMBOLS.iter().find(|(n, _)| *n == name) {
+                    out.push_str(symbol);
+                } else if ["{", "}", "$", "%", "&", "#", "_"].contains(&name.as_str()) {
+                    out.push_str(&name);
+                } else {
+                    out.push('\\');
+                    out.push_str(&name);
+                }
+            }
+            '^' | '_' => {
+                let (inner, next) = group(&chars, i + 1);
+                let inner = tex_text(&inner);
+                out.push_str(&if chars[i] == '^' { superscript(&inner) } else { subscript(&inner) });
+                i = next;
+            }
+            '{' | '}' => i += 1,
+            c => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
+/// A drawn unit standing for all of `source` (a footnote mark, inline
+/// math): the caret goes around it, and it's deleted whole.
+fn push_atom(flow: &mut Flow, text: &str, source: Range<usize>, mark: TextMark) {
+    let start = flow.text.len();
+    flow.text.push_str(text);
+    flow.chars.push(Char { shown: start..flow.text.len(), source });
+    if mark != TextMark::default() {
+        flow.marks.push((start..flow.text.len(), mark));
+    }
+}
+
 fn walk(block: &str, base: usize, nodes: &[Node], mark: TextMark, flow: &mut Flow) -> Option<()> {
-    for node in nodes {
+    let mut index = 0;
+    while index < nodes.len() {
+        let node = &nodes[index];
+        index += 1;
         let position = node.position()?;
         let at = position.start.offset..position.end.offset;
         match node {
+            // Inline HTML: a break, or formatting from its tag to the
+            // matching closing tag, the tags hidden like `**`.
+            Node::Html(html) => {
+                let (closing, name, attrs) = inline_tag(&html.value)?;
+                if closing {
+                    return None;
+                }
+                if name == "br" {
+                    let start = flow.text.len();
+                    flow.text.push('\n');
+                    flow.chars.push(Char { shown: start..start + 1, source: base + at.start..base + at.end });
+                    continue;
+                }
+                let tag_mark = html_mark(&name, &attrs)?;
+                let close = matching_close(nodes, index - 1, &name)?;
+                let close_at = nodes[close].position()?;
+                let mut inner_mark = mark.clone();
+                inner_mark.merge(tag_mark);
+                let start = flow.text.len();
+                walk(block, base, &nodes[index..close], inner_mark, flow)?;
+                flow.wrappers.push(Wrapper {
+                    kind: Wrap::Html,
+                    shown: start..flow.text.len(),
+                    source: base + at.start..base + close_at.end.offset,
+                    open: block[at.clone()].to_string(),
+                    close: block[close_at.start.offset..close_at.end.offset].to_string(),
+                });
+                index = close + 1;
+            }
+            // `[text][id]`: a link to its definition's address.
+            Node::LinkReference(reference) => {
+                let url = DEFINITIONS.with(|d| d.borrow().get(&reference.identifier.to_lowercase()).cloned())?;
+                let children = &reference.children;
+                let mut inner_mark = mark.clone();
+                inner_mark.link = Some(LinkMark { url: url.into(), identifier: None, title: None });
+                let start = flow.text.len();
+                walk(block, base, children, inner_mark, flow)?;
+                let inner = children.first().and_then(|c| c.position()).map(|p| p.start.offset)?
+                    ..children.last().and_then(|c| c.position()).map(|p| p.end.offset)?;
+                flow.wrappers.push(Wrapper {
+                    kind: Wrap::Link,
+                    shown: start..flow.text.len(),
+                    source: base + at.start..base + at.end,
+                    open: block[at.start..inner.start].to_string(),
+                    close: block[inner.end..at.end].to_string(),
+                });
+            }
             Node::Text(text) => push_text(block, base, at, &text.value, &mark, flow)?,
             Node::InlineCode(code) => {
                 let ticks = block[at.clone()].chars().take_while(|c| *c == '`').count();
@@ -166,11 +373,144 @@ fn walk(block: &str, base: usize, nodes: &[Node], mark: TextMark, flow: &mut Flo
                 flow.text.push('\n');
                 flow.chars.push(Char { shown: start..start + 1, source: base + at.start..base + at.end });
             }
-            // Images, inline HTML, footnotes, math: not drawn by this editor yet.
+            // `[^1]`: its number, raised.
+            Node::FootnoteReference(note) => {
+                let number = footnote_number(&note.identifier, note.label.as_deref());
+                let shown = if number.chars().all(|c| c.is_ascii_digit()) { superscript(&number) } else { format!("[{number}]") };
+                push_atom(flow, &shown, base + at.start..base + at.end, mark.clone());
+            }
+            // `$…$`: drawn as text, in italic; ⌘K edits its TeX.
+            Node::InlineMath(math) => {
+                let mut math_mark = mark.clone();
+                math_mark.italic = true;
+                let start = flow.text.len();
+                let shown = tex_text(&math.value);
+                let shown = if shown.trim().is_empty() { "∅".to_string() } else { shown };
+                push_atom(flow, &shown, base + at.start..base + at.end, math_mark);
+                flow.maths.push((start..flow.text.len(), base + at.start..base + at.end, math.value.clone()));
+            }
+            // Images: not drawn by this editor yet.
             _ => return None,
         }
     }
     Some(())
+}
+
+/// An inline HTML tag: whether it closes, its name, and its attributes.
+fn inline_tag(html: &str) -> Option<(bool, String, String)> {
+    let tag = html.trim().strip_prefix('<')?.strip_suffix('>')?;
+    let (closing, tag) = match tag.strip_prefix('/') {
+        Some(rest) => (true, rest),
+        None => (false, tag),
+    };
+    let name: String = tag.chars().take_while(|c| c.is_ascii_alphanumeric()).collect::<String>().to_ascii_lowercase();
+    if name.is_empty() {
+        return None;
+    }
+    Some((closing, name.clone(), tag[name.len()..].trim_end_matches('/').to_string()))
+}
+
+/// The marks a formatting tag gives, as the reader draws them.
+fn html_mark(name: &str, attrs: &str) -> Option<TextMark> {
+    let mut mark = TextMark::default();
+    match name {
+        "strong" | "b" => mark.bold = true,
+        "em" | "i" => mark.italic = true,
+        "u" => mark.underline = true,
+        "s" | "del" | "strike" => mark.strikethrough = true,
+        "mark" => mark.highlight = Some(mark_color(attrs)),
+        _ => return None,
+    }
+    Some(mark)
+}
+
+/// A `<mark>`'s colour: `color`, else `style`'s `background-color`, else
+/// the reader's yellow.
+fn mark_color(attrs: &str) -> gpui_kit::Hsla {
+    let attr = |name: &str| {
+        let at = attrs.find(&format!("{name}="))? + name.len() + 1;
+        let rest = &attrs[at..];
+        let quote = rest.chars().next().filter(|c| *c == '"' || *c == '\'')?;
+        let end = rest[1..].find(quote)? + 1;
+        Some(rest[1..end].to_string())
+    };
+    let parse = |value: &str| -> Option<gpui_kit::Hsla> {
+        let value = value.trim();
+        if value.starts_with('#') {
+            return gpui_kit::Rgba::try_from(value).ok().map(Into::into);
+        }
+        match value.to_ascii_lowercase().as_str() {
+            "black" => Some(gpui_kit::rgb(0x000000).into()),
+            "white" => Some(gpui_kit::rgb(0xffffff).into()),
+            "blue" => Some(gpui_kit::rgb(0x3b82f6).into()),
+            "yellow" => Some(gpui_kit::rgb(0xfacc15).into()),
+            _ => None,
+        }
+    };
+    attr("color")
+        .and_then(|c| parse(&c))
+        .or_else(|| {
+            let style = attr("style")?;
+            style.split(';').find_map(|d| {
+                let (key, value) = d.split_once(':')?;
+                key.trim().eq_ignore_ascii_case("background-color").then(|| parse(value)).flatten()
+            })
+        })
+        .unwrap_or_else(|| gpui_kit::rgb(0xfef08a).into())
+}
+
+/// The sibling closing `name`'s tag opened at `open`.
+fn matching_close(nodes: &[Node], open: usize, name: &str) -> Option<usize> {
+    let mut depth = 0usize;
+    for (i, node) in nodes.iter().enumerate().skip(open + 1) {
+        let Node::Html(html) = node else { continue };
+        match inline_tag(&html.value) {
+            Some((false, tag, _)) if tag == name => depth += 1,
+            Some((true, tag, _)) if tag == name => {
+                if depth == 0 {
+                    return Some(i);
+                }
+                depth -= 1;
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// The character an entity (`&amp;`, `&#169;`) stands for.
+fn decode_entity(entity: &str) -> Option<char> {
+    let name = entity.strip_prefix('&')?.strip_suffix(';')?;
+    if let Some(number) = name.strip_prefix('#') {
+        let code = match number.strip_prefix(['x', 'X']) {
+            Some(hex) => u32::from_str_radix(hex, 16).ok()?,
+            None => number.parse().ok()?,
+        };
+        return char::from_u32(code);
+    }
+    Some(match name {
+        "amp" => '&',
+        "lt" => '<',
+        "gt" => '>',
+        "quot" => '"',
+        "apos" => '\'',
+        "nbsp" => '\u{a0}',
+        "copy" => '©',
+        "reg" => '®',
+        "trade" => '™',
+        "hellip" => '…',
+        "mdash" => '—',
+        "ndash" => '–',
+        "rarr" => '→',
+        "larr" => '←',
+        "uarr" => '↑',
+        "darr" => '↓',
+        "times" => '×',
+        "deg" => '°',
+        "middot" => '·',
+        "bull" => '•',
+        _ => return None,
+    })
 }
 
 /// Text whose characters come from `at` of the block: the same characters,
@@ -188,10 +528,21 @@ fn push_text(block: &str, base: usize, at: Range<usize>, value: &str, mark: &Tex
         if s == '\\' && c != '\\' {
             (i, s) = source.next()?;
         }
-        if s != c {
-            return None; // An entity (`&amp;`) or other rewriting: not drawn yet.
+        let mut len = s.len_utf8();
+        // An entity (`&amp;`): one drawn character for all of it.
+        let entity = (s == '&')
+            .then(|| raw[i..].find(';').filter(|n| *n <= 10))
+            .flatten()
+            .filter(|semi| decode_entity(&raw[i..=i + semi]) == Some(c));
+        if let Some(semi) = entity {
+            while source.peek().is_some_and(|(j, _)| *j <= i + semi) {
+                source.next();
+            }
+            len = semi + 1;
+        } else if s != c {
+            return None;
         }
-        let char_source = base + at.start + i..base + at.start + i + s.len_utf8();
+        let char_source = base + at.start + i..base + at.start + i + len;
         // A wiki link shows only its label: its brackets and target are hidden.
         let wiki = wikis.iter().position(|w| w.full.contains(&vi));
         if let Some(w) = wiki {
@@ -357,6 +708,25 @@ impl Flow {
         place
     }
 
+    /// The next place the caret can stop after (or before) drawn position
+    /// `at`: a letter on, or past a whole unit such as inline math.
+    pub fn step(&self, at: usize, forward: bool) -> usize {
+        if forward {
+            self.chars.iter().find(|c| c.shown.end > at).map_or(self.text.len(), |c| c.shown.end)
+        } else {
+            self.chars.iter().rev().find(|c| c.shown.start < at).map_or(0, |c| c.shown.start)
+        }
+    }
+
+    /// The inline math at (or just before) drawn position `at`: its Markdown
+    /// and TeX.
+    pub fn math_at(&self, at: usize) -> Option<(Range<usize>, String)> {
+        self.maths
+            .iter()
+            .find(|(shown, ..)| shown.start <= at && at <= shown.end)
+            .map(|(_, source, tex)| (source.clone(), tex.clone()))
+    }
+
     /// The drawn position of the note's offset `at`.
     pub fn shown_for(&self, at: usize) -> usize {
         self.chars
@@ -455,6 +825,78 @@ impl Flow {
         vec![(span.end..span.end, mark.clone()), (span.start..span.start, mark)]
     }
 
+    /// The inline HTML tag `tag` (`u`, `mark`…) drawn text `shown` is
+    /// wholly inside: its opening and closing tags.
+    pub fn tag_over(&self, shown: Range<usize>, tag: &str) -> Option<(Range<usize>, Range<usize>)> {
+        let w = self
+            .wrappers
+            .iter()
+            .filter(|w| w.kind == Wrap::Html && !w.shown.is_empty() && w.shown.start <= shown.start && shown.end <= w.shown.end)
+            .filter(|w| inline_tag(&w.open).is_some_and(|(_, name, _)| name == tag))
+            .min_by_key(|w| w.source.len())?;
+        Some((w.source.start..w.source.start + w.open.len(), w.source.end - w.close.len()..w.source.end))
+    }
+
+    /// The delimiters to remove (last first) to clear the formatting of
+    /// drawn text `shown`: every mark (bold, code, highlight, HTML…) around
+    /// it or inside it. Links stay.
+    pub fn clear_edits(&self, shown: Range<usize>) -> Vec<Range<usize>> {
+        let mut gone: Vec<Range<usize>> = self
+            .wrappers
+            .iter()
+            .filter(|w| !matches!(w.kind, Wrap::Link | Wrap::Wiki) && !w.shown.is_empty())
+            .filter(|w| {
+                (w.shown.start <= shown.start && shown.end <= w.shown.end)
+                    || (shown.start <= w.shown.start && w.shown.end <= shown.end && !shown.is_empty())
+            })
+            .flat_map(|w| [w.source.start..w.source.start + w.open.len(), w.source.end - w.close.len()..w.source.end])
+            .filter(|r| !r.is_empty())
+            .collect();
+        gone.sort_by_key(|r| std::cmp::Reverse(r.start));
+        gone.dedup();
+        gone
+    }
+
+    /// The kinds of marked runs drawn text `shown` is wholly inside.
+    pub fn wraps_over(&self, shown: Range<usize>) -> Vec<Wrap> {
+        self.wrappers
+            .iter()
+            .filter(|w| !w.shown.is_empty() && w.shown.start <= shown.start && shown.end <= w.shown.end)
+            .map(|w| w.kind)
+            .collect()
+    }
+
+    /// The edit that changes the case of drawn text `shown` with `case`
+    /// (each letter in turn, given the letter before it), letter by letter
+    /// in the Markdown so its marks stay as written. `None`: nothing changes.
+    pub fn recase(
+        &self,
+        source: &str,
+        shown: Range<usize>,
+        mut case: impl FnMut(char, Option<char>) -> String,
+    ) -> Option<(Range<usize>, String)> {
+        let chars: Vec<&Char> = self.chars.iter().filter(|c| shown.start <= c.shown.start && c.shown.end <= shown.end).collect();
+        let (first, last) = (chars.first()?, chars.last()?);
+        let range = first.source.start..last.source.end;
+        let mut out = String::new();
+        let mut at = range.start;
+        let mut before = self.text[..first.shown.start].chars().next_back();
+        for c in &chars {
+            let drawn = &self.text[c.shown.clone()];
+            out.push_str(&source[at..c.source.start]);
+            let written = &source[c.source.clone()];
+            let mut letters = drawn.chars();
+            match (letters.next(), letters.next()) {
+                // A letter written as itself: its new case.
+                (Some(letter), None) if written.chars().eq(std::iter::once(letter)) => out.push_str(&case(letter, before)),
+                _ => out.push_str(written),
+            }
+            before = drawn.chars().next_back();
+            at = c.source.end;
+        }
+        (out != source[range.clone()]).then_some((range, out))
+    }
+
     /// The link whose letter is at drawn position `at` (under the pointer).
     pub fn link_under(&self, at: usize) -> Option<LinkAt> {
         let inside = self.wrappers.iter().any(|w| matches!(w.kind, Wrap::Link | Wrap::Wiki) && w.shown.start <= at && at < w.shown.end);
@@ -475,6 +917,25 @@ impl Flow {
             .and_then(|(_, m)| m.link.as_ref())
             .map(|l| l.url.to_string())?;
         Some(LinkAt { source: w.source.clone(), text: self.text[w.shown.clone()].to_string(), url, wiki: w.kind == Wrap::Wiki })
+    }
+
+    /// The highlight (`<mark>`) at drawn position `at` (`within`: strictly
+    /// on a letter of it, as under the pointer): the whole run, its opening
+    /// and closing tags, and its colour.
+    pub fn mark_at(&self, at: usize, within: bool) -> Option<MarkAt> {
+        let w = self
+            .wrappers
+            .iter()
+            .filter(|w| w.kind == Wrap::Html && w.open.to_ascii_lowercase().starts_with("<mark") && !w.shown.is_empty())
+            .filter(|w| if within { w.shown.start <= at && at < w.shown.end } else { w.shown.start <= at && at <= w.shown.end })
+            .min_by_key(|w| w.source.len())?;
+        let (_, _, attrs) = inline_tag(&w.open)?;
+        Some(MarkAt {
+            source: w.source.clone(),
+            open: w.source.start..w.source.start + w.open.len(),
+            close: w.source.end - w.close.len()..w.source.end,
+            color: mark_color(&attrs),
+        })
     }
 
     /// Where the word before `at` starts (spaces before it skipped).
@@ -633,6 +1094,59 @@ mod tests {
         let at = f.text.find("docs").unwrap();
         let link = f.link_at(at).unwrap();
         assert_eq!((link.text.as_str(), link.url.as_str(), &linked[link.source]), ("the docs", "https://a.io", "[the docs](https://a.io)"));
+    }
+
+    #[test]
+    fn inline_html_entities_and_references() {
+        let source = "A <mark color=\"blue\">marked **bold**</mark>, <u>under</u><br>and &amp; &rarr; done";
+        let f = of(source);
+        assert_eq!(f.text, "A marked bold, under\nand & → done");
+        // Typing inside the mark goes inside it.
+        let at = f.text.find("marked").unwrap() + 3;
+        assert_eq!(&source[..f.source_for(at)], "A <mark color=\"blue\">mar");
+        // The entity is one letter: deleting it takes the whole `&amp;`.
+        let amp = f.text.find('&').unwrap();
+        assert_eq!(&source[f.delete_before(amp + 1).unwrap()], "&amp;");
+        // A reference link, its address from the note's definition.
+        let page = super::super::page::Page::read("See [the spec][gfm] now\n\n[gfm]: https://github.github.com/gfm/\n");
+        let linked = &page.leaves[0].flow;
+        assert_eq!(linked.text, "See the spec now");
+        assert_eq!(linked.link_at(5).unwrap().url, "https://github.github.com/gfm/");
+    }
+
+    #[test]
+    fn footnotes_and_math_are_whole_units() {
+        let source = "A note.[^b] Then $E = mc^2$ and \\(not\\).\n\n[^b]: The **text**.\n";
+        let page = super::super::page::Page::read(source);
+        let f = &page.leaves[0].flow;
+        assert_eq!(f.text, "A note.¹ Then E = mc² and (not).");
+        // The caret steps over each whole, and Backspace takes it whole.
+        let mark = f.text.find('¹').unwrap();
+        assert_eq!(f.step(mark, true), mark + '¹'.len_utf8());
+        assert_eq!(&source[f.delete_before(mark + '¹'.len_utf8()).unwrap()], "[^b]");
+        let math = f.text.find('E').unwrap();
+        let end = f.step(math, true);
+        assert_eq!(&f.text[math..end], "E = mc²");
+        assert_eq!(f.step(end, false), math);
+        assert_eq!(&source[f.delete_before(end).unwrap()], "$E = mc^2$");
+        let (at, tex) = f.math_at(math + 1).unwrap();
+        assert_eq!((&source[at], tex.as_str()), ("$E = mc^2$", "E = mc^2"));
+        // The footnote's own text is a line, numbered.
+        assert_eq!(page.leaves[1].flow.text, "The text.");
+        assert!(matches!(&page.blocks[1].1, super::super::page::Shape::Note { number, .. } if number == "1"));
+        assert_eq!(tex_text("\\frac{a}{b} \\le \\alpha_1^{n}"), "a⁄b ≤ α₁ⁿ");
+    }
+
+    #[test]
+    fn case_changes_keep_marks_as_written() {
+        let source = "hello **big** w&amp;rld";
+        let f = of(source);
+        let title = |c: char, before: Option<char>| -> String {
+            if before.is_none_or(|b| !b.is_alphanumeric()) { c.to_uppercase().collect() } else { c.to_lowercase().collect() }
+        };
+        let (range, text) = f.recase(source, 0..f.text.len(), title).unwrap();
+        assert_eq!(format!("{}{}{}", &source[..range.start], text, &source[range.end..]), "Hello **Big** W&amp;Rld");
+        assert!(f.recase(source, 0..5, |c, _| c.to_string()).is_none());
     }
 
     #[test]

@@ -654,6 +654,12 @@ impl MarkdownPlugin for InlineImages {
     }
 }
 
+/// The block Live Preview has picked (by a click, to delete it): the
+/// editor and its range in the note. A picture in it draws a ring.
+#[derive(Default)]
+pub struct PickedBlock(pub Option<(EntityId, Range<usize>)>);
+impl Global for PickedBlock {}
+
 #[derive(Default)]
 struct ResizeState {
     preview: Option<(EntityId, Range<usize>, f32)>,
@@ -743,6 +749,13 @@ fn render_picture(
         // fills it without contributing an intrinsic-height layout box.
         .child(img(source).absolute().inset_0().size_full())
         .child(geometry(inner.clone()));
+    let picked = cx.try_global::<PickedBlock>().and_then(|p| p.0.clone()).is_some_and(|(id, block)| {
+        id == editor_id && range.as_ref().is_some_and(|r| block.start <= r.start && r.end <= block.end)
+    });
+    if picked {
+        let ring = cx.theme().ring;
+        image = image.child(div().absolute().inset_0().rounded_sm().border_2().border_color(ring));
+    }
     for left in [true, false].into_iter().filter(|_| !locked) {
         let owner = owner.clone();
         let range = range.clone();
@@ -1282,7 +1295,18 @@ pub struct HighlightForm {
     picker: Entity<ColorPickerState>,
     _subscription: Subscription,
 }
-fn highlight_hex(color: Hsla) -> String {
+/// The highlight colours offered, by name.
+pub const HIGHLIGHTS: [(&str, u32); 7] = [
+    ("Lemon", 0xfef08a),
+    ("Apricot", 0xfed7aa),
+    ("Rose", 0xfecaca),
+    ("Pink", 0xfbcfe8),
+    ("Lavender", 0xddd6fe),
+    ("Sky", 0xbfdbfe),
+    ("Mint", 0xbbf7d0),
+];
+
+pub fn highlight_hex(color: Hsla) -> String {
     let color = Rgba::from(color);
     let channel = |v: f32| (v.clamp(0., 1.) * 255.).round() as u8;
     if color.a < 1. {
@@ -1742,15 +1766,7 @@ impl Enso {
                     .read(cx)
                     .value()
                     .unwrap_or_else(|| rgb(0xfef08a).into());
-                let presets = [
-                    ("Lemon", 0xfef08a),
-                    ("Apricot", 0xfed7aa),
-                    ("Rose", 0xfecaca),
-                    ("Pink", 0xfbcfe8),
-                    ("Lavender", 0xddd6fe),
-                    ("Sky", 0xbfdbfe),
-                    ("Mint", 0xbbf7d0),
-                ];
+                let presets = HIGHLIGHTS;
                 let name = presets
                     .iter()
                     .find(|(_, value)| highlight_hex(rgb(*value).into()) == highlight_hex(color))
