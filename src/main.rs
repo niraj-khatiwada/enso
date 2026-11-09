@@ -6254,6 +6254,14 @@ mod transition_tests {
         let labels = menu(cx);
         assert!(labels.contains(&"Sky".to_string()) && !labels.contains(&"Mint".to_string()), "{labels:?}");
         assert!(labels.contains(&"Custom Color…".to_string()));
+        // Color opens beside the menu; Escape goes back to the menu.
+        cx.update_window(handle, |_, window, cx| live.update(cx, |live, cx| live.open_sub_for_test("Color", window, cx))).unwrap();
+        draw(cx, handle);
+        assert_eq!(cx.update(|cx| live.read(cx).sub_for_test()), Some("Color"));
+        cx.simulate_keystrokes(handle, "escape");
+        draw(cx, handle);
+        assert_eq!(cx.update(|cx| live.read(cx).sub_for_test()), None);
+        assert!(cx.update(|cx| live.read(cx).actions_for_test()).is_some());
         choose(cx, "Sky");
         assert!(text(cx).contains("<mark color=\"#bfdbfe\">marked</mark>"), "{}", text(cx));
         menu(cx);
@@ -6281,6 +6289,67 @@ mod transition_tests {
         draw(cx, handle);
         assert!(cx.update(|cx| live.read(cx).actions_for_test()).is_none());
         assert!(cx.update(|cx| live.read(cx).caret_for_test()).is_some(), "{:?}", cx.update(|cx| live.read(cx).caret_for_test()));
+    }
+
+    #[gpui_kit::test]
+    fn live_preview_edits_nested_blocks(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            bind_view_keys(cx);
+            crate::live::init(cx);
+            crate::settings::init(cx);
+            gpui_kit::BorrowAppContext::update_global::<crate::settings::Preferences, _>(cx, |p, _| p.live_preview = true);
+        });
+        let source = "> Intro\n>\n> - one\n\n- Item:\n\n  ```sh\n  cargo run\n  ```\n\n- Quoting:\n\n  > said\n";
+        let (handle, view) = cx.update(|cx| gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+            cx.new(|cx| {
+                let mut app = Enso::new(window, cx);
+                app.add_document(Some(PathBuf::from("nested.md")), source.into(), None, window, cx);
+                app
+            })
+        }).unwrap());
+        for _ in 0..3 { draw(cx, handle); cx.run_until_parked(); }
+        let (live, editor) = cx.update(|cx| {
+            let doc = &view.read(cx).documents[0];
+            (doc.live.clone().unwrap(), doc.editor.clone())
+        });
+        let text = |cx: &mut TestAppContext| cx.update(|cx| editor.read(cx).value().to_string());
+        let caret_at = |cx: &mut TestAppContext, needle: &str, offset: usize| {
+            cx.update_window(handle, |_, window, cx| {
+                let focus = live.read(cx).focus.clone();
+                window.focus(&focus, cx);
+                let at = editor.read(cx).value().find(needle).unwrap() + offset;
+                live.update(cx, |live, _| live.set_caret_for_test(at));
+            }).unwrap();
+            draw(cx, handle);
+        };
+        // A list in a quote: Enter makes the next item, still quoted.
+        caret_at(cx, "one", 3);
+        cx.simulate_keystrokes(handle, "enter");
+        cx.simulate_input(handle, "two");
+        draw(cx, handle);
+        assert!(text(cx).starts_with("> Intro\n>\n> - one\n> - two\n"), "{}", text(cx));
+        // Code in an item: a new line keeps the item's indent; Backspace at
+        // its start joins it back, indent and all.
+        caret_at(cx, "cargo run", 9);
+        cx.simulate_keystrokes(handle, "enter");
+        cx.simulate_input(handle, "x");
+        draw(cx, handle);
+        assert!(text(cx).contains("  ```sh\n  cargo run\n  x\n  ```"), "{}", text(cx));
+        cx.simulate_keystrokes(handle, "left backspace");
+        draw(cx, handle);
+        assert!(text(cx).contains("  ```sh\n  cargo runx\n  ```"), "{}", text(cx));
+        // A quote in an item: Enter, a new paragraph in it; Backspace at a
+        // paragraph's start leaves the quote but stays in the item.
+        caret_at(cx, "said", 4);
+        cx.simulate_keystrokes(handle, "enter");
+        cx.simulate_input(handle, "more");
+        draw(cx, handle);
+        assert!(text(cx).ends_with("  > said\n  >\n  > more\n"), "{}", text(cx));
+        cx.simulate_keystrokes(handle, if cfg!(target_os = "macos") { "cmd-left" } else { "home" });
+        cx.simulate_keystrokes(handle, "backspace");
+        draw(cx, handle);
+        assert!(text(cx).ends_with("  > said\n  >\n  more\n"), "{}", text(cx));
     }
 
     #[gpui_kit::test]

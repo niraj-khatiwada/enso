@@ -155,6 +155,10 @@ struct ActionMenu {
     actions: Vec<actions::Action>,
     scope: actions::Scope,
     at: Point<Pixels>,
+    /// The submenu open beside it (Convert To, Color, Case) and its search.
+    sub: Option<(&'static str, Entity<CommandState>)>,
+    /// Searching switches the list between submenus and every action.
+    _query: Subscription,
 }
 
 /// The math card (⌘K on inline math): its Markdown, its TeX being edited,
@@ -503,6 +507,17 @@ impl LiveView {
         self.press_button(act, window, cx);
     }
 
+    /// The ⌘/ menu's open submenu.
+    #[cfg(all(test, feature = "ui-tests"))]
+    pub(crate) fn sub_for_test(&self) -> Option<&'static str> {
+        self.action_menu.as_ref().and_then(|m| m.sub.as_ref().map(|(name, _)| *name))
+    }
+
+    #[cfg(all(test, feature = "ui-tests"))]
+    pub(crate) fn open_sub_for_test(&mut self, name: &'static str, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_sub(name, window, cx);
+    }
+
     /// Choose the ⌘/ menu's action labelled `label`.
     #[cfg(all(test, feature = "ui-tests"))]
     pub(crate) fn choose_for_test(&mut self, label: &str, window: &mut Window, cx: &mut Context<Self>) {
@@ -750,7 +765,8 @@ impl LiveView {
         self.link_card = None;
         self.mark_card = None;
         self.table_card = None;
-        self.action_menu = Some(ActionMenu { state, buttons, actions, scope, at });
+        let query = cx.observe(&state, |_, _, cx| cx.notify());
+        self.action_menu = Some(ActionMenu { state, buttons, actions, scope, at, sub: None, _query: query });
         cx.notify();
     }
 
@@ -764,6 +780,39 @@ impl LiveView {
             cx.notify();
         }
     }
+
+    /// Open submenu `name` beside the menu, its search focused.
+    fn open_sub(&mut self, name: &'static str, window: &mut Window, cx: &mut Context<Self>) {
+        self.show_sub(name, true, window, cx);
+    }
+
+    /// Show submenu `name` beside the menu; `focus`: its search takes the
+    /// keys (chosen with the keyboard), else the menu keeps them (hovered).
+    fn show_sub(&mut self, name: &'static str, focus: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(menu) = self.action_menu.as_mut() else { return };
+        let state = match &menu.sub {
+            Some((open, state)) if *open == name => state.clone(),
+            _ => {
+                let state = cx.new(|cx| CommandState::new(window, cx));
+                menu.sub = Some((name, state.clone()));
+                cx.notify();
+                state
+            }
+        };
+        if focus {
+            state.update(cx, |state, cx| state.focus(window, cx));
+        }
+    }
+
+    /// Back from the submenu to the menu.
+    fn close_sub(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(menu) = self.action_menu.as_mut() else { return };
+        if menu.sub.take().is_some() {
+            menu.state.update(cx, |state, cx| state.focus(window, cx));
+            cx.notify();
+        }
+    }
+
 
     /// Run one of the menu's formatting buttons.
     fn press_button(&mut self, act: actions::Act, window: &mut Window, cx: &mut Context<Self>) {
@@ -1259,7 +1308,7 @@ impl LiveView {
                     // Whole lines, so nothing of it (a trailing space) is left.
                     with_break(line(block.start).start..line(block.end.max(self.page.leaves[i].span.end)).end)
                 }
-                Kind::Quote => with_break(line(self.page.leaves[i].span.start)),
+                Kind::Quote { .. } => with_break(line(self.page.leaves[i].span.start)),
                 // A cell isn't removed: the table keeps its shape.
                 Kind::Cell { .. } => return None,
             },
@@ -1301,12 +1350,13 @@ impl LiveView {
         match &leaf.kind {
             // Code keeps its first line; a cell keeps its place in the table.
             Kind::Code { .. } | Kind::Cell { .. } => return,
-            Kind::Quote => {
-                let line_start = self.source[..start].rfind('\n').map_or(0, |n| n + 1);
-                if line_start < start {
-                    self.edit(line_start..start, "", window, cx);
-                    self.caret = Some(line_start);
-                }
+            // Out of the (innermost) quote: its `> ` goes. A list item's
+            // later paragraph joins the one above, as text does.
+            Kind::Quote { lead } if lead.contains('>') => {
+                let line_start = start - lead.len();
+                let mark = line_start + lead.rfind('>').unwrap_or(0);
+                self.edit(mark..start, "", window, cx);
+                self.caret = Some(mark);
                 return;
             }
             Kind::Text { block } if leaf.flow.heading.is_some() => {
@@ -1409,13 +1459,17 @@ impl LiveView {
         match spot {
             // In code, Enter is a new line of code.
             Spot::Leaf(i) if matches!(self.page.leaves[i].kind, Kind::Code { .. }) => {
-                self.edit(caret..caret, "\n", window, cx);
+                let Kind::Code { lead, .. } = &self.page.leaves[i].kind else { return };
+                let lead = lead.clone();
+                self.edit(caret..caret, &format!("\n{lead}"), window, cx);
                 return;
             }
-            // In a quote, a new paragraph in the quote.
-            Spot::Leaf(i) if matches!(self.page.leaves[i].kind, Kind::Quote) => {
+            // In a quote (or more of a list item), a new paragraph in it.
+            Spot::Leaf(i) if matches!(self.page.leaves[i].kind, Kind::Quote { .. }) => {
+                let Kind::Quote { lead } = &self.page.leaves[i].kind else { return };
+                let between = format!("\n{}\n{lead}", lead.trim_end());
                 let (at, text) = flow.split_at(flow.shown_for(caret));
-                let text = text.replacen("\n\n", "\n>\n> ", 1);
+                let text = text.replacen("\n\n", &between, 1);
                 self.edit(at..at, &text, window, cx);
                 return;
             }
@@ -1768,10 +1822,12 @@ impl LiveView {
                     self.edit_keeping_caret(prefix, "> ", window, cx);
                 }
             }
-            Kind::Quote => {
-                let line_start = self.source[..start].rfind('\n').map_or(0, |n| n + 1);
-                self.edit_keeping_caret(line_start..start, "", window, cx);
+            Kind::Quote { lead } if lead.contains('>') => {
+                let mark = start - lead.len() + lead.rfind('>').unwrap_or(0);
+                self.edit_keeping_caret(mark..start, "", window, cx);
             }
+            // More of a list item: quoted where it stands.
+            Kind::Quote { .. } => self.edit_keeping_caret(start..start, "> ", window, cx),
             _ => {}
         }
     }
@@ -2198,6 +2254,10 @@ impl LiveView {
             self.close_link_card(window, cx);
             return;
         }
+        if self.action_menu.as_ref().is_some_and(|m| m.sub.is_some()) {
+            self.close_sub(window, cx);
+            return;
+        }
         if self.action_menu.is_some() {
             self.close_actions(window, cx);
             return;
@@ -2351,33 +2411,91 @@ impl Render for LiveView {
                     .child(line(leaf, first, last, window, cx))
                     .into_any_element(),
                 Shape::List(items) => {
-                    let mut list = v_flex().w_full().gap_1().py_1();
+                    // One text line tall, the marker centred in it, so it sits
+                    // beside the item's first line at any size.
+                    let line_height = px(reading.size as f32 * 1.618);
+                    let slot = || div().h(line_height).min_w(px(18.)).flex_shrink_0().flex().items_center().text_color(muted);
+                    // Where an item's text starts, past its marker.
+                    let text_at = |depth: usize| LIST_INDENT * depth as f32 + 26.;
+                    let style = render_context.style();
+                    let (bar, quoted_text) = (style.border(), style.muted_foreground());
+                    let mut drawn: Vec<(Option<(usize, bool)>, AnyElement)> = Vec::new();
                     for row in items {
-                        // One text line tall, the marker centred in it, so it
-                        // sits beside the item's first line at any size.
-                        let line_height = px(reading.size as f32 * 1.618);
-                        let slot = || div().h(line_height).min_w(px(18.)).flex_shrink_0().flex().items_center().text_color(muted);
-                        let marker = match row.marker {
-                            Marker::Bullet => slot().child("•").into_any_element(),
-                            Marker::Number(n) => slot().child(format!("{n}.")).into_any_element(),
-                            Marker::Task(done) => {
+                        let leaf = row.leaf;
+                        let content = match &self.page.leaves[leaf].kind {
+                            Kind::Code { lang, .. } => {
+                                let code = CodeBlock::from_code(self.page.leaves[leaf].flow.text.clone(), lang.clone()).with_leaf_key(leaf_key(leaf));
+                                let node = BlockNode::CodeBlock(code);
+                                let position = FlowPosition::at(&[&node], 0, true).first(true);
+                                let element = node.render_with_id(("live-nested-code", leaf), position, &render_context, window, cx);
                                 let weak = weak.clone();
-                                let leaf = row.leaf;
-                                slot()
-                                    .child(Checkbox::new(("live-task", leaf)).checked(done).on_click(move |_, window, cx| {
-                                        let _ = weak.update(cx, |view, cx| view.toggle_task(leaf, window, cx));
-                                    }))
+                                div()
+                                    .id(("live-nested-code-row", leaf))
+                                    .flex_1()
+                                    .min_w_0()
+                                    .cursor_text()
+                                    .on_mouse_down(MouseButton::Left, move |event, window, cx| {
+                                        let _ = weak.update(cx, |view, cx| view.mouse_down(leaf, event, window, cx));
+                                    })
+                                    .child(element)
+                                    .into_any_element()
+                            }
+                            _ => line(leaf, true, true, window, cx),
+                        };
+                        // Rows in a quote sit inside its bar: from there on.
+                        let from = row.quote.map_or(0., |(depth, in_item)| if in_item { text_at(depth) } else { LIST_INDENT * depth as f32 });
+                        let element = match row.marker {
+                            Marker::Continue => div().w_full().flex().pl(px((text_at(row.depth) - from).max(0.))).child(content).into_any_element(),
+                            Marker::Nothing => div().w_full().flex().child(content).into_any_element(),
+                            marker => {
+                                let marker = match marker {
+                                    Marker::Number(n) => slot().child(format!("{n}.")).into_any_element(),
+                                    Marker::Task(done) => {
+                                        let weak = weak.clone();
+                                        slot()
+                                            .child(Checkbox::new(("live-task", leaf)).checked(done).on_click(move |_, window, cx| {
+                                                let _ = weak.update(cx, |view, cx| view.toggle_task(leaf, window, cx));
+                                            }))
+                                            .into_any_element()
+                                    }
+                                    _ => slot().child("•").into_any_element(),
+                                };
+                                h_flex()
+                                    .w_full()
+                                    .items_start()
+                                    .gap_2()
+                                    .pl(px((LIST_INDENT * row.depth as f32 - from).max(0.)))
+                                    .child(marker)
+                                    .child(content)
                                     .into_any_element()
                             }
                         };
+                        drawn.push((row.quote, element));
+                    }
+                    // Quoted rows in a run share one bar down their side.
+                    let mut list = v_flex().w_full().gap_1().py_1();
+                    let mut drawn = drawn.into_iter().peekable();
+                    while let Some((quote, element)) = drawn.next() {
+                        let Some((depth, in_item)) = quote else {
+                            list = list.child(element);
+                            continue;
+                        };
+                        let mut run = vec![element];
+                        while drawn.peek().is_some_and(|(q, _)| *q == quote) {
+                            run.push(drawn.next().map(|(_, e)| e).unwrap_or_else(|| div().into_any_element()));
+                        }
+                        let at = if in_item { text_at(depth) } else { LIST_INDENT * depth as f32 };
                         list = list.child(
-                            h_flex()
-                                .w_full()
-                                .items_start()
-                                .gap_2()
-                                .pl(px(LIST_INDENT * row.depth as f32))
-                                .child(marker)
-                                .child(line(row.leaf, true, true, window, cx)),
+                            div().w_full().pl(px(at)).child(
+                                v_flex()
+                                    .w_full()
+                                    .gap_1()
+                                    .border_l_2()
+                                    .border_color(bar)
+                                    .pl(px(reading.size as f32 * 0.9))
+                                    .text_color(quoted_text)
+                                    .children(run),
+                            ),
                         );
                     }
                     list.into_any_element()
@@ -2552,7 +2670,7 @@ impl Render for LiveView {
                 Shape::Code(leaf) => {
                     let kind = &self.page.leaves[leaf].kind;
                     let lang = match kind {
-                        Kind::Code { lang } => lang.clone(),
+                        Kind::Code { lang, .. } => lang.clone(),
                         _ => None,
                     };
                     let code = CodeBlock::from_code(self.page.leaves[leaf].flow.text.clone(), lang).with_leaf_key(leaf_key(leaf));
@@ -2848,8 +2966,43 @@ impl Render for LiveView {
                 .rounded(crate::ui::MODAL_RADIUS - px(1.))
                 .bordered(false)
                 .bg(gpui_kit::transparent_black());
-            // Groups in the order the actions came, each action's place kept
-            // so a choice finds it again.
+            // What each row stands for, so a choice finds it again.
+            #[derive(Clone, Copy)]
+            enum Row {
+                Act(usize),
+                Sub(&'static str),
+            }
+            // A row of the menu (`main`: hovering it puts a submenu away) or
+            // of a submenu.
+            let hover_weak = cx.entity().downgrade();
+            let item = |action: &actions::Action, group: &'static str, main: bool, n: usize| {
+                let label = action.label.clone();
+                let swatch = action.swatch;
+                let border = theme.border;
+                let weak = hover_weak.clone();
+                CommandItem::new()
+                    .label(label.clone())
+                    .keywords(action.keywords.iter().copied().chain(std::iter::once(group)))
+                    .child(move |_, _| {
+                        let weak = weak.clone();
+                        h_flex()
+                            .id(("live-action-row", n))
+                            .w_full()
+                            .gap_2()
+                            .items_center()
+                            .when(main, |row| {
+                                row.on_hover(move |hovered, window, cx| {
+                                    if *hovered {
+                                        let _ = weak.update(cx, |this, cx| this.close_sub(window, cx));
+                                    }
+                                })
+                            })
+                            .when_some(swatch, |row, swatch| {
+                                row.child(div().size(px(14.)).rounded(px(4.)).bg(swatch).border_1().border_color(border))
+                            })
+                            .child(label.clone())
+                    })
+            };
             let mut groups: Vec<(&'static str, Vec<usize>)> = Vec::new();
             for (i, action) in menu.actions.iter().enumerate() {
                 match groups.iter_mut().find(|(g, _)| *g == action.group) {
@@ -2857,35 +3010,68 @@ impl Render for LiveView {
                     None => groups.push((action.group, vec![i])),
                 }
             }
-            for (name, rows) in &groups {
-                let items = rows.iter().map(|&i| {
-                    let action = &menu.actions[i];
-                    let label = action.label.clone();
-                    let swatch = action.swatch;
-                    let border = theme.border;
-                    CommandItem::new()
-                        .label(label.clone())
-                        .keywords(action.keywords.iter().copied().chain(std::iter::once(*name)))
-                        .child(move |_, _| {
-                            h_flex()
-                                .w_full()
-                                .gap_2()
-                                .items_center()
-                                .when_some(swatch, |row, swatch| {
-                                    row.child(div().size(px(12.)).rounded(px(3.)).bg(swatch).border_1().border_color(border))
-                                })
-                                .child(label.clone())
-                        })
-                });
+            // Searching finds every action; otherwise Convert To, Color and
+            // Case are rows that open their own menu beside this one.
+            let searching = !menu.state.read(cx).query(cx).trim().is_empty();
+            let mut sections: Vec<(&'static str, Vec<Row>)> = Vec::new();
+            if searching {
+                sections = groups.iter().map(|(g, rows)| (*g, rows.iter().map(|i| Row::Act(*i)).collect())).collect();
+            } else {
+                let subs: Vec<Row> =
+                    groups.iter().filter(|(g, _)| actions::SUBMENUS.contains(g)).map(|(g, _)| Row::Sub(*g)).collect();
+                if !subs.is_empty() {
+                    sections.push(("Text", subs));
+                }
+                for (g, rows) in groups.iter().filter(|(g, _)| !actions::SUBMENUS.contains(g)) {
+                    sections.push((*g, rows.iter().map(|i| Row::Act(*i)).collect()));
+                }
+            }
+            let open_sub = menu.sub.as_ref().map(|(name, _)| *name);
+            for (name, rows) in &sections {
+                let items: Vec<CommandItem> = rows
+                    .iter()
+                    .map(|row| match *row {
+                        Row::Act(i) => item(&menu.actions[i], name, true, i),
+                        Row::Sub(sub) => {
+                            let muted = theme.muted_foreground;
+                            let lit = open_sub == Some(sub);
+                            let accent = theme.accent;
+                            let weak = hover_weak.clone();
+                            CommandItem::new().label(sub).child(move |_, _| {
+                                let weak = weak.clone();
+                                // Resting on it opens it (the menu keeps the keys).
+                                h_flex()
+                                    .id(SharedString::from(format!("live-sub-{sub}")))
+                                    .on_hover(move |hovered, window, cx| {
+                                        if *hovered {
+                                            let _ = weak.update(cx, |this, cx| this.show_sub(sub, false, window, cx));
+                                        }
+                                    })
+                                    .w_full()
+                                    .items_center()
+                                    .justify_between()
+                                    .when(lit, |row| row.bg(accent).rounded_sm())
+                                    .child(sub)
+                                    .child(Icon::new(IconName::ChevronRight).size_3p5().text_color(muted))
+                            })
+                        }
+                    })
+                    .collect();
                 command = command.group(CommandGroup::new().label(*name).items(items));
             }
-            let order: Vec<Vec<usize>> = groups.into_iter().map(|(_, rows)| rows).collect();
+            let order: Vec<Vec<Row>> = sections.into_iter().map(|(_, rows)| rows).collect();
             let weak = cx.entity().downgrade();
             let cancel = weak.clone();
             let command = command
                 .on_confirm(move |index, window, cx| {
-                    if let Some(&i) = order.get(index.section).and_then(|rows| rows.get(index.row)) {
-                        let _ = weak.update(cx, |this, cx| this.choose_action(i, window, cx));
+                    match order.get(index.section).and_then(|rows| rows.get(index.row)).copied() {
+                        Some(Row::Act(i)) => {
+                            let _ = weak.update(cx, |this, cx| this.choose_action(i, window, cx));
+                        }
+                        Some(Row::Sub(name)) => {
+                            let _ = weak.update(cx, |this, cx| this.open_sub(name, window, cx));
+                        }
+                        None => {}
                     }
                 })
                 // After this key's dispatch: Escape also reaches the page's
@@ -2897,15 +3083,53 @@ impl Render for LiveView {
                         let _ = cancel.update(cx, |this, cx| this.close_actions(window, cx));
                     });
                 });
+            // The open submenu: its group's actions.
+            let sub = menu.sub.as_ref().map(|(name, state)| {
+                let rows = groups.iter().find(|(g, _)| g == name).map(|(_, rows)| rows.clone()).unwrap_or_default();
+                let title = if *name == "Color" { "Background Color" } else { name };
+                let items: Vec<CommandItem> = rows.iter().map(|i| item(&menu.actions[*i], name, false, 1000 + *i)).collect();
+                let weak = cx.entity().downgrade();
+                let back = weak.clone();
+                let command = Command::new(state)
+                    .placeholder(SharedString::from(format!("{name}…")))
+                    .max_h(px(360.))
+                    .scroll_bounce(false)
+                    .rounded(crate::ui::MODAL_RADIUS - px(1.))
+                    .bordered(false)
+                    .bg(gpui_kit::transparent_black())
+                    .group(CommandGroup::new().label(title).items(items))
+                    .on_confirm(move |index, window, cx| {
+                        if let Some(&i) = rows.get(index.row) {
+                            let _ = weak.update(cx, |this, cx| this.choose_action(i, window, cx));
+                        }
+                    })
+                    .on_cancel(move |window, cx| {
+                        let back = back.clone();
+                        window.defer(cx, move |window, cx| {
+                            let _ = back.update(cx, |this, cx| this.close_sub(window, cx));
+                        });
+                    });
+                div()
+                    .id("live-actions-sub")
+                    .occlude()
+                    .w(px(240.))
+                    .modal_surface(&theme)
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .child(div().rounded(crate::ui::MODAL_RADIUS - px(1.)).overflow_hidden().child(command))
+            });
             deferred(
                 anchored().position(menu.at).snap_to_window_with_margin(px(8.)).child(
+                    h_flex()
+                        .items_start()
+                        .gap_1()
+                        .on_mouse_down_out(cx.listener(|this, _, window, cx| this.close_actions(window, cx)))
+                        .child(
                     div()
                         .id("live-actions")
                         .occlude()
                         .w(px(260.))
                         .modal_surface(&theme)
                         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                        .on_mouse_down_out(cx.listener(|this, _, window, cx| this.close_actions(window, cx)))
                         .when(!menu.buttons.is_empty(), |surface| {
                             let buttons = menu.buttons.iter().map(|b| {
                                 let act = b.act.clone();
@@ -2927,6 +3151,8 @@ impl Render for LiveView {
                             .child(div().h_px().mx_1p5().bg(theme.border))
                         })
                         .child(div().rounded(crate::ui::MODAL_RADIUS - px(1.)).overflow_hidden().child(command)),
+                        )
+                        .children(sub),
                 ),
             )
             .with_priority(2)

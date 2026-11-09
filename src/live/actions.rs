@@ -2,7 +2,7 @@
 //!
 //! The menu is built for where the caret is: in bold text it offers
 //! Remove Bold (and the other marks), in a highlight its colours, on a link
-//! Edit Link and Remove Link, in a list item Turn Into and Mark as Done, in
+//! Edit Link and Remove Link, in a list item Convert To and Mark as Done, in
 //! a table cell the table's rows and columns, on a picked image Delete. To
 //! give a new component its own actions, add a group to [`LiveView::actions`]
 //! and its [`Act`] to [`LiveView::run_action`].
@@ -13,6 +13,9 @@ use super::{LiveView, Spot, TableOp};
 use crate::rich;
 use gpui_kit::*;
 use std::ops::Range;
+
+/// Groups shown as a row that opens its own menu beside the first.
+pub const SUBMENUS: [&str; 3] = ["Convert To", "Color", "Case"];
 
 /// One thing the menu can do.
 #[derive(Clone, Debug, PartialEq)]
@@ -176,13 +179,13 @@ impl LiveView {
                     if current.as_deref() == Some(rich::highlight_hex(swatch).as_str()) {
                         continue;
                     }
-                    let mut a = action("Highlight", name, &["highlight", "mark", "color", "colour"], Act::Highlight(value));
+                    let mut a = action("Color", name, &["highlight", "mark", "color", "colour"], Act::Highlight(value));
                     a.swatch = Some(swatch);
                     out.push(a);
                 }
-                out.push(action("Highlight", "Custom Color…", &["highlight", "picker", "color", "colour"], Act::CustomColor));
+                out.push(action("Color", "Custom Color…", &["highlight", "picker", "color", "colour"], Act::CustomColor));
                 if mark.is_some() {
-                    out.push(action("Highlight", "Remove Highlight", &["mark", "color", "colour"], Act::RemoveHighlight));
+                    out.push(action("Color", "Remove Highlight", &["mark", "color", "colour"], Act::RemoveHighlight));
                 }
             }
             // A link: edit, open or remove it. A selection: link it.
@@ -210,7 +213,7 @@ impl LiveView {
                 Some(Into::Numbered)
             }
             Kind::Item(_) => Some(Into::Bullet),
-            Kind::Quote => Some(Into::Quote),
+            Kind::Quote { lead } if lead == "> " => Some(Into::Quote),
             _ => None,
         };
         let note = self.page.blocks.iter().any(|(_, s)| matches!(s, Shape::Note { leaf, .. } if *leaf == i));
@@ -234,7 +237,7 @@ impl LiveView {
                     _ => true,
                 };
                 if into != current && fits {
-                    out.push(action("Turn Into", label, keywords, Act::TurnInto(into)));
+                    out.push(action("Convert To", label, keywords, Act::TurnInto(into)));
                 }
             }
         }
@@ -562,7 +565,7 @@ impl LiveView {
         let prefix = match &leaf.kind {
             Kind::Text { block } => block.start..leaf.flow.source_for(0).max(block.start),
             Kind::Item(item) => item.prefix.clone(),
-            Kind::Quote => {
+            Kind::Quote { .. } => {
                 let start = leaf.span.start;
                 self.source[..start].rfind('\n').map_or(0, |n| n + 1)..start
             }

@@ -111,6 +111,19 @@ pub fn flow(source: &str, range: Range<usize>) -> Option<Flow> {
 pub fn from_inline(source: &str, heading: Option<u8>, children: &[Node], empty_at: usize) -> Option<Flow> {
     let mut flow = Flow { heading, empty_at, ..Default::default() };
     walk(source, 0, children, TextMark::default(), &mut flow)?;
+    // A line break in a list item or a quote is followed by the container's
+    // indent or `> `, which isn't drawn: it goes with the break, so deleting
+    // the break joins the lines cleanly.
+    for n in 1..flow.chars.len() {
+        let (before, after) = flow.chars.split_at_mut(n);
+        let (a, b) = (before.last_mut()?, &after[0]);
+        if &source[a.source.clone()] == "\n"
+            && a.source.end < b.source.start
+            && source[a.source.end..b.source.start].chars().all(|c| matches!(c, ' ' | '\t' | '>'))
+        {
+            a.source.end = b.source.start;
+        }
+    }
     Some(flow)
 }
 
@@ -523,8 +536,14 @@ fn push_text(block: &str, base: usize, at: Range<usize>, value: &str, mark: &Tex
     let mut run_start = flow.text.len();
     let mut run_link: Option<usize> = None;
     let mut wiki_spans: Vec<(usize, Range<usize>, Range<usize>)> = Vec::new();
+    let mut after_break = false;
     for (vi, c) in value.char_indices() {
         let (mut i, mut s) = source.next()?;
+        // A line's container prefix (indent, `> `) after a break: not drawn.
+        while after_break && s != c && matches!(s, ' ' | '\t' | '>') {
+            (i, s) = source.next()?;
+        }
+        after_break = c == '\n';
         if s == '\\' && c != '\\' {
             (i, s) = source.next()?;
         }
@@ -640,6 +659,35 @@ impl Flow {
 
     /// Text shown exactly as written (a code block's code): every character
     /// is itself in the note, no marks.
+    /// Text as written (code) in a container whose lines start with `lead`
+    /// (a list item's indent, a quote's `> `): the lead isn't drawn, and goes
+    /// with the line break before it.
+    pub fn plain_lead(source: &str, range: Range<usize>, lead: &str) -> Self {
+        if lead.is_empty() {
+            return Self::plain(source, range);
+        }
+        let mut flow = Self::empty(range.start);
+        let text = &source[range.clone()];
+        let mut i = 0;
+        // The first line's lead is before the range already.
+        while i < text.len() {
+            let c = text[i..].chars().next().unwrap_or(' ');
+            let at = range.start + i;
+            let shown = flow.text.len();
+            flow.text.push(c);
+            let mut end = at + c.len_utf8();
+            if c == '\n' {
+                // As much of the lead as the next line has.
+                let rest = &text[i + 1..];
+                let common = rest.bytes().zip(lead.bytes()).take_while(|(a, b)| a == b).count();
+                end += common;
+            }
+            flow.chars.push(Char { shown: shown..flow.text.len(), source: at..end });
+            i = end - range.start;
+        }
+        flow
+    }
+
     pub fn plain(source: &str, range: Range<usize>) -> Self {
         let mut flow = Self::empty(range.start);
         for (i, c) in source[range.clone()].char_indices() {

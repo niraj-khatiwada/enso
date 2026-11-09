@@ -17,7 +17,8 @@ Features:
   - Hovering a highlight shows its colours and a colour picker.
   - A click on an image (or a diagram, a rule…) selects it; Backspace or Delete removes it.
   - **Cmd/Ctrl + Shift + E** shows the block at the caret as its Markdown, to edit as text; again, Escape or moving away draws it again.
-  - **Cmd/Ctrl + /** opens actions for what the caret is in: formatting buttons (bold, italic, underline, strikethrough, code, link, highlight, math, clear formatting), highlight colours, letter case, Turn Into, Mark as Done, table rows and columns, and Duplicate, Delete or Edit as Markdown for the block.
+  - Blocks inside blocks are edited in place too: lists in quotes, and code, quotes and further paragraphs in list items; Enter keeps each line in its container.
+  - **Cmd/Ctrl + /** opens actions for what the caret is in, with Convert To, Color and Case as menus of their own: formatting buttons (bold, italic, underline, strikethrough, code, link, highlight, math, clear formatting), highlight colours, letter case, Convert To, Mark as Done, table rows and columns, and Duplicate, Delete or Edit as Markdown for the block.
 - The outline's section previews read as text in Live Preview, without Markdown.
 
 ### 1.2.0

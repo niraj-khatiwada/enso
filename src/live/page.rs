@@ -21,10 +21,12 @@ pub enum Kind {
     /// A paragraph or heading; `block` is its whole range.
     Text { block: Range<usize> },
     Item(Item),
-    /// A paragraph in a quote.
-    Quote,
-    /// A code block's code, in `lang`.
-    Code { lang: Option<String> },
+    /// A paragraph in a container: a quote, or a list item past its first
+    /// paragraph. `lead` starts each of its lines (`> `, `  `, `  > `).
+    Quote { lead: String },
+    /// A code block's code, in `lang`; `lead` starts each of its lines
+    /// inside a list item or quote.
+    Code { lang: Option<String>, lead: String },
     /// A table cell's text: row (0 is the header) and column.
     Cell { row: usize, col: usize },
 }
@@ -72,6 +74,9 @@ pub struct Row {
     pub leaf: usize,
     pub depth: usize,
     pub marker: Marker,
+    /// In a quote: the quote's own depth, and whether it's inside a list
+    /// item (then it starts at the item's text).
+    pub quote: Option<(usize, bool)>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -87,6 +92,10 @@ pub enum Marker {
     Bullet,
     Number(u32),
     Task(bool),
+    /// More of a list item (a paragraph, code): no marker, at its text.
+    Continue,
+    /// A line of a quote: no marker at all.
+    Nothing,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -146,7 +155,7 @@ impl Page {
                 if !raw_placed {
                     raw_placed = true;
                     let flow = Flow::plain(source, raw.clone());
-                    page.leaves.push(Leaf { span: raw.clone(), flow, kind: Kind::Code { lang: Some("markdown".into()) } });
+                    page.leaves.push(Leaf { span: raw.clone(), flow, kind: Kind::Code { lang: Some("markdown".into()), lead: String::new() } });
                     page.blocks.push((raw.clone(), Shape::Code(page.leaves.len() - 1)));
                 }
                 continue;
@@ -157,7 +166,7 @@ impl Page {
                 Node::List(list) => {
                     let mark = page.leaves.len();
                     let mut rows = Vec::new();
-                    if list_rows(&mut page, source, list, 0, &mut rows).is_some() {
+                    if list_rows(&mut page, source, list, 0, None, &mut rows).is_some() {
                         Shape::List(rows)
                     } else {
                         page.leaves.truncate(mark);
@@ -174,15 +183,23 @@ impl Page {
                             return false;
                         };
                         let end = flow.take_trailing_spaces(source, at.end.offset);
-                        page.leaves.push(Leaf { span: at.start.offset..end, flow, kind: Kind::Quote });
+                        let lead = lead_of(source, at.start.offset);
+                        page.leaves.push(Leaf { span: at.start.offset..end, flow, kind: Kind::Quote { lead } });
                         leaves.push(page.leaves.len() - 1);
                         true
                     });
                     if ok && !leaves.is_empty() {
                         Shape::Quote(leaves)
                     } else {
+                        // A quote holding lists or code: its lines as rows.
                         page.leaves.truncate(mark);
-                        Shape::Other
+                        let mut rows = Vec::new();
+                        if quote_rows(&mut page, source, quote, 0, false, &mut rows).is_some() && !rows.is_empty() {
+                            Shape::List(rows)
+                        } else {
+                            page.leaves.truncate(mark);
+                            Shape::Other
+                        }
                     }
                 }
                 Node::Table(table) => {
@@ -224,10 +241,9 @@ impl Page {
                     }
                     _ => Shape::Other,
                 },
-                Node::Code(code) if code.lang.as_deref() != Some("mermaid") => match code_content(source, range.clone(), &code.value) {
-                    Some(content) => {
-                        let flow = Flow::plain(source, content.clone());
-                        page.leaves.push(Leaf { span: content, flow, kind: Kind::Code { lang: code.lang.clone() } });
+                Node::Code(code) if code.lang.as_deref() != Some("mermaid") => match code_leaf(source, code) {
+                    Some(leaf) => {
+                        page.leaves.push(leaf);
                         Shape::Code(page.leaves.len() - 1)
                     }
                     None => Shape::Other,
@@ -279,9 +295,28 @@ fn table_rows(page: &mut Page, source: &str, table: &markdown::mdast::Table) -> 
     Some(rows)
 }
 
+/// What starts the line `at` is on, up to `at` (`> `, a list item's
+/// indent).
+fn lead_of(source: &str, at: usize) -> String {
+    let line_start = source[..at].rfind('\n').map_or(0, |i| i + 1);
+    source[line_start..at].to_string()
+}
+
+/// A fenced code block's code as a line of its own (`None` for Mermaid,
+/// indented code, or code not written out as is).
+fn code_leaf(source: &str, code: &markdown::mdast::Code) -> Option<Leaf> {
+    let at = code.position.as_ref()?;
+    let range = at.start.offset..at.end.offset;
+    let lead = lead_of(source, range.start);
+    let content = code_content(source, range, &code.value, &lead)?;
+    let flow = Flow::plain_lead(source, content.clone(), &lead);
+    Some(Leaf { span: content, flow, kind: Kind::Code { lang: code.lang.clone(), lead } })
+}
+
 /// A fenced code block's code, between its fences (`None` for indented
-/// code, or code whose text isn't written out as is).
-fn code_content(source: &str, range: Range<usize>, value: &str) -> Option<Range<usize>> {
+/// code, or code whose text isn't written out as is). In a container each
+/// line starts with `lead`, which the code itself doesn't hold.
+fn code_content(source: &str, range: Range<usize>, value: &str, lead: &str) -> Option<Range<usize>> {
     let block = &source[range.clone()];
     if !(block.starts_with("```") || block.starts_with("~~~")) {
         return None;
@@ -294,7 +329,25 @@ fn code_content(source: &str, range: Range<usize>, value: &str) -> Option<Range<
     };
     let end = if closed { last_line.saturating_sub(1).max(start) } else { range.end };
     let content = start..end.max(start);
-    (source[content.clone()] == *value).then_some(content)
+    // The first line's lead comes before the code.
+    let content = if !lead.is_empty() && source[content.clone()].starts_with(lead) { content.start + lead.len()..content.end.max(content.start + lead.len()) } else { content };
+    let written: String = if lead.is_empty() {
+        source[content.clone()].to_string()
+    } else {
+        let text = &source[content.clone()];
+        let mut out = String::new();
+        for (n, line) in text.split('\n').enumerate() {
+            if n > 0 {
+                out.push('\n');
+                let common = line.bytes().zip(lead.bytes()).take_while(|(a, b)| a == b).count();
+                out.push_str(&line[common..]);
+            } else {
+                out.push_str(line);
+            }
+        }
+        out
+    };
+    (written == *value).then_some(content)
 }
 
 fn text(page: &mut Page, source: &str, heading: Option<u8>, children: &[Node], range: Range<usize>) -> Shape {
@@ -309,14 +362,14 @@ fn text(page: &mut Page, source: &str, heading: Option<u8>, children: &[Node], r
     }
 }
 
-/// A list's items as rows, nested lists after their item. `None` when an
-/// item holds more than text and nested lists (code, a quote…).
-fn list_rows(page: &mut Page, source: &str, list: &List, depth: usize, rows: &mut Vec<Row>) -> Option<()> {
+/// A list's items as rows, what's nested in each after it: more
+/// paragraphs, code, quotes, lists. `quote`: the quote the list is in.
+/// `None` when an item holds something else (a table, HTML…).
+fn list_rows(page: &mut Page, source: &str, list: &List, depth: usize, quote: Option<(usize, bool)>, rows: &mut Vec<Row>) -> Option<()> {
     let mut number = list.start.unwrap_or(1);
     for child in &list.children {
         let Node::ListItem(item) = child else { return None };
         let leaf = item_leaf(source, item)?;
-        let indent = leaf.flow_start(source);
         let task = match &leaf.leaf.kind {
             Kind::Item(item) => item.checkbox.as_ref().map(|(_, done)| *done),
             _ => None,
@@ -328,11 +381,54 @@ fn list_rows(page: &mut Page, source: &str, list: &List, depth: usize, rows: &mu
             None => Marker::Bullet,
         };
         number += 1;
-        rows.push(Row { leaf: page.leaves.len() - 1, depth, marker });
-        for nested in item.children.iter().skip(usize::from(matches!(item.children.first(), Some(Node::Paragraph(_))))) {
-            let Node::List(nested) = nested else { return None };
-            let _ = indent;
-            list_rows(page, source, nested, depth + 1, rows)?;
+        rows.push(Row { leaf: page.leaves.len() - 1, depth, marker, quote });
+        let first_is_text = matches!(item.children.first(), Some(Node::Paragraph(_)));
+        for nested in item.children.iter().skip(usize::from(first_is_text)) {
+            match nested {
+                Node::List(nested) => list_rows(page, source, nested, depth + 1, quote, rows)?,
+                Node::Paragraph(p) => {
+                    let leaf = paragraph_leaf(source, p)?;
+                    page.leaves.push(leaf);
+                    rows.push(Row { leaf: page.leaves.len() - 1, depth, marker: Marker::Continue, quote });
+                }
+                Node::Code(code) => {
+                    page.leaves.push(code_leaf(source, code)?);
+                    rows.push(Row { leaf: page.leaves.len() - 1, depth, marker: Marker::Continue, quote });
+                }
+                Node::Blockquote(inner) => quote_rows(page, source, inner, depth, true, rows)?,
+                _ => return None,
+            }
+        }
+    }
+    Some(())
+}
+
+/// A paragraph in a container, as a line that keeps the container's lead.
+fn paragraph_leaf(source: &str, p: &markdown::mdast::Paragraph) -> Option<Leaf> {
+    let at = p.position.as_ref()?;
+    let mut flow = flow::from_inline(source, None, &p.children, at.end.offset)?;
+    let end = flow.take_trailing_spaces(source, at.end.offset);
+    Some(Leaf { span: at.start.offset..end, flow, kind: Kind::Quote { lead: lead_of(source, at.start.offset) } })
+}
+
+/// A quote's lines as rows: paragraphs, lists, code. `depth` and `in_item`
+/// say where it starts (at a list item's text, or the page's edge).
+fn quote_rows(page: &mut Page, source: &str, quote: &markdown::mdast::Blockquote, depth: usize, in_item: bool, rows: &mut Vec<Row>) -> Option<()> {
+    let at = Some((depth, in_item));
+    for child in &quote.children {
+        match child {
+            Node::Paragraph(p) => {
+                page.leaves.push(paragraph_leaf(source, p)?);
+                let marker = if in_item { Marker::Continue } else { Marker::Nothing };
+                rows.push(Row { leaf: page.leaves.len() - 1, depth, marker, quote: at });
+            }
+            Node::Code(code) => {
+                page.leaves.push(code_leaf(source, code)?);
+                let marker = if in_item { Marker::Continue } else { Marker::Nothing };
+                rows.push(Row { leaf: page.leaves.len() - 1, depth, marker, quote: at });
+            }
+            Node::List(list) => list_rows(page, source, list, depth + usize::from(in_item), at, rows)?,
+            _ => return None,
         }
     }
     Some(())
@@ -340,12 +436,6 @@ fn list_rows(page: &mut Page, source: &str, list: &List, depth: usize, rows: &mu
 
 struct ItemLeaf {
     leaf: Leaf,
-}
-
-impl ItemLeaf {
-    fn flow_start(&self, _: &str) -> usize {
-        self.leaf.span.start
-    }
 }
 
 fn item_leaf(source: &str, item: &ListItem) -> Option<ItemLeaf> {
@@ -422,6 +512,33 @@ fn item_leaf(source: &str, item: &ListItem) -> Option<ItemLeaf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nested_blocks_become_rows() {
+        let source = "> A quote with a list:\n>\n> - item one\n> - item two\n\n- A list item with code:\n\n  ```sh\n  cargo run\n  cargo test\n  ```\n\n- A list item with a quote:\n\n  > quoted inside\n  > the item\n\n  And more text.\n";
+        let page = Page::read(source);
+        let texts: Vec<_> = page.leaves.iter().map(|l| l.flow.text.as_str()).collect();
+        assert_eq!(
+            texts,
+            ["A quote with a list:", "item one", "item two", "A list item with code:", "cargo run\ncargo test", "A list item with a quote:", "quoted inside the item", "And more text."]
+        );
+        let Shape::List(rows) = &page.blocks[0].1 else { panic!("{:?}", page.blocks[0].1) };
+        assert!(matches!(rows[0].marker, Marker::Nothing) && rows[0].quote == Some((0, false)));
+        assert!(matches!(rows[1].marker, Marker::Bullet) && rows[1].quote == Some((0, false)));
+        let Kind::Item(item) = &page.leaves[1].kind else { panic!() };
+        assert_eq!(item.next_prefix, "> - ");
+        // Code in an item: its indent isn't drawn, and goes with the break.
+        let code = &page.leaves[4];
+        assert!(matches!(&code.kind, Kind::Code { lead, .. } if lead == "  "));
+        let at = code.flow.text.find('\n').unwrap();
+        assert_eq!(&source[code.flow.delete_after(at).unwrap()], "\n  ");
+        // A quote in an item, and a later paragraph of it.
+        assert!(matches!(&page.leaves[6].kind, Kind::Quote { lead } if lead == "  > "));
+        assert!(matches!(&page.leaves[7].kind, Kind::Quote { lead } if lead == "  "));
+        let Shape::List(rows) = &page.blocks[1].1 else { panic!() };
+        assert_eq!(rows[3].quote, Some((0, true)));
+        assert!(matches!(rows[4].marker, Marker::Continue) && rows[4].quote.is_none());
+    }
 
     #[test]
     fn lists_become_rows_of_leaves() {
