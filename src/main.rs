@@ -759,7 +759,7 @@ impl Enso {
     }
 
     /// Live Preview shows one view, the editable page: no Edit or Split.
-    fn live_view(&self, cx: &App) -> bool {
+    pub(crate) fn live_view(&self, cx: &App) -> bool {
         settings::live_preview(cx) && self.active.is_some_and(|i| self.documents[i].live.is_some())
     }
 
@@ -6522,6 +6522,50 @@ mod transition_tests {
         assert!(lit(cx).is_empty());
         press(cx, "Strikethrough");
         assert_eq!(text(cx), "Bold, **italic**, under, ~~struck~~ and gone.\n");
+    }
+
+    #[gpui_kit::test]
+    fn live_preview_finds_and_jumps_on_the_page(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            bind_view_keys(cx);
+            crate::live::init(cx);
+            crate::settings::init(cx);
+            gpui_kit::BorrowAppContext::update_global::<crate::settings::Preferences, _>(cx, |p, _| p.live_preview = true);
+        });
+        let source = "# Plan\n\nFind the **word** here.\n\n## Later\n\nAnd the word again.\n";
+        let (handle, view) = cx.update(|cx| gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+            cx.new(|cx| {
+                let mut app = Enso::new(window, cx);
+                app.add_document(Some(PathBuf::from("find.md")), source.into(), None, window, cx);
+                app
+            })
+        }).unwrap());
+        for _ in 0..3 { draw(cx, handle); cx.run_until_parked(); }
+        let (live, editor) = cx.update(|cx| {
+            let doc = &view.read(cx).documents[0];
+            (doc.live.clone().unwrap(), doc.editor.clone())
+        });
+        // Find: both matches on the page, the first the current one.
+        cx.update_window(handle, |_, window, cx| view.update(cx, |app, cx| app.open_page_find(window, cx))).unwrap();
+        draw(cx, handle);
+        assert!(cx.update(|cx| view.read(cx).page_find.is_some()));
+        cx.simulate_input(handle, "word");
+        draw(cx, handle);
+        cx.run_until_parked();
+        let first = source.find("word").unwrap();
+        let second = source.rfind("word").unwrap();
+        assert_eq!(cx.update(|cx| live.read(cx).found_for_test()), (vec![first..first + 4, second..second + 4], Some(0)));
+        cx.update(|cx| view.update(cx, |app, cx| app.page_find_step(1, cx)));
+        assert_eq!(cx.update(|cx| live.read(cx).found_for_test()).1, Some(1));
+        cx.update_window(handle, |_, window, cx| view.update(cx, |app, cx| app.close_page_find(window, cx))).unwrap();
+        assert!(cx.update(|cx| live.read(cx).found_for_test()).0.is_empty());
+        // The outline: the caret on the heading.
+        let id = cx.update(|cx| editor.entity_id());
+        let later = source.find("## Later").unwrap();
+        cx.update_window(handle, |_, window, cx| view.update(cx, |app, cx| app.jump_to_heading(id, later, window, cx))).unwrap();
+        draw(cx, handle);
+        assert_eq!(cx.update(|cx| live.read(cx).caret_for_test()), Some(later + 3));
     }
 
     #[gpui_kit::test]

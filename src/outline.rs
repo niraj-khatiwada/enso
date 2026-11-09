@@ -308,6 +308,12 @@ impl Enso {
                 e.set_selected_range(offset..offset, cx);
             });
         }
+        // Live Preview: the caret on the heading in the page, in view.
+        if let Some(live) = doc.live.clone().filter(|_| settings::live_preview(cx)) {
+            live.update(cx, |live, cx| live.jump_to(offset, window, cx));
+            cx.notify();
+            return;
+        }
         if self.mode != Mode::Read {
             doc.editor.focus_handle(cx).focus(window, cx);
         }

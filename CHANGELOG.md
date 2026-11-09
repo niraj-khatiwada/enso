@@ -23,6 +23,7 @@ Features:
   - Blocks inside blocks are edited in place too: lists in quotes, and code, quotes and further paragraphs in list items; Enter keeps each line in its container.
   - **Cmd/Ctrl + /** opens actions for what the caret is in, with Convert To, Color and Case as menus of their own: formatting buttons (bold, italic, underline, strikethrough, code, link, highlight, math, clear formatting; written as Markdown or HTML alike), highlight colours, letter case, Convert To, Mark as Done, table rows and columns, and Duplicate, Delete or Edit as Markdown for the block.
 - The outline's section previews read as text in Live Preview, without Markdown.
+- Find (Cmd/Ctrl + F) highlights its matches on the live page and scrolls to each; a search result opened flashes its match there; and a heading picked in the outline puts the caret on it.
 
 ### 1.2.0
 

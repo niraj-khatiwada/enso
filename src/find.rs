@@ -23,7 +23,7 @@ pub(crate) struct PageFind {
 }
 
 /// Every match softly, the current one strongly.
-fn colors(cx: &App) -> (Hsla, Hsla) {
+pub(crate) fn colors(cx: &App) -> (Hsla, Hsla) {
     let dark = cx.theme().mode.is_dark();
     (
         hsla(0.14, 0.95, 0.55, if dark { 0.22 } else { 0.30 }),
@@ -32,11 +32,17 @@ fn colors(cx: &App) -> (Hsla, Hsla) {
 }
 
 impl Enso {
+    /// The live page showing the note `id`, when Live Preview shows it.
+    fn live_page(&self, id: EntityId, cx: &App) -> Option<Entity<crate::live::LiveView>> {
+        let doc = self.documents.iter().find(|d| d.editor.entity_id() == id)?;
+        doc.live.clone().filter(|_| settings::live_preview(cx))
+    }
+
     /// Cmd/Ctrl+F: in the editor its own Find opens (it binds the keys
     /// closer in); here the reading view gets one.
     pub(crate) fn open_page_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(index) = self.active else { return };
-        if self.mode == Mode::Edit || !self.documents[index].markdown {
+        if (self.mode == Mode::Edit && !self.live_view(cx)) || !self.documents[index].markdown {
             cx.propagate();
             return;
         }
@@ -53,7 +59,10 @@ impl Enso {
             return;
         }
         // What's selected in the reader is what to look for.
-        let selected = if doc.large_reader.is_none() {
+        let live = self.live_page(editor_id, cx);
+        let selected = if let Some(live) = &live {
+            live.read(cx).selected_text()
+        } else if doc.large_reader.is_none() {
             doc.preview.read(cx).selected_text()
         } else {
             String::new()
@@ -99,7 +108,10 @@ impl Enso {
         let Some(doc) = self.documents.iter().find(|d| d.editor.entity_id() == find.editor_id) else {
             return;
         };
+        let live = self.live_page(doc.editor.entity_id(), cx);
         let matches = match &doc.large_reader {
+            // Live Preview: in the page's text (as the note's offsets).
+            _ if live.is_some() => live.as_ref().map(|l| l.read(cx).find_all(&query, MAX_MATCHES)).unwrap_or_default(),
             // The editor of a large note loads only when it's opened.
             Some(reader) => search::find_all(&reader.read(cx).source(), &query, MAX_MATCHES),
             None => search::find_all(doc.preview.read(cx).rendered_text().as_str(), &query, MAX_MATCHES),
@@ -129,6 +141,12 @@ impl Enso {
             return;
         };
         self.flash_task = None;
+        if let Some(live) = self.live_page(find.editor_id, cx) {
+            let (matches, current) = (find.matches.clone(), (!find.matches.is_empty()).then_some(find.current));
+            live.update(cx, |live, cx| live.show_found(matches, current, cx));
+            cx.notify();
+            return;
+        }
         let (soft, strong) = colors(cx);
         let current = find.matches.get(find.current).cloned();
         match &doc.large_reader {
@@ -167,11 +185,17 @@ impl Enso {
         if doc.editor_loaded {
             doc.editor.update(cx, |editor, cx| editor.set_selected_range(span, cx));
         }
-        if self.mode == Mode::Edit || self.page_find.is_some() {
+        if (self.mode == Mode::Edit && self.live_page(id, cx).is_none()) || self.page_find.is_some() {
             return;
         }
         let (_, strong) = colors(cx);
         match &doc.large_reader {
+            _ if self.live_page(id, cx).is_some() => {
+                if let Some(live) = self.live_page(id, cx) {
+                    let count = ranges.len();
+                    live.update(cx, |live, cx| live.show_found(ranges, (count > 0).then_some(0), cx));
+                }
+            }
             Some(reader) => reader.update(cx, |reader, cx| reader.highlight(ranges, strong, cx)),
             None => {
                 let rendered = doc.preview.read(cx).rendered_text();
@@ -199,6 +223,9 @@ impl Enso {
     }
 
     fn clear_reader_highlights(&mut self, id: EntityId, cx: &mut Context<Self>) {
+        if let Some(live) = self.live_page(id, cx) {
+            live.update(cx, |live, cx| live.clear_found(cx));
+        }
         let Some(doc) = self.documents.iter().find(|d| d.editor.entity_id() == id) else { return };
         match &doc.large_reader {
             Some(reader) => reader.update(cx, |reader, cx| reader.clear_highlight(cx)),

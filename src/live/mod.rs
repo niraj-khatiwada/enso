@@ -288,6 +288,9 @@ pub struct LiveView {
     /// A block without text (an image, a diagram) picked by a click, by its
     /// start: Backspace or Delete removes it.
     picked: Option<usize>,
+    /// Find's matches on the page (in the note), and which is the current.
+    found: Vec<Range<usize>>,
+    found_current: Option<usize>,
     /// Where the picked block was pressed, for menus about it.
     picked_at: Option<Point<Pixels>>,
     /// The pointer is over the link card: it stays.
@@ -344,6 +347,8 @@ impl LiveView {
             raw: None,
             picked: None,
             picked_at: None,
+            found: Vec::new(),
+            found_current: None,
             closing: None,
             geometry: Rc::default(),
             undo: Vec::new(),
@@ -543,6 +548,12 @@ impl LiveView {
     #[cfg(all(test, feature = "ui-tests"))]
     pub(crate) fn edit_block_for_test(&mut self, start: usize, window: &mut Window, cx: &mut Context<Self>) {
         self.edit_raw(start, window, cx);
+    }
+
+    /// Find's matches on the page, and the current one.
+    #[cfg(all(test, feature = "ui-tests"))]
+    pub(crate) fn found_for_test(&self) -> (Vec<Range<usize>>, Option<usize>) {
+        (self.found.clone(), self.found_current)
     }
 
     #[cfg(all(test, feature = "ui-tests"))]
@@ -1034,6 +1045,76 @@ impl LiveView {
         cx.notify();
     }
 
+    /// Find: where `query` is in the page's text, in the note.
+    pub(crate) fn find_all(&self, query: &str, limit: usize) -> Vec<Range<usize>> {
+        let mut found = Vec::new();
+        for leaf in &self.page.leaves {
+            for shown in crate::search::find_all(&leaf.flow.text, query, limit.saturating_sub(found.len())) {
+                if let Some(span) = leaf.flow.char_span(shown) {
+                    found.push(span);
+                }
+            }
+            if found.len() >= limit {
+                break;
+            }
+        }
+        found
+    }
+
+    /// Find's matches painted (`current` stronger) and the current one
+    /// brought into view.
+    pub(crate) fn show_found(&mut self, found: Vec<Range<usize>>, current: Option<usize>, cx: &mut Context<Self>) {
+        let at = current.and_then(|i| found.get(i)).map(|r| r.start);
+        self.found = found;
+        self.found_current = current;
+        if let Some(at) = at {
+            self.reveal(at);
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn clear_found(&mut self, cx: &mut Context<Self>) {
+        if !self.found.is_empty() {
+            self.found.clear();
+            self.found_current = None;
+            cx.notify();
+        }
+    }
+
+    /// The outline's heading at `at` (in the note): the caret on it, in view.
+    pub(crate) fn jump_to(&mut self, at: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let leaf = self.page.leaf_at(at).or_else(|| self.page.leaves.iter().position(|l| l.span.start >= at));
+        let Some(leaf) = leaf else { return };
+        let flow = &self.page.leaves[leaf].flow;
+        let to = flow.source_for(0);
+        self.anchor = None;
+        self.picked = None;
+        self.caret = Some(to);
+        self.parked = None;
+        self.reveal(to);
+        window.focus(&self.focus, cx);
+        cx.notify();
+    }
+
+    /// Scroll so the line holding `at` (in the note) is in view, a third of
+    /// the way down, when it isn't already.
+    fn reveal(&self, at: usize) {
+        let Some(leaf) = self.page.leaf_at(at) else { return };
+        let geometry = self.geometry.borrow();
+        let Some(g) = geometry.get(&leaf_key(leaf)) else { return };
+        let flow = &self.page.leaves[leaf].flow;
+        let y = g.position_for_index(flow.shown_for(at)).y;
+        let view = self.scroll.bounds();
+        let margin = g.line_height() * 2.;
+        if y > view.top() + margin && y + margin < view.bottom() {
+            return;
+        }
+        let offset = self.scroll.offset();
+        let max = self.scroll.max_offset();
+        let moved = offset.y - (y - (view.top() + view.size.height / 3.));
+        self.scroll.set_offset(point(offset.x, moved.min(px(0.)).max(-max.y.abs())));
+    }
+
     /// A press on an empty line: the caret there.
     fn click_blank(&mut self, at: usize, window: &mut Window, cx: &mut Context<Self>) {
         if self.editor.read(cx).value().as_ref() != self.source.as_str() {
@@ -1203,7 +1284,7 @@ impl LiveView {
     }
 
     /// The selected text as read: no Markdown, a line break between lines.
-    fn selected_text(&self) -> String {
+    pub(crate) fn selected_text(&self) -> String {
         self.selected_parts()
             .into_iter()
             .map(|(i, shown)| self.page.leaves[i].flow.text[shown].to_string())
@@ -3693,6 +3774,17 @@ impl Render for LiveView {
             )));
         // The selection, painted behind each line it covers.
         let mut decorations: HashMap<u64, Vec<(Range<usize>, Hsla)>> = HashMap::new();
+        // Find's matches, softly, the current one strongly.
+        if !self.found.is_empty() {
+            let (soft, strong) = crate::find::colors(cx);
+            for (n, found) in self.found.iter().enumerate() {
+                let Some(i) = self.page.leaf_at(found.start) else { continue };
+                let flow = &self.page.leaves[i].flow;
+                let shown = flow.shown_for(found.start)..flow.shown_for(found.end);
+                let color = if Some(n) == self.found_current { strong } else { soft };
+                decorations.entry(leaf_key(i)).or_default().push((shown, color));
+            }
+        }
         if let Some(selection) = self.selection().filter(|_| self.shows_selection(focused)) {
             let color = cx.theme().selection;
             for (i, leaf) in self.page.leaves.iter().enumerate() {
@@ -3702,7 +3794,7 @@ impl Render for LiveView {
                 }
                 let shown = leaf.flow.shown_for(start)..leaf.flow.shown_for(end);
                 if !shown.is_empty() {
-                    decorations.insert(leaf_key(i), vec![(shown, color)]);
+                    decorations.entry(leaf_key(i)).or_default().push((shown, color));
                 }
             }
         }
