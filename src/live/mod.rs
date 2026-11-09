@@ -539,6 +539,12 @@ impl LiveView {
         self.caret = Some(range.end);
     }
 
+    /// The Edit button of the block starting at `start` pressed.
+    #[cfg(all(test, feature = "ui-tests"))]
+    pub(crate) fn edit_block_for_test(&mut self, start: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.edit_raw(start, window, cx);
+    }
+
     #[cfg(all(test, feature = "ui-tests"))]
     pub(crate) fn table_card_for_test(&self) -> bool {
         self.table_card.is_some()
@@ -1006,6 +1012,28 @@ impl LiveView {
         self.selection().is_some() && self.shows_selection(self.focus.is_focused(window))
     }
 
+    /// The block starting at `start` as its Markdown, the caret at its
+    /// content (past a fence's first line).
+    fn edit_raw(&mut self, start: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.editor.read(cx).is_editable() {
+            return;
+        }
+        let Some((range, _)) = self.page.blocks.iter().find(|(r, _)| r.start == start).cloned() else { return };
+        self.raw = Some(range.clone());
+        self.page = Page::read_with_raw(&self.source, self.raw.clone());
+        self.picked = None;
+        self.anchor = None;
+        // What's typed in it undoes apart from what came before.
+        self.last_edit = None;
+        let text = &self.source[range.clone()];
+        let fenced = text.starts_with("```") || text.starts_with("~~~") || text.starts_with("$$");
+        let content = if fenced { text.find('\n').map_or(range.start, |n| range.start + n + 1) } else { range.start };
+        self.caret = Some(content.min(range.end));
+        self.parked = None;
+        window.focus(&self.focus, cx);
+        cx.notify();
+    }
+
     /// A press on an empty line: the caret there.
     fn click_blank(&mut self, at: usize, window: &mut Window, cx: &mut Context<Self>) {
         if self.editor.read(cx).value().as_ref() != self.source.as_str() {
@@ -1302,7 +1330,8 @@ impl LiveView {
 
     fn restore(&mut self, to: (String, usize), window: &mut Window, cx: &mut Context<Self>) {
         let (text, caret) = to;
-        self.raw = None;
+        // The block shown as Markdown stays so when what changes is in it.
+        self.raw = self.raw.clone().and_then(|raw| moved_range(&self.source, &text, raw));
         self.editor.update(cx, |editor, cx| editor.set_value(text.as_str(), window, cx));
         self.refresh(cx);
         self.caret = Some(caret.min(self.source.len()));
@@ -2469,7 +2498,28 @@ impl LiveView {
         }
         marks.retain(|(r, m)| !r.is_empty() && *m != gpui_kit::base::text::editor_host::TextMark::default());
         let mut paragraph = Paragraph::default();
-        paragraph.push(InlineNode::new(flow.text.clone()).marks(marks));
+        // Text, and images in it: each run of text with its own marks.
+        let mut from = 0;
+        let run = |paragraph: &mut Paragraph, range: Range<usize>| {
+            if range.is_empty() {
+                return;
+            }
+            let marks = marks
+                .iter()
+                .filter(|(r, _)| r.start < range.end && range.start < r.end)
+                .map(|(r, m)| (r.start.max(range.start) - range.start..r.end.min(range.end) - range.start, m.clone()))
+                .collect();
+            paragraph.push(InlineNode::new(flow.text[range].to_string()).marks(marks));
+        };
+        for (at, url, alt) in &flow.images {
+            run(&mut paragraph, from..at.start);
+            let mut image = gpui_kit::base::text::editor_host::ImageNode::default();
+            image.url = url.clone().into();
+            image.alt = (!alt.is_empty()).then(|| alt.clone().into());
+            paragraph.push(InlineNode::image(image));
+            from = at.end;
+        }
+        run(&mut paragraph, from..flow.text.len());
         let paragraph = paragraph.with_leaf_key(key);
         match flow.heading {
             Some(level) => BlockNode::Heading { level, children: paragraph, span: None },
@@ -2521,7 +2571,18 @@ impl Render for LiveView {
         let reading = typography::current(cx);
         let render_context = {
             let (owner, editor) = (self.owner.clone(), self.editor_id);
-            RenderContext::from_app(cx).with_body_font_size(px(reading.size as f32)).on_link_click(move |url, _, window, cx| {
+            let images = self.base.clone();
+            RenderContext::from_app(cx)
+                .with_body_font_size(px(reading.size as f32))
+                // Images in the text, from beside the note as the reader finds them.
+                .with_image_source(move |uri| {
+                    let source = uri.to_string();
+                    match &images {
+                        Some(base) if !source.contains(':') => ImageSource::from(base.join(source)),
+                        _ => ImageSource::from(uri.clone()),
+                    }
+                })
+                .on_link_click(move |url, _, window, cx| {
                 // Web addresses in the browser; notes (wiki links too) in enso.
                 if url.starts_with("https://") || url.starts_with("http://") || url.starts_with("mailto:") {
                     cx.open_url(url);
@@ -2883,20 +2944,60 @@ impl Render for LiveView {
                         Kind::Code { lang, .. } => lang.clone(),
                         _ => None,
                     };
+                    // A diagram, formula or HTML being edited as Markdown:
+                    // drawn beside it as it's typed.
+                    let preview_of = (self.raw.as_ref() == Some(&range))
+                        .then(|| self.source[range.clone()].to_string())
+                        .filter(|text| previews(text));
                     let code = CodeBlock::from_code(self.page.leaves[leaf].flow.text.clone(), lang).with_leaf_key(leaf_key(leaf));
                     let node = BlockNode::CodeBlock(code);
-                    let position = FlowPosition::at(&[&node], 0, last).first(first);
+                    // Beside a preview, the gap after it goes under both.
+                    let position = FlowPosition::at(&[&node], 0, last || preview_of.is_some()).first(first);
                     let element = node.render_with_id(("live-code", range.start), position, &render_context, window, cx);
                     let weak = weak.clone();
-                    div()
+                    let theme = cx.theme().clone();
+                    let preview = preview_of.map(|text| match mermaid_code(&text) {
+                        Some(code) => rich::mermaid_preview(&code, self.owner.clone(), cx),
+                        None => {
+                            let view = TextView::markdown(("live-raw-preview", range.start), text).selectable(false).w_full();
+                            let view = typography::style(view, cx);
+                            let view = rich::decorate(view, self.owner.clone(), self.editor_id, self.base.clone(), range.start, 0);
+                            // A formula or HTML on a panel like the Markdown's.
+                            div()
+                                .size_full()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .p_4()
+                                .rounded(px(10.))
+                                .border_1()
+                                .border_color(theme.border.opacity(0.6))
+                                .child(view)
+                                .into_any_element()
+                        }
+                    });
+                    let gap_after = render_context.style().paragraph_gap();
+                    let code = div()
                         .id(("live-code-row", range.start))
                         .w_full()
                         .cursor_text()
                         .on_mouse_down(MouseButton::Left, move |event, window, cx| {
                             let _ = weak.update(cx, |view, cx| view.mouse_down(leaf, event, window, cx));
                         })
-                        .child(element)
-                        .into_any_element()
+                        .child(element);
+                    match preview {
+                        // Side by side: the Markdown on the left, what it draws
+                        // on the right, each half the width.
+                        Some(preview) => h_flex()
+                            .w_full()
+                            .items_stretch()
+                            .gap_4()
+                            .when(!last, |row| row.mb(gap_after))
+                            .child(div().flex_1().min_w_0().child(code))
+                            .child(div().flex_1().min_w_0().flex().child(preview))
+                            .into_any_element(),
+                        None => code.into_any_element(),
+                    }
                 }
                 Shape::Other => {
                     let view = TextView::markdown(("live-view", range.start), self.source[range.clone()].to_string())
@@ -2919,8 +3020,23 @@ impl Render for LiveView {
                     }
                     let picked = picked && !picture;
                     let ring = cx.theme().ring;
+                    let editable = self.editor.read(cx).is_editable();
+                    // Edit: the block as its Markdown, drawn again under it
+                    // as it's typed.
+                    let edit: rich::DiagramEdit = {
+                        let weak = weak.clone();
+                        std::rc::Rc::new(move |window: &mut Window, cx: &mut App| {
+                            let _ = weak.update(cx, |view, cx| view.edit_raw(start, window, cx));
+                        })
+                    };
+                    let mermaid = mermaid_code(&self.source[range.clone()]);
+                    let is_mermaid = mermaid.is_some();
+                    let group: SharedString = format!("live-block-{start}").into();
+                    let theme = cx.theme().clone();
+                    let gap_after = render_context.style().paragraph_gap();
                     div()
                         .id(("live-block", range.start))
+                        .group(group.clone())
                         .w_full()
                         .relative()
                         .on_click(move |event, window, cx| {
@@ -2930,7 +3046,35 @@ impl Render for LiveView {
                         .when(picked, |block| {
                             block.child(div().absolute().top(px(-3.)).bottom(px(-3.)).left(px(-3.)).right(px(-3.)).rounded_md().border_2().border_color(ring))
                         })
-                        .child(
+                        // A diagram: drawn with an Edit button on its toolbar.
+                        .when_some(mermaid.filter(|_| editable), |block, code| {
+                            block.child(div().w_full().pb(gap_after).child(rich::mermaid_view(&code, self.owner.clone(), edit.clone(), cx)))
+                        })
+                        // Math, HTML…: an Edit button at the top right on hover.
+                        .when(!is_mermaid && editable && !picture, |block| {
+                            let edit = edit.clone();
+                            block.child(
+                                div()
+                                    .absolute()
+                                    .top(px(6.))
+                                    .right(px(6.))
+                                    .p(px(2.))
+                                    .toolbar_surface(&theme)
+                                    .opacity(0.)
+                                    .group_hover(group.clone(), |bar| bar.opacity(1.))
+                                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                    .child(
+                                        crate::ui::icon_button(("live-block-edit", start), IconName::Pencil, "Edit")
+                                            .xsmall()
+                                            .compact()
+                                            .on_click(move |_, window, cx| {
+                                                cx.stop_propagation();
+                                                edit(window, cx);
+                                            }),
+                                    ),
+                            )
+                        })
+                        .when(!is_mermaid || !editable, |block| block.child(
                             rich::decorate(view, self.owner.clone(), self.editor_id, base, range.start, 0).image_source(
                                 move |uri| {
                                     let source = uri.to_string();
@@ -2942,7 +3086,7 @@ impl Render for LiveView {
                                     ImageSource::from(uri.clone())
                                 },
                             ),
-                        )
+                        ))
                         .into_any_element()
                 }
             };
@@ -3178,6 +3322,19 @@ impl Render for LiveView {
             )
             .with_priority(1)
         });
+        // The menu follows what changes while it's open (⌘B on the
+        // selection, say): its buttons, its list, and where it works.
+        if self.action_menu.is_some() && (self.caret.is_some() || self.picked.is_some()) {
+            let (buttons, actions) = (self.buttons(), self.actions());
+            let scope = actions::Scope { caret: self.caret, anchor: self.anchor, picked: self.picked };
+            if let Some(menu) = self.action_menu.as_mut() {
+                menu.buttons = buttons;
+                if !actions.is_empty() {
+                    menu.actions = actions;
+                }
+                menu.scope = scope;
+            }
+        }
         let action_menu = self.action_menu.as_ref().map(|menu| {
             let theme = cx.theme().clone();
             let mut command = Command::new(&menu.state)
@@ -3710,6 +3867,46 @@ fn urlencoding_decode(text: &str) -> String {
     String::from_utf8(out).unwrap_or_else(|_| text.to_string())
 }
 
+/// Where `range` of `old` is in `new`, when what changed between them is
+/// within it or wholly before or after it.
+fn moved_range(old: &str, new: &str, range: Range<usize>) -> Option<Range<usize>> {
+    let prefix = old.bytes().zip(new.bytes()).take_while(|(a, b)| a == b).count();
+    let room = old.len().min(new.len()) - prefix;
+    let suffix = old.bytes().rev().zip(new.bytes().rev()).take(room).take_while(|(a, b)| a == b).count();
+    let (changed_end, delta) = (old.len() - suffix, new.len() as isize - old.len() as isize);
+    let shift = |at: usize| (at as isize + delta) as usize;
+    let moved = if range.start <= prefix && changed_end <= range.end {
+        range.start..shift(range.end)
+    } else if changed_end <= range.start {
+        shift(range.start)..shift(range.end)
+    } else if prefix >= range.end {
+        range
+    } else {
+        return None;
+    };
+    (moved.end <= new.len() && new.is_char_boundary(moved.start) && new.is_char_boundary(moved.end)).then_some(moved)
+}
+
+/// Whether a block shown as its Markdown is drawn under it too: one that
+/// reads nothing like its Markdown (a diagram, a formula, HTML).
+fn previews(block: &str) -> bool {
+    let text = block.trim_start();
+    mermaid_code(text).is_some() || text.starts_with("> [!") || text.starts_with("$$") || text.starts_with("\\[") || text.starts_with('<')
+}
+
+/// A ```mermaid fence's diagram source.
+fn mermaid_code(block: &str) -> Option<String> {
+    let (first, rest) = block.split_once('\n')?;
+    let fence = first.trim_start();
+    let lang = fence.trim_start_matches(['`', '~']).trim();
+    if !(fence.starts_with("```") || fence.starts_with("~~~")) || !crate::diagram::is_mermaid(Some(lang)) {
+        return None;
+    }
+    let body = rest.trim_end();
+    let body = body.strip_suffix("```").or_else(|| body.strip_suffix("~~~")).unwrap_or(body);
+    Some(body.trim_end_matches('\n').to_string() + "\n")
+}
+
 /// The empty lines drawn between `from` (a block's end) and `to` (the next
 /// block's start, or the note's end): where each starts. Between two
 /// blocks one blank line is the gap Markdown needs, so it isn't one of
@@ -3788,5 +3985,29 @@ mod tests {
         assert_eq!(super::byte_to_utf16(text, 7), 4);
         assert_eq!(super::previous_boundary(text, 7), 3);
         assert_eq!(super::next_boundary(text, 3), 7);
+    }
+
+    #[test]
+    fn diagrams_and_formulas_preview_while_edited() {
+        let diagram = "```mermaid\nflowchart LR\n  a --> b\n```";
+        assert_eq!(super::mermaid_code(diagram).as_deref(), Some("flowchart LR\n  a --> b\n"));
+        assert_eq!(super::mermaid_code("```rust\nfn a() {}\n```"), None);
+        assert!(super::previews(diagram) && super::previews("$$\nx^2\n$$") && super::previews("<details>\nmore\n</details>"));
+        assert!(!super::previews("Plain **text**") && !super::previews("- item"));
+        assert!(super::previews("> [!TIP]\n> Use it."));
+    }
+
+    #[test]
+    fn undo_keeps_the_block_being_edited() {
+        let old = "A\n\n$$\nx^2\n$$\n\nB";
+        let raw = 3..12;
+        assert_eq!(&old[raw.clone()], "$$\nx^2\n$$");
+        // Typed inside it: it grows and shrinks with the text.
+        assert_eq!(super::moved_range(old, "A\n\n$$\nx^23\n$$\n\nB", raw.clone()), Some(3..13));
+        // Before it: it moves; after it: it stays.
+        assert_eq!(super::moved_range(old, "AA\n\n$$\nx^2\n$$\n\nB", raw.clone()), Some(4..13));
+        assert_eq!(super::moved_range(old, "A\n\n$$\nx^2\n$$\n\nBB", raw.clone()), Some(3..12));
+        // Across its edge: gone.
+        assert_eq!(super::moved_range(old, "A\n\nB", raw), None);
     }
 }

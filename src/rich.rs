@@ -246,7 +246,7 @@ pub(crate) fn decorate_mapped(
         })
         .markdown_block_renderer("enso-mermaid", move |node, _, cx| {
             let block = node.data::<MermaidBlock>().unwrap();
-            render_mermaid(&block.source, diagram_owner.clone(), cx)
+            render_mermaid(&block.source, diagram_owner.clone(), None, cx)
         })
         .markdown_block_renderer("enso-image", move |node, window, cx| {
             render_picture(
@@ -363,9 +363,28 @@ struct MermaidBlock {
     source: String,
 }
 
+/// What a diagram's Edit button does (Live Preview: its Markdown, to edit).
+pub(crate) type DiagramEdit = std::rc::Rc<dyn Fn(&mut Window, &mut App)>;
+
+/// A diagram as the reader draws it, with an Edit button on its toolbar.
+pub(crate) fn mermaid_view(source: &str, owner: WeakEntity<Enso>, edit: DiagramEdit, cx: &mut App) -> AnyElement {
+    render_mermaid(source, owner, Some(edit), cx)
+}
+
+/// A diagram beside its Markdown as it's edited: the same panel, filling
+/// the height it's given, with no margin of its own.
+pub(crate) fn mermaid_preview(source: &str, owner: WeakEntity<Enso>, cx: &mut App) -> AnyElement {
+    div().size_full().child(render_mermaid_in(source, owner, None, true, cx)).into_any_element()
+}
+
 /// A diagram on a soft panel the width of the text, centred; wide ones scale
 /// down to fit. A diagram with a mistake shows the mistake and its source.
-fn render_mermaid(source: &str, owner: WeakEntity<Enso>, cx: &mut App) -> AnyElement {
+fn render_mermaid(source: &str, owner: WeakEntity<Enso>, edit: Option<DiagramEdit>, cx: &mut App) -> AnyElement {
+    render_mermaid_in(source, owner, edit, false, cx)
+}
+
+/// `fill`: the panel fills its parent's height, without margins.
+fn render_mermaid_in(source: &str, owner: WeakEntity<Enso>, edit: Option<DiagramEdit>, fill: bool, cx: &mut App) -> AnyElement {
     let theme = cx.theme().clone();
     let dark = theme.mode.is_dark();
     match crate::diagram::render(source, dark) {
@@ -388,9 +407,9 @@ fn render_mermaid(source: &str, owner: WeakEntity<Enso>, cx: &mut App) -> AnyEle
                         let _ = opener.update(cx, |app, cx| app.open_lightbox(full, w, cx));
                     }
                 })
-                .child(diagram_toolbar(source, &drawn, owner, &theme))
+                .child(diagram_toolbar(source, &drawn, owner, edit, &theme))
                 .w_full()
-                .my_1()
+                .map(|panel| if fill { panel.h_full().items_center() } else { panel.my_1() })
                 .p_4()
                 .rounded(px(10.))
                 .bg(rgb(u32::from_be_bytes([0, r, g, b])))
@@ -408,8 +427,9 @@ fn render_mermaid(source: &str, owner: WeakEntity<Enso>, cx: &mut App) -> AnyEle
                 .into_any_element()
         }
         Err(problem) => v_flex()
+            .relative()
             .w_full()
-            .my_1()
+            .map(|panel| if fill { panel.h_full() } else { panel.my_1() })
             .p_3()
             .gap_2()
             .rounded(px(10.))
@@ -436,6 +456,19 @@ fn render_mermaid(source: &str, owner: WeakEntity<Enso>, cx: &mut App) -> AnyEle
                     .text_color(theme.muted_foreground)
                     .child(source.trim_end().to_string()),
             )
+            .when_some(edit, |panel, edit| {
+                panel.child(
+                    div().absolute().top(px(6.)).right(px(6.)).child(
+                        ui::icon_button("diagram-edit", IconName::Pencil, "Edit")
+                            .xsmall()
+                            .compact()
+                            .on_click(move |_, w, cx| {
+                                cx.stop_propagation();
+                                edit(w, cx);
+                            }),
+                    ),
+                )
+            })
             .into_any_element(),
     }
 }
@@ -446,6 +479,7 @@ fn diagram_toolbar(
     source: &str,
     drawn: &crate::diagram::Diagram,
     owner: WeakEntity<Enso>,
+    edit: Option<DiagramEdit>,
     theme: &gpui_kit::component::Theme,
 ) -> impl IntoElement {
     let source: SharedString = source.to_string().into();
@@ -464,6 +498,17 @@ fn diagram_toolbar(
         .opacity(0.)
         .group_hover("enso-diagram", |bar| bar.opacity(1.))
         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+        .when_some(edit, |bar, edit| {
+            bar.child(
+                ui::icon_button("diagram-edit", IconName::Pencil, "Edit")
+                    .xsmall()
+                    .compact()
+                    .on_click(move |_, w, cx| {
+                        cx.stop_propagation();
+                        edit(w, cx);
+                    }),
+            )
+        })
         .child({
             let owner = owner.clone();
             ui::icon_button("diagram-full", IconName::Maximize, "View Full Size")

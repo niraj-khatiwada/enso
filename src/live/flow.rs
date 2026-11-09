@@ -84,6 +84,9 @@ pub struct Flow {
     /// Inline math, drawn as one unit: where it's drawn, its Markdown, and
     /// its TeX.
     pub maths: Vec<(Range<usize>, Range<usize>, String)>,
+    /// Images in the text, each drawn as one unit (`U+FFFC`): where, and
+    /// its address and alt text.
+    pub images: Vec<(Range<usize>, String, String)>,
 }
 
 /// The drawn form of the block at `range` of `source`, or `None` when it holds
@@ -402,7 +405,13 @@ fn walk(block: &str, base: usize, nodes: &[Node], mark: TextMark, flow: &mut Flo
                 push_atom(flow, &shown, base + at.start..base + at.end, math_mark);
                 flow.maths.push((start..flow.text.len(), base + at.start..base + at.end, math.value.clone()));
             }
-            // Images: not drawn by this editor yet.
+            // `![alt](src)` in the text: the image, as one unit.
+            Node::Image(image) => {
+                let start = flow.text.len();
+                push_atom(flow, "\u{FFFC}", base + at.start..base + at.end, TextMark::default());
+                flow.images.push((start..flow.text.len(), image.url.clone(), image.alt.clone()));
+            }
+            // Anything else: not drawn by this editor yet.
             _ => return None,
         }
     }
@@ -1198,6 +1207,19 @@ mod tests {
     }
 
     #[test]
+    fn images_in_text_are_whole_units() {
+        let source = "Text with ![a photo](photo.jpg) in it";
+        let f = of(source);
+        assert_eq!(f.text, "Text with \u{FFFC} in it");
+        let at = f.text.find('\u{FFFC}').unwrap();
+        assert_eq!(f.images, vec![(at..at + 3, "photo.jpg".to_string(), "a photo".to_string())]);
+        assert_eq!(f.step(at, true), at + 3);
+        assert_eq!(&source[f.delete_before(at + 3).unwrap()], "![a photo](photo.jpg)");
+        // Typing just after it goes after its Markdown.
+        assert_eq!(&source[..f.source_for(at + 3)], "Text with ![a photo](photo.jpg)");
+    }
+
+    #[test]
     fn wiki_links_show_their_label() {
         let source = "See [[19-retrospective]] and [[plan|the plan]].";
         let f = of(source);
@@ -1221,7 +1243,7 @@ mod tests {
         // At its end: after the delimiter, nothing to reopen.
         let (at, text) = f.split_at(9);
         assert_eq!((&source[..at], text.as_str()), ("## Big **title**", "\n\n"));
-        // Unsupported inline content: no flow.
-        assert!(flow("an ![img](a.png) here", 0..21).is_none());
+        // An image in the text is drawn too.
+        assert!(flow("an ![img](a.png) here", 0..21).is_some());
     }
 }

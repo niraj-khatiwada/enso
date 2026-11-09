@@ -17,6 +17,8 @@ Features:
   - Hovering a highlight shows its colours and a colour picker.
   - A click on an image (or a diagram, a rule…) selects it; Backspace or Delete removes it, and Enter starts a new line under it.
   - Enter on an empty line adds another, as in Notion: extra blank lines show as empty lines to click into, type on and move through with the arrow keys.
+  - Mermaid diagrams, block math, HTML blocks and callouts have an Edit button: their Markdown on the left, drawn live on the right as it's typed; undo and redo stay in it.
+  - Images inside a sentence are drawn in the line, which stays editable around them; callouts are drawn as callouts.
   - **Cmd/Ctrl + Shift + E** shows the block at the caret as its Markdown, to edit as text; again, Escape or moving away draws it again.
   - Blocks inside blocks are edited in place too: lists in quotes, and code, quotes and further paragraphs in list items; Enter keeps each line in its container.
   - **Cmd/Ctrl + /** opens actions for what the caret is in, with Convert To, Color and Case as menus of their own: formatting buttons (bold, italic, underline, strikethrough, code, link, highlight, math, clear formatting; written as Markdown or HTML alike), highlight colours, letter case, Convert To, Mark as Done, table rows and columns, and Duplicate, Delete or Edit as Markdown for the block.

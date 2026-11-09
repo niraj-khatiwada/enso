@@ -6129,6 +6129,24 @@ mod transition_tests {
         cx.simulate_keystrokes(handle, "escape");
         draw(cx, handle);
         assert_eq!(raw(cx), None);
+        // The math's Edit button: its Markdown, the caret on the formula.
+        let math = text(cx).find("$$").unwrap();
+        cx.update_window(handle, |_, window, cx| live.update(cx, |live, cx| live.edit_block_for_test(math, window, cx))).unwrap();
+        draw(cx, handle);
+        assert_eq!(raw(cx).map(|r| r.start), Some(math));
+        assert_eq!(cx.update(|cx| live.read(cx).caret_for_test()), Some(math + 3));
+        cx.simulate_input(handle, "F = ");
+        draw(cx, handle);
+        assert!(text(cx).contains("$$\nF = E = mc^2!\n$$"), "{}", text(cx));
+        // Undo and redo inside it: it stays shown as Markdown.
+        cx.simulate_keystrokes(handle, "cmd-z");
+        draw(cx, handle);
+        assert!(text(cx).contains("$$\nE = mc^2!\n$$"), "{}", text(cx));
+        assert_eq!(raw(cx).map(|r| r.start), Some(math));
+        cx.simulate_keystrokes(handle, "cmd-shift-z");
+        draw(cx, handle);
+        assert!(text(cx).contains("$$\nF = E = mc^2!\n$$"), "{}", text(cx));
+        assert_eq!(raw(cx).map(|r| r.start), Some(math));
     }
 
     #[gpui_kit::test]
@@ -6490,11 +6508,20 @@ mod transition_tests {
             press(cx, label);
         }
         assert_eq!(text(cx), "Bold, italic, under, struck and gone.\n");
+        // ⌘B with the menu open: its Bold button follows.
+        select(cx, "italic");
+        assert!(lit(cx).is_empty());
+        cx.simulate_keystrokes(handle, "cmd-b");
+        draw(cx, handle);
+        assert_eq!(text(cx), "Bold, **italic**, under, struck and gone.\n");
+        assert!(cx.update(|cx| live.read(cx).buttons_for_test()).contains(&("Bold".to_string(), true)));
+        cx.simulate_keystrokes(handle, "escape");
+        draw(cx, handle);
         // And on again, as Markdown.
         select(cx, "struck");
         assert!(lit(cx).is_empty());
         press(cx, "Strikethrough");
-        assert_eq!(text(cx), "Bold, italic, under, ~~struck~~ and gone.\n");
+        assert_eq!(text(cx), "Bold, **italic**, under, ~~struck~~ and gone.\n");
     }
 
     #[gpui_kit::test]

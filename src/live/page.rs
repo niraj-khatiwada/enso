@@ -161,6 +161,18 @@ impl Page {
                 continue;
             }
             let shape = match node {
+                // Only images on the line: drawn as the reader draws them, with
+                // their own controls (size, alignment).
+                Node::Paragraph(p)
+                    if p.children.iter().any(|c| matches!(c, Node::Image(_)))
+                        && p.children.iter().all(|c| match c {
+                            Node::Image(_) => true,
+                            Node::Text(t) => t.value.trim().is_empty(),
+                            _ => false,
+                        }) =>
+                {
+                    Shape::Other
+                }
                 Node::Paragraph(p) => text(&mut page, source, None, &p.children, range.clone()),
                 Node::Heading(h) => text(&mut page, source, Some(h.depth), &h.children, range.clone()),
                 Node::List(list) => {
@@ -173,6 +185,9 @@ impl Page {
                         Shape::Other
                     }
                 }
+                // A callout (`> [!NOTE]`): drawn as the reader draws it, edited
+                // as its Markdown.
+                Node::Blockquote(_) if crate::callout::Callout::parse(node).is_some() => Shape::Other,
                 Node::Blockquote(quote) => {
                     let mark = page.leaves.len();
                     let mut leaves = Vec::new();
@@ -512,6 +527,13 @@ fn item_leaf(source: &str, item: &ListItem) -> Option<ItemLeaf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn callouts_stay_drawn_as_callouts() {
+        let page = Page::read("> [!NOTE]\n> Remember this.\n\n> A plain quote.\n");
+        assert!(matches!(page.blocks[0].1, Shape::Other));
+        assert!(matches!(page.blocks[1].1, Shape::Quote(_)));
+    }
 
     #[test]
     fn nested_blocks_become_rows() {
