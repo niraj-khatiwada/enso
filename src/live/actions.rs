@@ -285,7 +285,7 @@ impl LiveView {
         let Some(shown) = self.shown_in(i) else { return Vec::new() };
         let flow = &self.page.leaves[i].flow;
         let wraps = flow.wraps_over(shown.clone());
-        let on = |kind: Wrap| wraps.contains(&kind);
+        let on = |kind: Wrap| wraps.contains(&kind) || self.html_mark(i, shown.clone(), kind).is_some();
         use gpui_kit::assets::IconName;
         let link = flow.link_at(shown.start).is_some() && flow.link_at(shown.end).is_some();
         let math = shown.is_empty() && flow.math_at(shown.start).is_some();
@@ -294,7 +294,12 @@ impl LiveView {
         vec![
             button(Act::Toggle(Wrap::Strong), IconName::Bold, "Bold", on(Wrap::Strong)),
             button(Act::Toggle(Wrap::Emphasis), IconName::Italic, "Italic", on(Wrap::Emphasis)),
-            button(Act::Underline, IconName::Underline, "Underline", flow.tag_over(shown.clone(), "u").is_some()),
+            button(
+                Act::Underline,
+                IconName::Underline,
+                "Underline",
+                flow.tag_over(shown.clone(), "u").or_else(|| flow.tag_over(shown.clone(), "ins")).is_some(),
+            ),
             button(Act::Toggle(Wrap::Delete), IconName::Strikethrough, "Strikethrough", on(Wrap::Delete)),
             button(Act::Toggle(Wrap::Code), IconName::Code, "Inline Code", on(Wrap::Code)),
             button(Act::EditLink, IconName::Link, "Link", link),
@@ -315,22 +320,57 @@ impl LiveView {
         Some(flow.word_start(end)..end)
     }
 
+    /// The HTML tag around the selection (or the word) that gives what
+    /// `kind` gives (`<b>` for bold, `<s>` for strikethrough…).
+    fn html_mark(&self, i: usize, shown: Range<usize>, kind: Wrap) -> Option<(Range<usize>, Range<usize>)> {
+        let tags: &[&str] = match kind {
+            Wrap::Strong => &["b", "strong"],
+            Wrap::Emphasis => &["i", "em"],
+            Wrap::Delete => &["s", "del", "strike"],
+            Wrap::Code => &["code"],
+            _ => &[],
+        };
+        let flow = &self.page.leaves[i].flow;
+        tags.iter().find_map(|tag| flow.tag_over(shown.clone(), tag))
+    }
+
+    /// Bold, italic, strikethrough, inline code: off when the text has it,
+    /// written either way (`**` or `<b>`), else on.
+    pub(super) fn toggle_format(&mut self, kind: Wrap, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(Spot::Leaf(i)) = self.spot() else { return };
+        let Some(shown) = self.selection_or_word(i) else { return };
+        let markdown = self.page.leaves[i].flow.wraps_over(shown.clone()).contains(&kind);
+        match self.html_mark(i, shown, kind).filter(|_| !markdown) {
+            Some((open, close)) => self.remove_tags(open, close, window, cx),
+            None => self.toggle_mark(kind, window, cx),
+        }
+    }
+
+    /// An HTML tag pair gone, its text kept, the caret and selection on the
+    /// same letters.
+    fn remove_tags(&mut self, open: Range<usize>, close: Range<usize>, window: &mut Window, cx: &mut Context<Self>) {
+        let (caret, anchor) = (self.caret, self.anchor);
+        self.edit(close.clone(), "", window, cx);
+        self.last_edit = Some(std::time::Instant::now());
+        self.edit(open.clone(), "", window, cx);
+        let keep = |at: usize| {
+            let at = if at >= close.end { at - close.len() } else { at.min(close.start) };
+            if at >= open.end { at - open.len() } else { at.min(open.start) }
+        };
+        self.caret = caret.map(keep);
+        self.anchor = anchor.map(keep);
+        cx.notify();
+    }
+
     /// `<u>` on the selection (or the word), or off the run it's in.
     fn underline(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(Spot::Leaf(i)) = self.spot() else { return };
         let Some(shown) = self.selection_or_word(i) else { return };
         let flow = self.page.leaves[i].flow.clone();
         let (caret, anchor) = (self.caret, self.anchor);
-        if let Some((open, close)) = flow.tag_over(shown.clone(), "u") {
-            self.edit(close.clone(), "", window, cx);
-            self.last_edit = Some(std::time::Instant::now());
-            self.edit(open.clone(), "", window, cx);
-            let keep = |at: usize| {
-                let at = if at >= close.end { at - close.len() } else { at.min(close.start) };
-                if at >= open.end { at - open.len() } else { at.min(open.start) }
-            };
-            self.caret = caret.map(keep);
-            self.anchor = anchor.map(keep);
+        if let Some((open, close)) = flow.tag_over(shown.clone(), "u").or_else(|| flow.tag_over(shown.clone(), "ins")) {
+            self.remove_tags(open, close, window, cx);
+            return;
         } else {
             let Some(span) = flow.char_span(shown) else { return };
             self.edit(span.end..span.end, "</u>", window, cx);
@@ -406,7 +446,7 @@ impl LiveView {
         self.picked = scope.picked;
         self.parked = None;
         match act {
-            Act::Toggle(kind) => self.toggle_mark(kind, window, cx),
+            Act::Toggle(kind) => self.toggle_format(kind, window, cx),
             Act::Underline => self.underline(window, cx),
             Act::ClearFormatting => self.clear_formatting(window, cx),
             Act::Math => self.make_math(window, cx),

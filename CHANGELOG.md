@@ -15,10 +15,11 @@ Features:
   - Tables like Notion's: each cell is its own field, the arrow keys stay in it, a click anywhere in a cell lands there, and + bars under and beside the table add a row or column. Hovering a cell shows its column's alignment and a ⋯ menu to insert, align and delete rows and columns.
   - Inline HTML formatting (`<b>`, `<u>`, `<mark>`…), entities, reference links, footnotes and inline math are edited in place; a footnote mark or a formula moves and deletes as one, and Cmd/Ctrl + K edits a formula's TeX.
   - Hovering a highlight shows its colours and a colour picker.
-  - A click on an image (or a diagram, a rule…) selects it; Backspace or Delete removes it.
+  - A click on an image (or a diagram, a rule…) selects it; Backspace or Delete removes it, and Enter starts a new line under it.
+  - Enter on an empty line adds another, as in Notion: extra blank lines show as empty lines to click into, type on and move through with the arrow keys.
   - **Cmd/Ctrl + Shift + E** shows the block at the caret as its Markdown, to edit as text; again, Escape or moving away draws it again.
   - Blocks inside blocks are edited in place too: lists in quotes, and code, quotes and further paragraphs in list items; Enter keeps each line in its container.
-  - **Cmd/Ctrl + /** opens actions for what the caret is in, with Convert To, Color and Case as menus of their own: formatting buttons (bold, italic, underline, strikethrough, code, link, highlight, math, clear formatting), highlight colours, letter case, Convert To, Mark as Done, table rows and columns, and Duplicate, Delete or Edit as Markdown for the block.
+  - **Cmd/Ctrl + /** opens actions for what the caret is in, with Convert To, Color and Case as menus of their own: formatting buttons (bold, italic, underline, strikethrough, code, link, highlight, math, clear formatting; written as Markdown or HTML alike), highlight colours, letter case, Convert To, Mark as Done, table rows and columns, and Duplicate, Delete or Edit as Markdown for the block.
 - The outline's section previews read as text in Live Preview, without Markdown.
 
 ### 1.2.0

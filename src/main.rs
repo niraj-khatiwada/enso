@@ -5979,6 +5979,16 @@ mod transition_tests {
         cx.simulate_keystrokes(handle, "escape");
         draw(cx, handle);
         assert_eq!(picked(cx), None);
+        // Enter under a picked image: a new empty line there, to type on.
+        cx.update_window(handle, |_, window, cx| live.update(cx, |live, cx| live.click_block_for_test(first, window, cx))).unwrap();
+        draw(cx, handle);
+        cx.simulate_keystrokes(handle, "enter");
+        cx.simulate_input(handle, "Caption");
+        draw(cx, handle);
+        assert_eq!(text(cx), "Before\n\n![one](a.png)\n\nCaption\n\n<img src=\"b.png\" width=\"30%\" />\n\nAfter\n");
+        cx.simulate_keystrokes(handle, "cmd-z");
+        draw(cx, handle);
+        assert_eq!(text(cx), source);
         // Picked again, Backspace removes it and its blank line.
         cx.update_window(handle, |_, window, cx| live.update(cx, |live, cx| live.click_block_for_test(first, window, cx))).unwrap();
         draw(cx, handle);
@@ -6350,6 +6360,141 @@ mod transition_tests {
         cx.simulate_keystrokes(handle, "backspace");
         draw(cx, handle);
         assert!(text(cx).ends_with("  > said\n  >\n  more\n"), "{}", text(cx));
+    }
+
+    #[gpui_kit::test]
+    fn live_preview_enter_adds_empty_lines(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            bind_view_keys(cx);
+            crate::live::init(cx);
+            crate::settings::init(cx);
+            gpui_kit::BorrowAppContext::update_global::<crate::settings::Preferences, _>(cx, |p, _| p.live_preview = true);
+        });
+        let source = "First\n\nSecond\n";
+        let (handle, view) = cx.update(|cx| gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+            cx.new(|cx| {
+                let mut app = Enso::new(window, cx);
+                app.add_document(Some(PathBuf::from("lines.md")), source.into(), None, window, cx);
+                app
+            })
+        }).unwrap());
+        for _ in 0..3 { draw(cx, handle); cx.run_until_parked(); }
+        let (live, editor) = cx.update(|cx| {
+            let doc = &view.read(cx).documents[0];
+            (doc.live.clone().unwrap(), doc.editor.clone())
+        });
+        let text = |cx: &mut TestAppContext| cx.update(|cx| editor.read(cx).value().to_string());
+        let caret = |cx: &mut TestAppContext| cx.update(|cx| live.read(cx).caret_for_test());
+        cx.update_window(handle, |_, window, cx| {
+            let focus = live.read(cx).focus.clone();
+            window.focus(&focus, cx);
+            live.update(cx, |live, _| live.set_caret_for_test(5));
+        }).unwrap();
+        draw(cx, handle);
+        // Each Enter: one more empty line, the caret on it.
+        cx.simulate_keystrokes(handle, "enter");
+        draw(cx, handle);
+        assert_eq!((text(cx).as_str(), caret(cx)), ("First\n\n\nSecond\n", Some(6)));
+        cx.simulate_keystrokes(handle, "enter");
+        draw(cx, handle);
+        assert_eq!((text(cx).as_str(), caret(cx)), ("First\n\n\n\nSecond\n", Some(7)));
+        // The arrows stop on each empty line.
+        let keys = |cx: &mut TestAppContext, keys: &str| {
+            cx.simulate_keystrokes(handle, keys);
+            draw(cx, handle);
+            cx.update(|cx| live.read(cx).caret_for_test())
+        };
+        // Nothing moves as the caret comes onto an empty line and leaves it.
+        let second = |cx: &mut TestAppContext| {
+            cx.update(|cx| live.read(cx).text_bounds_for_test(editor.read(cx).value().find("Second").unwrap()).top())
+        };
+        let on_empty = second(cx);
+        assert_eq!(keys(cx, "up"), Some(6));
+        assert_eq!(second(cx), on_empty);
+        assert_eq!(keys(cx, "up"), Some(0));
+        assert_eq!(second(cx), on_empty);
+        assert_eq!(keys(cx, "down"), Some(6));
+        assert_eq!(keys(cx, "down"), Some(7));
+        assert_eq!(keys(cx, "down"), Some(9));
+        assert_eq!(keys(cx, "left"), Some(7));
+        assert_eq!(keys(cx, "left"), Some(6));
+        assert_eq!(keys(cx, "left"), Some(5));
+        assert_eq!(keys(cx, "right"), Some(6));
+        assert_eq!(keys(cx, "right right"), Some(9));
+        assert_eq!(keys(cx, "left"), Some(7));
+        // Typed on the second: the first stays an empty line above it.
+        cx.simulate_input(handle, "x");
+        draw(cx, handle);
+        assert_eq!(text(cx), "First\n\n\nx\n\nSecond\n");
+        // Its letter gone, it's an empty line again; Backspace on an empty
+        // line takes just that line.
+        cx.simulate_keystrokes(handle, "backspace");
+        draw(cx, handle);
+        assert_eq!((text(cx).as_str(), caret(cx)), ("First\n\n\n\nSecond\n", Some(7)));
+        cx.simulate_keystrokes(handle, "backspace");
+        draw(cx, handle);
+        assert_eq!(text(cx), "First\n\n\nSecond\n");
+        assert_eq!(caret(cx), Some(6));
+    }
+
+    #[gpui_kit::test]
+    fn live_preview_formatting_buttons_know_html_marks(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            bind_view_keys(cx);
+            crate::live::init(cx);
+            crate::settings::init(cx);
+            gpui_kit::BorrowAppContext::update_global::<crate::settings::Preferences, _>(cx, |p, _| p.live_preview = true);
+        });
+        let source = "<b>Bold</b>, <i>italic</i>, <u>under</u>, <s>struck</s> and ~~gone~~.\n";
+        let (handle, view) = cx.update(|cx| gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+            cx.new(|cx| {
+                let mut app = Enso::new(window, cx);
+                app.add_document(Some(PathBuf::from("html-marks.md")), source.into(), None, window, cx);
+                app
+            })
+        }).unwrap());
+        for _ in 0..3 { draw(cx, handle); cx.run_until_parked(); }
+        let (live, editor) = cx.update(|cx| {
+            let doc = &view.read(cx).documents[0];
+            (doc.live.clone().unwrap(), doc.editor.clone())
+        });
+        let text = |cx: &mut TestAppContext| cx.update(|cx| editor.read(cx).value().to_string());
+        let open = if cfg!(target_os = "macos") { "cmd-/" } else { "ctrl-/" };
+        let select = |cx: &mut TestAppContext, word: &str| {
+            cx.update_window(handle, |_, window, cx| {
+                let focus = live.read(cx).focus.clone();
+                window.focus(&focus, cx);
+                let at = editor.read(cx).value().find(word).unwrap();
+                live.update(cx, |live, _| live.select_for_test(at..at + word.len()));
+            }).unwrap();
+            draw(cx, handle);
+        };
+        let lit = |cx: &mut TestAppContext| -> Vec<String> {
+            cx.simulate_keystrokes(handle, open);
+            draw(cx, handle);
+            cx.update(|cx| live.read(cx).buttons_for_test()).into_iter().filter(|(_, on)| *on).map(|(l, _)| l).collect()
+        };
+        let press = |cx: &mut TestAppContext, label: &'static str| {
+            cx.update_window(handle, |_, window, cx| live.update(cx, |live, cx| live.press_for_test(label, window, cx))).unwrap();
+            draw(cx, handle);
+        };
+        // Each mark, written as HTML or Markdown: its button lit, and
+        // pressed, off (the selection kept, and shown while the menu is open).
+        for (word, label) in [("Bold", "Bold"), ("italic", "Italic"), ("under", "Underline"), ("struck", "Strikethrough"), ("gone", "Strikethrough")] {
+            select(cx, word);
+            assert_eq!(lit(cx), vec![label.to_string()], "{word}");
+            let drawn = cx.update_window(handle, |_, window, cx| live.read(cx).selection_drawn_for_test(window)).unwrap();
+            assert!(drawn, "the selection stays drawn while the menu is open");
+            press(cx, label);
+        }
+        assert_eq!(text(cx), "Bold, italic, under, struck and gone.\n");
+        // And on again, as Markdown.
+        select(cx, "struck");
+        assert!(lit(cx).is_empty());
+        press(cx, "Strikethrough");
+        assert_eq!(text(cx), "Bold, italic, under, ~~struck~~ and gone.\n");
     }
 
     #[gpui_kit::test]

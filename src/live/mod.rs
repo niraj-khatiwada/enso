@@ -238,6 +238,10 @@ impl Grid {
     }
 }
 
+/// Keys of the empty lines' layout (one per line, by where it starts):
+/// apart from every line of text's.
+const BLANK_LEAF: u64 = 1 << 40;
+
 /// Edits closer together than this undo as one.
 const UNDO_GROUP_MS: u128 = 800;
 /// How far each level of a list is indented on the page.
@@ -284,6 +288,8 @@ pub struct LiveView {
     /// A block without text (an image, a diagram) picked by a click, by its
     /// start: Backspace or Delete removes it.
     picked: Option<usize>,
+    /// Where the picked block was pressed, for menus about it.
+    picked_at: Option<Point<Pixels>>,
     /// The pointer is over the link card: it stays.
     over_card: bool,
     /// The hover card closing, a moment after the pointer left the link (so
@@ -337,6 +343,7 @@ impl LiveView {
             over_card: false,
             raw: None,
             picked: None,
+            picked_at: None,
             closing: None,
             geometry: Rc::default(),
             undo: Vec::new(),
@@ -443,7 +450,7 @@ impl LiveView {
     /// A click on the block starting at `start` (an image).
     #[cfg(all(test, feature = "ui-tests"))]
     pub(crate) fn click_block_for_test(&mut self, start: usize, window: &mut Window, cx: &mut Context<Self>) {
-        self.click_other(start, window, cx);
+        self.click_other(start, None, window, cx);
     }
 
     #[cfg(all(test, feature = "ui-tests"))]
@@ -758,6 +765,16 @@ impl LiveView {
                 let p = g.position_for_index(local);
                 Some(point(p.x, p.y + g.line_height() + px(6.)))
             })
+            .or_else(|| self.picked.and(self.picked_at).map(|p| point(p.x, p.y + px(8.))))
+            .or_else(|| {
+                // A picked block reached by the keyboard: under the line
+                // before it.
+                let start = self.picked?;
+                let i = self.page.leaves.iter().rposition(|l| l.span.end <= start)?;
+                let geometry = self.geometry.borrow();
+                let g = geometry.get(&leaf_key(i))?;
+                Some(point(g.bounds().left(), g.bounds().bottom() + px(6.)))
+            })
             .unwrap_or(point(px(120.), px(120.)));
         let scope = actions::Scope { caret: self.caret, anchor: self.anchor, picked: self.picked };
         let state = cx.new(|cx| CommandState::new(window, cx));
@@ -943,7 +960,8 @@ impl LiveView {
 
     /// A click on a block typed into only through its own controls (a table,
     /// an image): editing stops.
-    fn click_other(&mut self, start: usize, window: &mut Window, cx: &mut Context<Self>) {
+    fn click_other(&mut self, start: usize, at: Option<Point<Pixels>>, window: &mut Window, cx: &mut Context<Self>) {
+        self.picked_at = at;
         if self.editor.read(cx).value().as_ref() != self.source.as_str() {
             self.refresh(cx);
         }
@@ -951,6 +969,54 @@ impl LiveView {
         self.caret = None;
         self.parked = None;
         self.picked = self.editor.read(cx).is_editable().then_some(start);
+        window.focus(&self.focus, cx);
+        cx.notify();
+    }
+
+    /// Backspace (or Delete) on a paragraph's only letter, the paragraph
+    /// on a line of its own after a blank line: it becomes an empty line
+    /// again, as it was before it was typed, not a blank line more.
+    fn empty_line_again(&mut self, forward: bool, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let (Some(caret), Some(Spot::Leaf(i))) = (self.caret, self.spot()) else { return false };
+        let leaf = &self.page.leaves[i];
+        let Kind::Text { block } = &leaf.kind else { return false };
+        let flow = &leaf.flow;
+        let at = flow.shown_for(caret);
+        let one = flow.text.chars().count() == 1;
+        let on_it = if forward { at == 0 } else { at == flow.text.len() };
+        if !one || !on_it || flow.heading.is_some() || block.start < 2 || !self.source[..block.start].ends_with("\n\n") {
+            return false;
+        }
+        let end = block.end.max(leaf.span.end);
+        let gone = block.start - 1..end;
+        self.edit(gone.clone(), "", window, cx);
+        self.caret = Some(gone.start);
+        cx.notify();
+        true
+    }
+
+    /// Whether the selection is drawn: while the page has the keys, and
+    /// while the ⌘/ menu (working on it) has them.
+    fn shows_selection(&self, focused: bool) -> bool {
+        focused || self.action_menu.is_some()
+    }
+
+    #[cfg(all(test, feature = "ui-tests"))]
+    pub(crate) fn selection_drawn_for_test(&self, window: &Window) -> bool {
+        self.selection().is_some() && self.shows_selection(self.focus.is_focused(window))
+    }
+
+    /// A press on an empty line: the caret there.
+    fn click_blank(&mut self, at: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if self.editor.read(cx).value().as_ref() != self.source.as_str() {
+            self.refresh(cx);
+            cx.notify();
+            return;
+        }
+        self.parked = None;
+        self.picked = None;
+        self.anchor = None;
+        self.caret = Some(at.min(self.source.len()));
         window.focus(&self.focus, cx);
         cx.notify();
     }
@@ -1376,6 +1442,7 @@ impl LiveView {
             && matches!(leaf.kind, Kind::Text { .. })
         {
             self.picked = Some(range.start);
+            self.picked_at = None;
             self.caret = None;
             self.anchor = None;
             cx.notify();
@@ -1417,6 +1484,22 @@ impl LiveView {
         if self.delete_selection(window, cx) {
             return;
         }
+        // The last letter of a paragraph of its own: back to an empty line.
+        if self.empty_line_again(false, window, cx) {
+            return;
+        }
+        // An empty line after another: just this line goes.
+        if let Some(Spot::Gap(at)) = self.spot()
+            && at >= 2
+            && self.source[..at].ends_with("\n\n")
+            && self.source[at..].starts_with('\n')
+            && quote_line(&self.source, at).is_none()
+        {
+            self.edit(at - 1..at, "", window, cx);
+            self.caret = Some(at - 1);
+            cx.notify();
+            return;
+        }
         let (Some(caret), Some(spot), Some(flow)) = (self.caret, self.spot(), self.active_flow()) else { return };
         let at = flow.shown_for(caret);
         // An empty block (a space or two at most) goes whole.
@@ -1436,6 +1519,9 @@ impl LiveView {
         if self.delete_selection(window, cx) {
             return;
         }
+        if self.empty_line_again(true, window, cx) {
+            return;
+        }
         if let Some(spot) = self.spot().filter(|s| self.spot_is_empty(*s)) {
             self.remove_empty_block(spot, true, window, cx);
             return;
@@ -1451,6 +1537,13 @@ impl LiveView {
     /// empty item, the list ends and a paragraph starts). Marks around the
     /// caret close before the break and reopen after.
     fn enter(&mut self, _: &Enter, window: &mut Window, cx: &mut Context<Self>) {
+        // An image (or other block) picked: a new empty line under it, the
+        // caret on it.
+        if let Some(range) = self.picked_range() {
+            self.picked = None;
+            self.edit(range.end..range.end, "\n", window, cx);
+            return;
+        }
         self.delete_selection(window, cx);
         if self.table_key("enter", window, cx) {
             return;
@@ -1496,6 +1589,22 @@ impl LiveView {
             let text = text.replacen("\n\n", &format!("\n{}", item.next_prefix), 1);
             self.edit(at..at, &text, window, cx);
             return;
+        }
+        // On an empty line: one more empty line.
+        if let Spot::Gap(at) = spot {
+            self.edit(at..at, "\n", window, cx);
+            return;
+        }
+        // At a paragraph's end: an empty line after it, to type on.
+        if let Spot::Leaf(i) = spot
+            && let Kind::Text { block } = &self.page.leaves[i].kind
+            && flow.shown_for(caret) >= flow.text.len()
+        {
+            let end = block.end.max(self.page.leaves[i].span.end);
+            if self.source[end..].is_empty() || self.source[end..].starts_with('\n') {
+                self.edit(end..end, "\n", window, cx);
+                return;
+            }
         }
         if flow.text.is_empty() {
             self.edit(caret..caret, "\n\n", window, cx);
@@ -1653,9 +1762,12 @@ impl LiveView {
             return;
         }
         let to = if edge {
-            self.neighbour(spot, forward).map(|l| {
-                let leaf = &self.page.leaves[l];
-                if forward { leaf.flow.source_for(0) } else { leaf.flow.source_for(leaf.flow.text.len()) }
+            self.next_stop(spot, forward).map(|stop| match stop {
+                Spot::Leaf(l) => {
+                    let leaf = &self.page.leaves[l];
+                    if forward { leaf.flow.source_for(0) } else { leaf.flow.source_for(leaf.flow.text.len()) }
+                }
+                Spot::Gap(at) => at,
             })
         } else {
             // A letter on (a whole emoji), or past a unit such as math.
@@ -1691,6 +1803,39 @@ impl LiveView {
         }
     }
 
+    /// Every empty line drawn on the page (each one a stop for the arrows).
+    fn empty_lines(&self) -> Vec<usize> {
+        let mut out = Vec::new();
+        let mut previous_end = 0;
+        for (b, (range, _)) in self.page.blocks.iter().enumerate() {
+            out.extend(blank_lines(&self.source, previous_end, range.start, b == 0));
+            previous_end = range.end;
+        }
+        if !self.page.blocks.is_empty() {
+            out.extend(blank_lines(&self.source, previous_end, self.source.len(), false));
+        }
+        out
+    }
+
+    /// Where an arrow past the edge of the caret's line goes: the next (or
+    /// previous) line of text, or an empty line on the way to it.
+    fn next_stop(&self, spot: Spot, forward: bool) -> Option<Spot> {
+        let (start, end) = match spot {
+            Spot::Leaf(i) => (self.page.leaves[i].span.start, self.page.leaves[i].span.end),
+            Spot::Gap(at) => (at, at),
+        };
+        let leaf = self.neighbour(spot, forward);
+        let empty = self.empty_lines().into_iter().filter(|&at| {
+            if forward {
+                at > end && leaf.is_none_or(|l| at < self.page.leaves[l].span.start)
+            } else {
+                at < start && leaf.is_none_or(|l| at > self.page.leaves[l].span.end)
+            }
+        });
+        let empty = if forward { empty.min() } else { empty.max() };
+        empty.map(Spot::Gap).or(leaf.map(Spot::Leaf))
+    }
+
     /// Up and down move a line within the text, and past its first or last
     /// line into the line above or below.
     fn vertical(&mut self, down: bool, cx: &mut Context<Self>) {
@@ -1712,10 +1857,17 @@ impl LiveView {
         if self.in_cell() {
             return;
         }
-        if let Some(l) = self.neighbour(spot, down) {
-            let flow = &self.page.leaves[l].flow;
-            self.caret = Some(flow.source_for(local.min(flow.text.len())));
-            cx.notify();
+        match self.next_stop(spot, down) {
+            Some(Spot::Leaf(l)) => {
+                let flow = &self.page.leaves[l].flow;
+                self.caret = Some(flow.source_for(local.min(flow.text.len())));
+                cx.notify();
+            }
+            Some(Spot::Gap(at)) => {
+                self.caret = Some(at);
+                cx.notify();
+            }
+            None => {}
         }
     }
 
@@ -2292,8 +2444,32 @@ impl LiveView {
     /// A line of text drawn from its flow, reporting its layout under `key`
     /// so clicks, the caret and the selection can find its letters.
     fn flow_node(flow: &Flow, key: u64) -> BlockNode {
+        Self::flow_node_selected(flow, key, None)
+    }
+
+    /// The same, with drawn text `selected` selected: its highlight (a
+    /// `<mark>` colour) drops out there, or it would hide the selection.
+    fn flow_node_selected(flow: &Flow, key: u64, selected: Option<&Range<usize>>) -> BlockNode {
+        let mut marks = Vec::new();
+        for (range, mark) in &flow.marks {
+            match selected.filter(|s| mark.highlight.is_some() && s.start < range.end && range.start < s.end) {
+                Some(s) => {
+                    let mut plain = mark.clone();
+                    plain.highlight = None;
+                    if range.start < s.start {
+                        marks.push((range.start..s.start, mark.clone()));
+                    }
+                    marks.push((range.start.max(s.start)..range.end.min(s.end), plain));
+                    if s.end < range.end {
+                        marks.push((s.end..range.end, mark.clone()));
+                    }
+                }
+                None => marks.push((range.clone(), mark.clone())),
+            }
+        }
+        marks.retain(|(r, m)| !r.is_empty() && *m != gpui_kit::base::text::editor_host::TextMark::default());
         let mut paragraph = Paragraph::default();
-        paragraph.push(InlineNode::new(flow.text.clone()).marks(flow.marks.clone()));
+        paragraph.push(InlineNode::new(flow.text.clone()).marks(marks));
         let paragraph = paragraph.with_leaf_key(key);
         match flow.heading {
             Some(level) => BlockNode::Heading { level, children: paragraph, span: None },
@@ -2305,7 +2481,9 @@ impl LiveView {
 impl Render for LiveView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let focused = self.focus.is_focused(window);
-        if self.was_focused && !focused {
+        // The ⌘/ menu's search took the keys: the caret and selection stay,
+        // drawn, so it shows what the menu works on.
+        if self.was_focused && !focused && self.action_menu.is_none() {
             if self.raw.is_some() {
                 self.leave_raw(cx);
             }
@@ -2358,10 +2536,12 @@ impl Render for LiveView {
         let count = self.page.blocks.len();
         let mut rows: Vec<AnyElement> = Vec::new();
         let mut gap_placed = false;
+        // What's selected, line by line (drawn ranges).
+        let selected: HashMap<usize, Range<usize>> = self.selected_parts().into_iter().filter(|(_, r)| !r.is_empty()).collect();
         // A line of text: pressed, the caret goes there (and a drag selects).
         let line = |leaf: usize, first: bool, last: bool, rows_window: &mut Window, cx: &mut App| {
             let flow = &self.page.leaves[leaf].flow;
-            let node = Self::flow_node(flow, leaf_key(leaf));
+            let node = Self::flow_node_selected(flow, leaf_key(leaf), selected.get(&leaf));
             let position = FlowPosition::at(&[&node], 0, last).first(first);
             let element = node.render_with_id(("live-line", leaf), position, &render_context, rows_window, cx);
             let weak = weak.clone();
@@ -2381,7 +2561,37 @@ impl Render for LiveView {
             let position = FlowPosition::at(&[&node], 0, false).first(first);
             node.render_with_id(("live-new", at), position, &render_context, rows_window, cx)
         };
-        for (b, (range, shape)) in self.page.blocks.clone().into_iter().enumerate() {
+        // Blank lines past the one between two blocks: empty lines, each one
+        // there to click into and type on.
+        // Drawn just as the line the caret types on (`gap`), so nothing
+        // moves when the caret comes or goes.
+        let blank = |at: usize, first: bool, rows_window: &mut Window, cx: &mut App| {
+            let node = Self::flow_node(&Flow::empty(at), BLANK_LEAF + at as u64);
+            let position = FlowPosition::at(&[&node], 0, false).first(first);
+            let element = node.render_with_id(("live-blank", at), position, &render_context, rows_window, cx);
+            let weak = weak.clone();
+            div()
+                .id(("live-blank-row", at))
+                .w_full()
+                .cursor_text()
+                .on_mouse_down(MouseButton::Left, move |_, window, cx| {
+                    let _ = weak.update(cx, |view, cx| view.click_blank(at, window, cx));
+                })
+                .child(element)
+                .into_any_element()
+        };
+        let mut previous_end = 0;
+        let blocks = self.page.blocks.clone();
+        for (b, (range, shape)) in blocks.clone().into_iter().enumerate() {
+            for at in blank_lines(&self.source, previous_end, range.start, b == 0) {
+                if spot == Some(Spot::Gap(at)) && !gap_placed {
+                    rows.push(gap(at, rows.is_empty(), window, cx));
+                    gap_placed = true;
+                } else {
+                    rows.push(blank(at, rows.is_empty(), window, cx));
+                }
+            }
+            previous_end = range.end;
             // A new paragraph being written between blocks.
             if let Some(Spot::Gap(at)) = spot
                 && !gap_placed
@@ -2501,7 +2711,7 @@ impl Render for LiveView {
                     list.into_any_element()
                 }
                 Shape::Quote(leaves) => {
-                    let children = leaves.iter().map(|i| Self::flow_node(&self.page.leaves[*i].flow, leaf_key(*i))).collect();
+                    let children = leaves.iter().map(|i| Self::flow_node_selected(&self.page.leaves[*i].flow, leaf_key(*i), selected.get(i))).collect();
                     let node = BlockNode::Blockquote { children, span: None };
                     let position = FlowPosition::at(&[&node], 0, last).first(first);
                     let element = node.render_with_id(("live-quote", range.start), position, &render_context, window, cx);
@@ -2555,7 +2765,7 @@ impl Render for LiveView {
                                 line = line.child(cell);
                                 continue;
                             };
-                            let node = Self::flow_node(&self.page.leaves[leaf].flow, leaf_key(leaf));
+                            let node = Self::flow_node_selected(&self.page.leaves[leaf].flow, leaf_key(leaf), selected.get(&leaf));
                             let position = FlowPosition::at(&[&node], 0, true).first(true);
                             let text = node.render_with_id(("live-cell-text", leaf), position, &render_context, window, cx);
                             let weak = weak.clone();
@@ -2713,8 +2923,9 @@ impl Render for LiveView {
                         .id(("live-block", range.start))
                         .w_full()
                         .relative()
-                        .on_click(move |_, window, cx| {
-                            let _ = weak.update(cx, |view, cx| view.click_other(start, window, cx));
+                        .on_click(move |event, window, cx| {
+                            let at = event.position();
+                            let _ = weak.update(cx, |view, cx| view.click_other(start, Some(at), window, cx));
                         })
                         .when(picked, |block| {
                             block.child(div().absolute().top(px(-3.)).bottom(px(-3.)).left(px(-3.)).right(px(-3.)).rounded_md().border_2().border_color(ring))
@@ -2736,6 +2947,16 @@ impl Render for LiveView {
                 }
             };
             rows.push(element);
+        }
+        if !blocks.is_empty() {
+            for at in blank_lines(&self.source, previous_end, self.source.len(), false) {
+                if spot == Some(Spot::Gap(at)) && !gap_placed {
+                    rows.push(gap(at, rows.is_empty(), window, cx));
+                    gap_placed = true;
+                } else {
+                    rows.push(blank(at, rows.is_empty(), window, cx));
+                }
+            }
         }
         // A new paragraph after the last block (or in an empty note).
         if let Some(Spot::Gap(at)) = spot
@@ -3256,10 +3477,10 @@ impl Render for LiveView {
                 if this.copy(false, cx) { this.delete_selection(w, cx); } else { cx.propagate(); }
             }))
             .on_action(cx.listener(|this, _: &Paste, w, cx| this.paste(w, cx)))
-            .on_action(cx.listener(|this, _: &Bold, w, cx| this.toggle_mark(Wrap::Strong, w, cx)))
-            .on_action(cx.listener(|this, _: &Italic, w, cx| this.toggle_mark(Wrap::Emphasis, w, cx)))
-            .on_action(cx.listener(|this, _: &Strike, w, cx| this.toggle_mark(Wrap::Delete, w, cx)))
-            .on_action(cx.listener(|this, _: &InlineCode, w, cx| this.toggle_mark(Wrap::Code, w, cx)))
+            .on_action(cx.listener(|this, _: &Bold, w, cx| this.toggle_format(Wrap::Strong, w, cx)))
+            .on_action(cx.listener(|this, _: &Italic, w, cx| this.toggle_format(Wrap::Emphasis, w, cx)))
+            .on_action(cx.listener(|this, _: &Strike, w, cx| this.toggle_format(Wrap::Delete, w, cx)))
+            .on_action(cx.listener(|this, _: &InlineCode, w, cx| this.toggle_format(Wrap::Code, w, cx)))
             .on_action(cx.listener(|this, _: &EditLink, w, cx| this.edit_link(w, cx)))
             .on_action(cx.listener(|this, _: &Heading1, w, cx| this.set_heading(1, w, cx)))
             .on_action(cx.listener(|this, _: &Heading2, w, cx| this.set_heading(2, w, cx)))
@@ -3315,7 +3536,7 @@ impl Render for LiveView {
             )));
         // The selection, painted behind each line it covers.
         let mut decorations: HashMap<u64, Vec<(Range<usize>, Hsla)>> = HashMap::new();
-        if let Some(selection) = self.selection().filter(|_| focused) {
+        if let Some(selection) = self.selection().filter(|_| self.shows_selection(focused)) {
             let color = cx.theme().selection;
             for (i, leaf) in self.page.leaves.iter().enumerate() {
                 let (start, end) = (selection.start.max(leaf.span.start), selection.end.min(leaf.span.end));
@@ -3383,6 +3604,7 @@ impl EntityInputHandler for LiveView {
         } else {
             text
         };
+        let typed = range.is_none();
         let target = match range {
             Some(r) => {
                 let (Some(start), Some(end)) = (
@@ -3395,6 +3617,39 @@ impl EntityInputHandler for LiveView {
             }
             None => caret..caret,
         };
+        // On an empty line: a paragraph of its own, apart from the blocks
+        // around it.
+        if typed
+            && let Some(Spot::Gap(at)) = self.spot()
+            && quote_line(&self.source, at).is_none()
+        {
+            let before = &self.source[..at];
+            let after = &self.source[at..];
+            // Empty lines above stay empty lines: past them, the one blank
+            // line Markdown needs (none at the very top).
+            let top = self.page.blocks.first().is_none_or(|(r, _)| at < r.start);
+            let from = self.page.blocks.iter().rev().find(|(r, _)| r.end <= at).map_or(0, |(r, _)| r.end);
+            let to = self.page.blocks.iter().find(|(r, _)| r.start > at).map_or(self.source.len(), |(r, _)| r.start);
+            let rows_above = blank_lines(&self.source, from, to, top).into_iter().filter(|r| *r < at).count();
+            let blank_above = before.len() - before.trim_end_matches('\n').len();
+            let blank_above = blank_above.saturating_sub(1);
+            let need = if top { rows_above } else { rows_above + 1 };
+            let prefix = if self.page.in_block(at) {
+                // A blank line inside a block (a list just left): apart from
+                // what's above, no more.
+                if before.ends_with("\n\n") { String::new() } else if before.ends_with('\n') { "\n".into() } else { "\n\n".into() }
+            } else if !before.ends_with('\n') && at > 0 {
+                "\n".repeat(need + 1)
+            } else {
+                "\n".repeat(need.saturating_sub(blank_above))
+            };
+            let prefix = prefix.as_str();
+            let suffix = if after.is_empty() || after.starts_with("\n\n") { "" } else if after.starts_with('\n') { "\n" } else { "\n\n" };
+            self.edit(at..at, &format!("{prefix}{text}{suffix}"), window, cx);
+            self.caret = Some(at + prefix.len() + text.len());
+            cx.notify();
+            return;
+        }
         self.edit(target, text, window, cx);
     }
 
@@ -3453,6 +3708,28 @@ fn urlencoding_decode(text: &str) -> String {
         i += 1;
     }
     String::from_utf8(out).unwrap_or_else(|_| text.to_string())
+}
+
+/// The empty lines drawn between `from` (a block's end) and `to` (the next
+/// block's start, or the note's end): where each starts. Between two
+/// blocks one blank line is the gap Markdown needs, so it isn't one of
+/// them; at the very top every blank line is.
+fn blank_lines(source: &str, from: usize, to: usize, top: bool) -> Vec<usize> {
+    let mut starts: Vec<usize> = Vec::new();
+    if top && from == 0 && to > 0 {
+        starts.push(0);
+    }
+    for (i, c) in source[from..to].char_indices() {
+        if c == '\n' && from + i + 1 < to {
+            starts.push(from + i + 1);
+        }
+    }
+    // Only blank lines count (a block's own last line can end in spaces).
+    starts.retain(|&at| source[at..].split('\n').next().is_some_and(|line| line.trim().is_empty()));
+    if !top {
+        starts.pop();
+    }
+    starts
 }
 
 fn on_blank_line(text: &str, at: usize) -> bool {
