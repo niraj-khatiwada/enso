@@ -508,6 +508,8 @@ mod ui_tests {
             gpui_kit::init(cx);
             settings::init(cx);
             cx.update_global::<settings::Preferences, _>(|p, _| {
+                // The classic reader, whose layout this measures.
+                p.live_preview = false;
                 p.reading = ReadingStyle::default();
                 p.reading_path = Some(path.clone());
             });

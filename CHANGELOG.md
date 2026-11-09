@@ -1,5 +1,19 @@
 # Changelog
 
+### 1.3.0
+
+Features:
+
+- **Live Preview**: Edit right on the page, as in Notion: the Markdown is never shown. On by default (Settings › Editor › Live Preview); off, Edit, Read and Split are as before. The note stays plain Markdown underneath: each keystroke changes only the text you're editing, so everything else keeps its exact bytes, and undo, saving and sync work on the file itself.
+  - Paragraphs and headings with bold, italic, strikethrough, inline code, links and wiki links, edited as drawn; `# ` and `- [ ] ` typed at a line's start become a heading and a checkbox.
+  - Bullet, numbered and checkbox lists: Enter for the next item, Enter on an empty one to leave the list, Tab and Shift + Tab to indent, and checkboxes that tick.
+  - Quotes, code blocks with highlighting, and tables, each cell edited in place: Tab and Enter move between cells and add rows.
+  - Selection by drag, Shift, double and triple click; Cmd/Ctrl + A selects the line, then the page. Copy gives plain text (Cmd/Ctrl + Shift + C the Markdown); a copy pasted back keeps its formatting.
+  - The editing keys of the system (word and line moves and deletes) and the editor's formatting keys: bold, italic, strikethrough, inline code (Cmd/Ctrl + E), links, headings, lists, checkboxes, quote and code block.
+  - Links open on click; resting the pointer on one, or Cmd/Ctrl + K, shows a card to edit its text and address.
+  - Backspace or Delete in an empty block removes it; the slash menu works on an empty line.
+- The outline's section previews read as text in Live Preview, without Markdown.
+
 ### 1.2.0
 
 Features:

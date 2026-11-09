@@ -12,6 +12,7 @@ mod files;
 mod find;
 mod focus;
 mod http;
+mod live;
 mod lock;
 mod links;
 mod wiki;
@@ -149,6 +150,8 @@ struct Document {
     dirty: bool,
     editor_loaded: bool,
     large_reader: Option<Entity<reader::LargeReader>>,
+    /// Live Preview's editable page, for ordinary Markdown notes.
+    live: Option<Entity<live::LiveView>>,
     stats: String,
     _stats_task: Option<Task<()>>,
     spellcheck: Option<Entity<spellcheck::Spellcheck>>,
@@ -755,10 +758,18 @@ impl Enso {
         }
     }
 
+    /// Live Preview shows one view, the editable page: no Edit or Split.
+    fn live_view(&self, cx: &App) -> bool {
+        settings::live_preview(cx) && self.active.is_some_and(|i| self.documents[i].live.is_some())
+    }
+
     fn set_mode(&mut self, mode: Mode, window: &mut Window, cx: &mut Context<Self>) {
         let Some(index) = self.active else {
             return;
         };
+        if self.live_view(cx) && mode != Mode::Read {
+            return;
+        }
         // Focus Mode is one page: Read or Edit, never Split.
         if self.focus_mode && mode == Mode::Split {
             return;
@@ -1316,6 +1327,13 @@ impl Enso {
             }
         });
         let spellcheck = markdown.then(|| cx.new(|cx| spellcheck::Spellcheck::new(&editor, source.len(), cx)));
+        // Live Preview's page, for ordinary Markdown notes.
+        let live = (markdown && large_reader.is_none()).then(|| {
+            let owner = cx.entity().downgrade();
+            let base = path.as_ref().and_then(|p| p.parent()).map(PathBuf::from);
+            let editor = editor.clone();
+            cx.new(|cx| live::LiveView::new(editor, owner, base, cx))
+        });
         self.documents.push(Document {
             path,
             saved: source,
@@ -1337,6 +1355,7 @@ impl Enso {
             missing: false,
             locked: false,
             pinned: false,
+            live,
             editor,
             preview,
             preview_loaded: false,
@@ -3049,7 +3068,8 @@ impl Render for Enso {
             }
         }
         let markdown = self.active.is_none_or(|i| self.documents[i].markdown);
-        let mode = if markdown { self.mode } else { Mode::Edit };
+        let live_view = self.live_view(cx);
+        let mode = if live_view { Mode::Read } else if markdown { self.mode } else { Mode::Edit };
         let active_doc = self.active.map(|i| self.documents[i].editor.entity_id());
         if active_doc != self.warmed_doc {
             self.warmed_doc = active_doc;
@@ -4028,7 +4048,19 @@ impl Render for Enso {
                 );
             }
             if mode != Mode::Edit {
-                if let Some(reader) = &document.large_reader {
+                if let Some(live) = document.live.as_ref().filter(|_| settings::live_preview(cx)) {
+                    // Live Preview: the page, edited where it stands.
+                    reading_pane = Some(
+                        div()
+                            .id(("preview-pane", document.editor.entity_id()))
+                            .overflow_hidden()
+                            .flex_1()
+                            .min_w_0()
+                            .h_full()
+                            .child(live.clone())
+                            .into_any_element(),
+                    );
+                } else if let Some(reader) = &document.large_reader {
                     let owner = cx.entity().downgrade();
                     reader.update(cx, |reader, _| reader.set_controls(owner, document.editor.entity_id()));
                     reading_pane = Some(
@@ -4217,6 +4249,8 @@ impl Render for Enso {
                         (Mode::Split, "Split", IconName::Columns2),
                     ]
                     .into_iter()
+                    // Live Preview has the one view.
+                    .filter(|_| !live_view)
                     .enumerate()
                     .map(|(i, (value, label, icon))| {
                         ui::icon_button(("mode", i), icon, label)
@@ -4999,6 +5033,7 @@ fn main() {
             workspaces::init(cx);
             session::init(cx);
             lock::init(cx);
+            live::init(cx);
             cx.on_action(|_: &OpenSettings, cx| settings::open(cx));
             cx.bind_keys([
                 KeyBinding::new(if cfg!(target_os = "macos") { "cmd-," } else { "ctrl-," }, OpenSettings, None),
@@ -5848,6 +5883,646 @@ mod transition_tests {
         cx.simulate_keystrokes(handle, paste);
         draw(cx, handle);
         assert!(text(cx).starts_with("Skim the [guide]"));
+    }
+
+    #[gpui_kit::test]
+    fn live_preview_edits_the_page_and_keeps_other_blocks_exact(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            bind_view_keys(cx);
+            crate::live::init(cx);
+            crate::settings::init(cx);
+            gpui_kit::BorrowAppContext::update_global::<crate::settings::Preferences, _>(cx, |p, _| p.live_preview = true);
+        });
+        let source = "# Plan\n\nPack the  umbrella.\n\n<mark color=\"blue\">kept</mark>  exactly\n";
+        let (handle, view) = cx.update(|cx| gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+            cx.new(|cx| {
+                let mut app = Enso::new(window, cx);
+                app.add_document(Some(PathBuf::from("live.md")), source.into(), None, window, cx);
+                app.mode = Mode::Read;
+                app
+            })
+        }).unwrap());
+        for _ in 0..3 { draw(cx, handle); cx.run_until_parked(); }
+        let (live, editor) = cx.update(|cx| {
+            let doc = &view.read(cx).documents[0];
+            (doc.live.clone().unwrap(), doc.editor.clone())
+        });
+        let text = |cx: &mut TestAppContext| cx.update(|cx| editor.read(cx).value().to_string());
+        // Into the paragraph, after "Pack the ": type a word.
+        let at = source.find("umbrella").unwrap() - 1;
+        cx.update_window(handle, |_, window, cx| {
+            let focus = live.read(cx).focus.clone();
+            window.focus(&focus, cx);
+            live.update(cx, |live, _| live.set_caret_for_test(at));
+        }).unwrap();
+        draw(cx, handle);
+        cx.simulate_input(handle, "blue");
+        draw(cx, handle);
+        assert_eq!(text(cx), source.replace("the  umbrella", "the blue umbrella"));
+        // The block written elsewhere is untouched, spacing and all.
+        assert!(text(cx).contains("<mark color=\"blue\">kept</mark>  exactly"));
+        // Enter starts a new paragraph; typing fills it.
+        cx.simulate_keystrokes(handle, "end enter");
+        cx.simulate_input(handle, "Then go.");
+        draw(cx, handle);
+        assert!(text(cx).contains("the blue umbrella.\n\nThen go.\n\n<mark"), "{}", text(cx));
+        // Backspace at its start joins it back.
+        cx.simulate_keystrokes(handle, "home backspace");
+        draw(cx, handle);
+        assert!(text(cx).contains("the blue umbrella.Then go.\n\n<mark"), "{}", text(cx));
+        // Undo: edits made in a quick run undo together; redo brings them back.
+        let edited = text(cx);
+        let primary = if cfg!(target_os = "macos") { "cmd" } else { "ctrl" };
+        cx.simulate_keystrokes(handle, &format!("{primary}-z"));
+        draw(cx, handle);
+        assert_eq!(text(cx), source);
+        cx.simulate_keystrokes(handle, &format!("{primary}-shift-z"));
+        draw(cx, handle);
+        assert_eq!(text(cx), edited);
+        // Focus elsewhere (the sidebar, say): the block shows rendered again.
+        assert!(cx.update(|cx| live.read(cx).caret_in_active().is_some()));
+        cx.update_window(handle, |_, window, cx| view.update(cx, |app, cx| app.focus.focus(window, cx))).unwrap();
+        for _ in 0..2 { cx.run_until_parked(); draw(cx, handle); }
+        assert!(cx.update(|cx| live.read(cx).caret_in_active().is_none()));
+    }
+
+    #[gpui_kit::test]
+    fn live_preview_edits_formatted_text_as_drawn(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            bind_view_keys(cx);
+            crate::live::init(cx);
+            crate::settings::init(cx);
+            gpui_kit::BorrowAppContext::update_global::<crate::settings::Preferences, _>(cx, |p, _| p.live_preview = true);
+        });
+        let source = "# Title\n\nSome __bold__ words.\n";
+        let (handle, view) = cx.update(|cx| gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+            cx.new(|cx| {
+                let mut app = Enso::new(window, cx);
+                app.add_document(Some(PathBuf::from("wysiwyg.md")), source.into(), None, window, cx);
+                app
+            })
+        }).unwrap());
+        for _ in 0..3 { draw(cx, handle); cx.run_until_parked(); }
+        let (live, editor) = cx.update(|cx| {
+            let doc = &view.read(cx).documents[0];
+            (doc.live.clone().unwrap(), doc.editor.clone())
+        });
+        let text = |cx: &mut TestAppContext| cx.update(|cx| editor.read(cx).value().to_string());
+        let caret_at = |cx: &mut TestAppContext, at: usize| {
+            cx.update_window(handle, |_, window, cx| {
+                let focus = live.read(cx).focus.clone();
+                window.focus(&focus, cx);
+                live.update(cx, |live, _| live.set_caret_for_test(at));
+            }).unwrap();
+            draw(cx, handle);
+        };
+        // Inside the bold (after "bo"): what's typed is bold, and `__` stays `__`.
+        caret_at(cx, source.find("ld__").unwrap());
+        cx.simulate_input(handle, "X");
+        draw(cx, handle);
+        assert_eq!(text(cx), "# Title\n\nSome __boXld__ words.\n");
+        // Enter there: the bold closes before the break and reopens after it.
+        cx.simulate_keystrokes(handle, "enter");
+        draw(cx, handle);
+        assert_eq!(text(cx), "# Title\n\nSome __boX__\n\n__ld__ words.\n");
+        // Backspace at a heading's start makes it a paragraph.
+        caret_at(cx, 2);
+        cx.simulate_keystrokes(handle, "home backspace");
+        draw(cx, handle);
+        assert!(text(cx).starts_with("Title\n\nSome"), "{}", text(cx));
+        // A new paragraph typed as `## ` becomes a heading.
+        let end = text(cx).len();
+        caret_at(cx, end);
+        cx.simulate_input(handle, "## Next");
+        draw(cx, handle);
+        assert!(text(cx).ends_with("words.\n## Next") || text(cx).ends_with("words.\n\n## Next"), "{:?}", text(cx));
+    }
+
+    #[gpui_kit::test]
+    fn live_preview_lists_edit_like_a_document(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            bind_view_keys(cx);
+            crate::live::init(cx);
+            crate::settings::init(cx);
+            gpui_kit::BorrowAppContext::update_global::<crate::settings::Preferences, _>(cx, |p, _| p.live_preview = true);
+        });
+        let source = "Packing:\n\n- [ ] bags\n- [x] tickets\n";
+        let (handle, view) = cx.update(|cx| gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+            cx.new(|cx| {
+                let mut app = Enso::new(window, cx);
+                app.add_document(Some(PathBuf::from("list.md")), source.into(), None, window, cx);
+                app
+            })
+        }).unwrap());
+        for _ in 0..3 { draw(cx, handle); cx.run_until_parked(); }
+        let (live, editor) = cx.update(|cx| {
+            let doc = &view.read(cx).documents[0];
+            (doc.live.clone().unwrap(), doc.editor.clone())
+        });
+        let text = |cx: &mut TestAppContext| cx.update(|cx| editor.read(cx).value().to_string());
+        // Type at the end of "bags", then Enter: a new, unticked item.
+        let at = source.find("bags").unwrap() + 4;
+        cx.update_window(handle, |_, window, cx| {
+            let focus = live.read(cx).focus.clone();
+            window.focus(&focus, cx);
+            live.update(cx, |live, _| live.set_caret_for_test(at));
+        }).unwrap();
+        draw(cx, handle);
+        cx.simulate_input(handle, " and coat");
+        cx.simulate_keystrokes(handle, "enter");
+        cx.simulate_input(handle, "map");
+        draw(cx, handle);
+        assert_eq!(text(cx), "Packing:\n\n- [ ] bags and coat\n- [ ] map\n- [x] tickets\n");
+        // Tab nests it under the item above; Shift+Tab brings it back.
+        cx.simulate_keystrokes(handle, "tab");
+        draw(cx, handle);
+        assert!(text(cx).contains("coat\n  - [ ] map\n"), "{}", text(cx));
+        cx.simulate_keystrokes(handle, "shift-tab");
+        draw(cx, handle);
+        assert!(text(cx).contains("coat\n- [ ] map\n"), "{}", text(cx));
+        // The checkbox ticks the item, the caret stays in the text.
+        let _ = handle.update(cx, |_, window, cx| live.update(cx, |live, cx| live.toggle_task_for_test(2, window, cx)));
+        draw(cx, handle);
+        assert!(text(cx).contains("- [x] map\n"), "{}", text(cx));
+        // Backspace at its start joins it to the item above.
+        cx.simulate_keystrokes(handle, "home backspace");
+        draw(cx, handle);
+        assert!(text(cx).contains("- [ ] bags and coatmap\n- [x] tickets"), "{}", text(cx));
+        // Enter on a new, empty item ends the list: a paragraph follows.
+        cx.simulate_keystrokes(handle, "end enter enter");
+        cx.simulate_input(handle, "Done.");
+        draw(cx, handle);
+        assert!(text(cx).contains("coatmap\n\nDone.\n- [x] tickets") || text(cx).contains("coatmap\n\nDone."), "{}", text(cx));
+    }
+
+    #[gpui_kit::test]
+    fn live_preview_word_and_line_keys_and_trailing_spaces(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            bind_view_keys(cx);
+            crate::live::init(cx);
+            crate::settings::init(cx);
+            gpui_kit::BorrowAppContext::update_global::<crate::settings::Preferences, _>(cx, |p, _| p.live_preview = true);
+        });
+        let source = "Pack the **blue** umbrella\n";
+        let (handle, view) = cx.update(|cx| gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+            cx.new(|cx| {
+                let mut app = Enso::new(window, cx);
+                app.add_document(Some(PathBuf::from("keys.md")), source.into(), None, window, cx);
+                app
+            })
+        }).unwrap());
+        for _ in 0..3 { draw(cx, handle); cx.run_until_parked(); }
+        let (live, editor) = cx.update(|cx| {
+            let doc = &view.read(cx).documents[0];
+            (doc.live.clone().unwrap(), doc.editor.clone())
+        });
+        let text = |cx: &mut TestAppContext| cx.update(|cx| editor.read(cx).value().to_string());
+        let caret = |cx: &mut TestAppContext| cx.update(|cx| live.read(cx).caret_in_active());
+        cx.update_window(handle, |_, window, cx| {
+            let focus = live.read(cx).focus.clone();
+            window.focus(&focus, cx);
+            live.update(cx, |live, _| live.set_caret_for_test("Pack the **blue** umbrella".len()));
+        }).unwrap();
+        draw(cx, handle);
+        let (word, line, word_left) = if cfg!(target_os = "macos") {
+            ("alt-backspace", "cmd-backspace", "alt-left")
+        } else {
+            ("ctrl-backspace", "ctrl-backspace", "ctrl-left")
+        };
+        // A space at the end shows: the caret moves past it.
+        cx.simulate_input(handle, " ");
+        draw(cx, handle);
+        assert_eq!(caret(cx), Some("Pack the blue umbrella ".len()));
+        // Word back: "umbrella " goes; again: the bold word goes with its `**`.
+        cx.simulate_keystrokes(handle, word);
+        draw(cx, handle);
+        assert_eq!(text(cx), "Pack the **blue** \n");
+        cx.simulate_keystrokes(handle, word);
+        draw(cx, handle);
+        assert_eq!(text(cx), "Pack the \n");
+        // Word left lands at the word's start.
+        cx.simulate_keystrokes(handle, word_left);
+        assert_eq!(caret(cx), Some("Pack ".len()));
+        if cfg!(target_os = "macos") {
+            // ⌘⌫ deletes back to the line's start.
+            cx.simulate_keystrokes(handle, "alt-right alt-right");
+            draw(cx, handle);
+            cx.simulate_keystrokes(handle, line);
+            draw(cx, handle);
+            assert_eq!(text(cx).trim_end(), "");
+        }
+    }
+
+    #[gpui_kit::test]
+    fn live_preview_slash_opens_the_insert_menu_in_place(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            bind_view_keys(cx);
+            super::bind_markdown_keys(cx);
+            crate::live::init(cx);
+            crate::settings::init(cx);
+            gpui_kit::BorrowAppContext::update_global::<crate::settings::Preferences, _>(cx, |p, _| p.live_preview = true);
+        });
+        let source = "Shopping\n\n";
+        let (handle, view) = cx.update(|cx| gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+            cx.new(|cx| {
+                let mut app = Enso::new(window, cx);
+                app.add_document(Some(PathBuf::from("slash.md")), source.into(), None, window, cx);
+                app
+            })
+        }).unwrap());
+        for _ in 0..3 { draw(cx, handle); cx.run_until_parked(); }
+        let (live, editor) = cx.update(|cx| {
+            let doc = &view.read(cx).documents[0];
+            (doc.live.clone().unwrap(), doc.editor.clone())
+        });
+        let text = |cx: &mut TestAppContext| cx.update(|cx| editor.read(cx).value().to_string());
+        // An empty line after the paragraph.
+        cx.update_window(handle, |_, window, cx| {
+            let focus = live.read(cx).focus.clone();
+            window.focus(&focus, cx);
+            live.update(cx, |live, _| live.set_caret_for_test(source.len()));
+        }).unwrap();
+        draw(cx, handle);
+        cx.simulate_input(handle, "/");
+        draw(cx, handle);
+        assert!(cx.update(|cx| view.read(cx).palette.is_some()));
+        cx.simulate_input(handle, "checkbox");
+        draw(cx, handle);
+        cx.simulate_keystrokes(handle, "enter");
+        for _ in 0..3 { draw(cx, handle); cx.run_until_parked(); }
+        assert!(cx.update(|cx| view.read(cx).palette.is_none()));
+        assert!(text(cx).contains("- [ ] "), "{:?}", text(cx));
+        // Typing goes on in the new checkbox.
+        cx.simulate_input(handle, "milk");
+        draw(cx, handle);
+        assert!(text(cx).contains("- [ ] milk"), "{:?}", text(cx));
+    }
+
+    #[gpui_kit::test]
+    fn live_preview_selects_types_over_copies_and_pastes(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            bind_view_keys(cx);
+            crate::live::init(cx);
+            crate::settings::init(cx);
+            gpui_kit::BorrowAppContext::update_global::<crate::settings::Preferences, _>(cx, |p, _| p.live_preview = true);
+        });
+        let source = "First line here\n\nSecond **bold** line\n";
+        let (handle, view) = cx.update(|cx| gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+            cx.new(|cx| {
+                let mut app = Enso::new(window, cx);
+                app.add_document(Some(PathBuf::from("select.md")), source.into(), None, window, cx);
+                app
+            })
+        }).unwrap());
+        for _ in 0..3 { draw(cx, handle); cx.run_until_parked(); }
+        let (live, editor) = cx.update(|cx| {
+            let doc = &view.read(cx).documents[0];
+            (doc.live.clone().unwrap(), doc.editor.clone())
+        });
+        let text = |cx: &mut TestAppContext| cx.update(|cx| editor.read(cx).value().to_string());
+        let mac = cfg!(target_os = "macos");
+        cx.update_window(handle, |_, window, cx| {
+            let focus = live.read(cx).focus.clone();
+            window.focus(&focus, cx);
+            live.update(cx, |live, _| live.set_caret_for_test("First line here".len()));
+        }).unwrap();
+        draw(cx, handle);
+        // Shift+← four times selects "here"; typing replaces it.
+        cx.simulate_keystrokes(handle, "shift-left shift-left shift-left shift-left");
+        assert!(cx.update(|cx| live.read(cx).has_selection()));
+        cx.simulate_input(handle, "now");
+        draw(cx, handle);
+        assert_eq!(text(cx), "First line now\n\nSecond **bold** line\n");
+        // A selection across both lines joins them when deleted.
+        cx.simulate_keystrokes(handle, "shift-down");
+        draw(cx, handle);
+        cx.simulate_keystrokes(handle, "backspace");
+        draw(cx, handle);
+        assert!(text(cx).starts_with("First line now") && !text(cx).contains("\n\nSecond"), "{:?}", text(cx));
+        // ⌘A selects the line first; again, the whole page. Then copy: the
+        // Markdown goes to the clipboard.
+        cx.simulate_keystrokes(handle, if mac { "cmd-a cmd-c" } else { "ctrl-a ctrl-c" });
+        let line = cx.update(|cx| cx.read_from_clipboard().and_then(|i| i.text())).unwrap_or_default();
+        assert_eq!(line, text(cx).lines().next().unwrap_or_default());
+        cx.simulate_keystrokes(handle, if mac { "cmd-a cmd-c" } else { "ctrl-a ctrl-c" });
+        let copied = cx.update(|cx| cx.read_from_clipboard().and_then(|i| i.text())).unwrap_or_default();
+        assert_eq!(copied, text(cx).trim_end());
+        // Cut it all, then paste it back.
+        cx.simulate_keystrokes(handle, if mac { "cmd-x" } else { "ctrl-x" });
+        draw(cx, handle);
+        assert_eq!(text(cx).trim(), "");
+        cx.simulate_keystrokes(handle, if mac { "cmd-v" } else { "ctrl-v" });
+        draw(cx, handle);
+        assert_eq!(text(cx).trim_end(), copied);
+    }
+
+    #[gpui_kit::test]
+    fn live_preview_edits_quotes_and_code_in_place(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            bind_view_keys(cx);
+            crate::live::init(cx);
+            crate::settings::init(cx);
+            gpui_kit::BorrowAppContext::update_global::<crate::settings::Preferences, _>(cx, |p, _| p.live_preview = true);
+        });
+        let source = "> Quote one\n\n```rust\nlet a = 1;\n```";
+        let (handle, view) = cx.update(|cx| gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+            cx.new(|cx| {
+                let mut app = Enso::new(window, cx);
+                app.add_document(Some(PathBuf::from("blocks.md")), source.into(), None, window, cx);
+                app
+            })
+        }).unwrap());
+        for _ in 0..3 { draw(cx, handle); cx.run_until_parked(); }
+        let (live, editor) = cx.update(|cx| {
+            let doc = &view.read(cx).documents[0];
+            (doc.live.clone().unwrap(), doc.editor.clone())
+        });
+        let text = |cx: &mut TestAppContext| cx.update(|cx| editor.read(cx).value().to_string());
+        let caret_at = |cx: &mut TestAppContext, at: usize| {
+            cx.update_window(handle, |_, window, cx| {
+                let focus = live.read(cx).focus.clone();
+                window.focus(&focus, cx);
+                live.update(cx, |live, _| live.set_caret_for_test(at));
+            }).unwrap();
+            draw(cx, handle);
+        };
+        // In the quote: Enter starts a new paragraph inside it.
+        caret_at(cx, "> Quote one".len());
+        cx.simulate_keystrokes(handle, "enter");
+        cx.simulate_input(handle, "two");
+        draw(cx, handle);
+        assert!(text(cx).starts_with("> Quote one\n>\n> two\n"), "{:?}", text(cx));
+        // In the code: typed as is; Enter is a new line, Tab indents.
+        let at = text(cx).find("1;").unwrap() + 2;
+        caret_at(cx, at);
+        cx.simulate_keystrokes(handle, "enter tab");
+        cx.simulate_input(handle, "let b = **2**;");
+        draw(cx, handle);
+        assert!(text(cx).ends_with("```rust\nlet a = 1;\n    let b = **2**;\n```"), "{:?}", text(cx));
+        // Down past the last line (the code): a paragraph after it.
+        cx.simulate_keystrokes(handle, "down");
+        cx.simulate_input(handle, "After");
+        draw(cx, handle);
+        assert!(text(cx).ends_with("```\n\nAfter"), "{:?}", text(cx));
+    }
+
+    #[gpui_kit::test]
+    fn live_preview_copies_text_and_markdown(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            bind_view_keys(cx);
+            crate::live::init(cx);
+            crate::settings::init(cx);
+            gpui_kit::BorrowAppContext::update_global::<crate::settings::Preferences, _>(cx, |p, _| p.live_preview = true);
+        });
+        let source = "- [ ] Review **empty states** and *error messages*\n";
+        let (handle, view) = cx.update(|cx| gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+            cx.new(|cx| {
+                let mut app = Enso::new(window, cx);
+                app.add_document(Some(PathBuf::from("copy.md")), source.into(), None, window, cx);
+                app
+            })
+        }).unwrap());
+        for _ in 0..3 { draw(cx, handle); cx.run_until_parked(); }
+        let (live, editor) = cx.update(|cx| {
+            let doc = &view.read(cx).documents[0];
+            (doc.live.clone().unwrap(), doc.editor.clone())
+        });
+        let text = |cx: &mut TestAppContext| cx.update(|cx| editor.read(cx).value().to_string());
+        let clipboard = |cx: &mut TestAppContext| cx.update(|cx| cx.read_from_clipboard().and_then(|i| i.text())).unwrap_or_default();
+        let primary = if cfg!(target_os = "macos") { "cmd" } else { "ctrl" };
+        cx.update_window(handle, |_, window, cx| {
+            let focus = live.read(cx).focus.clone();
+            window.focus(&focus, cx);
+            live.update(cx, |live, _| live.set_caret_for_test(source.find("Review").unwrap()));
+        }).unwrap();
+        draw(cx, handle);
+        // The item's line: ⌘C copies what's read, ⌘⇧C the Markdown, whole.
+        cx.simulate_keystrokes(handle, &format!("{primary}-a {primary}-c"));
+        assert_eq!(clipboard(cx), "Review empty states and error messages");
+        cx.simulate_keystrokes(handle, &format!("{primary}-shift-c"));
+        assert_eq!(clipboard(cx), "Review **empty states** and *error messages*");
+        // A ⌘C copy pasted back into the note keeps its formatting.
+        // At the italic's end, it goes after the italic's `*`, not inside it.
+        cx.simulate_keystrokes(handle, &format!("{primary}-c right {primary}-v"));
+        draw(cx, handle);
+        assert!(text(cx).ends_with("*error messages*Review **empty states** and *error messages*\n"), "{:?}", text(cx));
+    }
+
+    #[gpui_kit::test]
+    fn live_preview_removes_empty_blocks(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            bind_view_keys(cx);
+            crate::live::init(cx);
+            crate::settings::init(cx);
+            gpui_kit::BorrowAppContext::update_global::<crate::settings::Preferences, _>(cx, |p, _| p.live_preview = true);
+        });
+        // (source, where the caret is, key, the note after, where the caret ends)
+        let cases = [
+            ("- [ ] a\n- [ ] \n", "- [ ] a\n- [ ] ".len(), "backspace", "- [ ] a\n", "- [ ] a".len()),
+            ("Text\n\n# \n", "Text\n\n# ".len(), "backspace", "Text\n\n", "Text".len()),
+            ("Para\n\n```\n\n```\n", "Para\n\n```\n".len(), "backspace", "Para\n\n", "Para".len()),
+            ("- a\n- \n- b\n", "- a\n- ".len(), "delete", "- a\n- b\n", "- a\n- ".len()),
+        ];
+        for (source, at, key, expected, caret) in cases {
+            let (handle, view) = cx.update(|cx| gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| {
+                    let mut app = Enso::new(window, cx);
+                    app.add_document(Some(PathBuf::from("empty.md")), source.into(), None, window, cx);
+                    app
+                })
+            }).unwrap());
+            for _ in 0..3 { draw(cx, handle); cx.run_until_parked(); }
+            let (live, editor) = cx.update(|cx| {
+                let doc = &view.read(cx).documents[0];
+                (doc.live.clone().unwrap(), doc.editor.clone())
+            });
+            cx.update_window(handle, |_, window, cx| {
+                let focus = live.read(cx).focus.clone();
+                window.focus(&focus, cx);
+                live.update(cx, |live, _| live.set_caret_for_test(at));
+            }).unwrap();
+            draw(cx, handle);
+            cx.simulate_keystrokes(handle, key);
+            draw(cx, handle);
+            let text = cx.update(|cx| editor.read(cx).value().to_string());
+            assert_eq!(text, expected, "{source:?}");
+            assert_eq!(cx.update(|cx| live.read(cx).caret_for_test()), Some(caret), "{source:?}");
+            // More presses never crash.
+            for _ in 0..4 { cx.simulate_keystrokes(handle, key); draw(cx, handle); }
+        }
+    }
+
+    #[gpui_kit::test]
+    fn live_preview_formatting_keys_and_links(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            bind_view_keys(cx);
+            crate::live::init(cx);
+            crate::settings::init(cx);
+            gpui_kit::BorrowAppContext::update_global::<crate::settings::Preferences, _>(cx, |p, _| p.live_preview = true);
+        });
+        let source = "Make this bold now\n";
+        let (handle, view) = cx.update(|cx| gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+            cx.new(|cx| {
+                let mut app = Enso::new(window, cx);
+                app.add_document(Some(PathBuf::from("keys.md")), source.into(), None, window, cx);
+                app
+            })
+        }).unwrap());
+        for _ in 0..3 { draw(cx, handle); cx.run_until_parked(); }
+        let (live, editor) = cx.update(|cx| {
+            let doc = &view.read(cx).documents[0];
+            (doc.live.clone().unwrap(), doc.editor.clone())
+        });
+        let text = |cx: &mut TestAppContext| cx.update(|cx| editor.read(cx).value().to_string());
+        let p = if cfg!(target_os = "macos") { "cmd" } else { "ctrl" };
+        let key = |cx: &mut TestAppContext, keys: &str| {
+            cx.simulate_keystrokes(handle, &keys.replace("P-", &format!("{p}-")));
+            draw(cx, handle);
+        };
+        cx.update_window(handle, |_, window, cx| {
+            let focus = live.read(cx).focus.clone();
+            window.focus(&focus, cx);
+            live.update(cx, |live, _| live.set_caret_for_test("Make this bold".len()));
+        }).unwrap();
+        draw(cx, handle);
+        // ⌘B on "this bold" (selected by Shift and word moves), then off again.
+        let (word, select) = if cfg!(target_os = "macos") { ("alt", "alt-shift") } else { ("ctrl", "ctrl-shift") };
+        key(cx, &format!("{select}-left {select}-left P-b"));
+        assert_eq!(text(cx), "Make **this bold** now\n");
+        key(cx, "P-b");
+        assert_eq!(text(cx), "Make this bold now\n");
+        // ⌘I with no selection: the word at the caret.
+        key(cx, &format!("{word}-right P-i"));
+        assert_eq!(text(cx), "Make this bold *now*\n");
+        key(cx, "P-z");
+        // Headings, lists, checkboxes.
+        key(cx, "P-2");
+        assert!(text(cx).starts_with("## "), "{:?}", text(cx));
+        key(cx, "P-0 P-shift-8");
+        assert!(text(cx).starts_with("- "), "{:?}", text(cx));
+        key(cx, "P-shift-8");
+        assert!(!text(cx).starts_with("- "), "{:?}", text(cx));
+        key(cx, "P-shift-l P-enter");
+        assert!(text(cx).starts_with("- [x] "), "{:?}", text(cx));
+        // ⌘K on a selection, then Escape: the selection is back as it was.
+        key(cx, "end");
+        key(cx, &format!("{select}-left"));
+        let before = cx.update(|cx| live.read(cx).caret_for_test());
+        key(cx, "P-k escape");
+        for _ in 0..2 { cx.run_until_parked(); draw(cx, handle); }
+        assert!(cx.update(|cx| live.read(cx).has_selection()));
+        assert_eq!(cx.update(|cx| live.read(cx).caret_for_test()), before);
+        // ⌘K on a selection: a new link, its address typed in the card.
+        key(cx, "P-k");
+        assert!(cx.update(|cx| live.read(cx).link_card_for_test(cx)).is_some());
+        cx.simulate_input(handle, "https://enso.app");
+        key(cx, "enter");
+        assert!(text(cx).trim_end().ends_with("[now](https://enso.app)"), "{:?}", text(cx));
+        // ⌘K on that link: its card, with its text and address.
+        key(cx, "left P-k");
+        assert_eq!(cx.update(|cx| live.read(cx).link_card_for_test(cx)), Some(("now".into(), "https://enso.app".into())));
+        key(cx, "escape");
+        assert!(cx.update(|cx| live.read(cx).link_card_for_test(cx)).is_none());
+    }
+
+    #[gpui_kit::test]
+    fn live_preview_edits_table_cells_in_place(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            bind_view_keys(cx);
+            crate::live::init(cx);
+            crate::settings::init(cx);
+            gpui_kit::BorrowAppContext::update_global::<crate::settings::Preferences, _>(cx, |p, _| p.live_preview = true);
+        });
+        let source = "| Area | Status |\n| :--- | ---: |\n| Copy |  |";
+        let (handle, view) = cx.update(|cx| gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+            cx.new(|cx| {
+                let mut app = Enso::new(window, cx);
+                app.add_document(Some(PathBuf::from("table.md")), source.into(), None, window, cx);
+                app
+            })
+        }).unwrap());
+        for _ in 0..3 { draw(cx, handle); cx.run_until_parked(); }
+        let (live, editor) = cx.update(|cx| {
+            let doc = &view.read(cx).documents[0];
+            (doc.live.clone().unwrap(), doc.editor.clone())
+        });
+        let text = |cx: &mut TestAppContext| cx.update(|cx| editor.read(cx).value().to_string());
+        // Into "Copy": type, then Tab to the empty Status cell and type there.
+        cx.update_window(handle, |_, window, cx| {
+            let focus = live.read(cx).focus.clone();
+            window.focus(&focus, cx);
+            live.update(cx, |live, _| live.set_caret_for_test(source.find("Copy").unwrap() + 4));
+        }).unwrap();
+        draw(cx, handle);
+        cx.simulate_input(handle, " text");
+        cx.simulate_keystrokes(handle, "tab");
+        cx.simulate_input(handle, "Ready | soon");
+        draw(cx, handle);
+        assert_eq!(text(cx), "| Area | Status |\n| :--- | ---: |\n| Copy text | Ready \\| soon |");
+        // Enter on the last row: a new row, in the same column.
+        cx.simulate_keystrokes(handle, "enter");
+        cx.simulate_input(handle, "Later");
+        draw(cx, handle);
+        assert!(text(cx).ends_with("| Ready \\| soon |\n|  | Later |"), "{:?}", text(cx));
+        // Shift+Tab back to the first cell of that row.
+        cx.simulate_keystrokes(handle, "shift-tab");
+        cx.simulate_input(handle, "Pack");
+        draw(cx, handle);
+        assert!(text(cx).ends_with("\n| Pack | Later |"), "{:?}", text(cx));
+        // Up goes to the cell above; Backspace at a cell's start keeps the table.
+        cx.simulate_keystrokes(handle, "up home backspace");
+        draw(cx, handle);
+        assert!(text(cx).contains("| Copy text | Ready"), "{:?}", text(cx));
+    }
+
+    #[gpui_kit::test]
+    fn live_preview_link_card_shows_on_hover(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            bind_view_keys(cx);
+            crate::live::init(cx);
+            crate::settings::init(cx);
+            gpui_kit::BorrowAppContext::update_global::<crate::settings::Preferences, _>(cx, |p, _| p.live_preview = true);
+        });
+        let source = "Plain words then [the docs](https://enso.app) here\n";
+        let (handle, view) = cx.update(|cx| gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+            cx.new(|cx| {
+                let mut app = Enso::new(window, cx);
+                app.add_document(Some(PathBuf::from("hover.md")), source.into(), None, window, cx);
+                app
+            })
+        }).unwrap());
+        for _ in 0..3 { draw(cx, handle); cx.run_until_parked(); }
+        let live = cx.update(|cx| view.read(cx).documents[0].live.clone().unwrap());
+        let card = |cx: &mut TestAppContext| cx.update(|cx| live.read(cx).link_card_for_test(cx));
+        let (on, off) = cx.update(|cx| live.read(cx).link_points_for_test()).unwrap();
+        let move_to = |cx: &mut TestAppContext, position| {
+            let mut visual = gpui_kit::VisualTestContext::from_window(handle, cx);
+            visual.simulate_event(gpui_kit::MouseMoveEvent { position, pressed_button: None, modifiers: gpui_kit::Modifiers::none() });
+        };
+        move_to(cx, on);
+        draw(cx, handle);
+        // Not at once: after resting a moment.
+        assert!(card(cx).is_none());
+        cx.executor().advance_clock(std::time::Duration::from_millis(900));
+        cx.run_until_parked();
+        draw(cx, handle);
+        assert_eq!(card(cx), Some(("the docs".into(), "https://enso.app".into())));
+        // Off the link, the hover card goes.
+        move_to(cx, off);
+        draw(cx, handle);
+        assert!(card(cx).is_none());
     }
 
     #[gpui_kit::test]

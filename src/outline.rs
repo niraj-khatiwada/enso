@@ -9,6 +9,8 @@ pub struct Heading {
     pub level: usize,
     pub offset: usize,
     pub preview: String,
+    /// The same section as read, without Markdown, for Live Preview.
+    pub plain: String,
 }
 pub fn headings(source: &str) -> Vec<Heading> {
     let mut result = Vec::new();
@@ -42,6 +44,7 @@ pub fn headings(source: &str) -> Vec<Heading> {
                         level,
                         offset,
                         preview: String::new(),
+                        plain: String::new(),
                     });
                 }
                 previous = None;
@@ -55,6 +58,7 @@ pub fn headings(source: &str) -> Vec<Heading> {
                         level: if marker == b'=' { 1 } else { 2 },
                         offset: start,
                         preview: String::new(),
+                        plain: String::new(),
                     });
                 }
             } else if text.is_empty() {
@@ -69,6 +73,9 @@ pub fn headings(source: &str) -> Vec<Heading> {
     }
     for i in 0..result.len() {
         let end = result.get(i + 1).map_or(source.len(), |h| h.offset);
+        let body = &source[result[i].offset..end];
+        let body = body.split_once('\n').map_or("", |(_, rest)| rest);
+        result[i].plain = plain_text(body).chars().take(180).collect();
         result[i].preview = source[result[i].offset..end]
             .lines()
             .skip(1)
@@ -82,11 +89,49 @@ pub fn headings(source: &str) -> Vec<Heading> {
     }
     result
 }
+/// Markdown as read: the words of its paragraphs, lists and tables (cells
+/// joined by " · "), leaving out code, diagrams and HTML.
+pub fn plain_text(markdown: &str) -> String {
+    use markdown::mdast::Node;
+    fn words(node: &Node, out: &mut String) {
+        match node {
+            Node::Text(t) => out.push_str(&t.value.replace('\n', " ")),
+            Node::InlineCode(c) => out.push_str(&c.value),
+            Node::Break(_) => out.push(' '),
+            Node::Code(_) | Node::Html(_) | Node::Math(_) | Node::Image(_) | Node::Definition(_) => {}
+            Node::TableCell(_) => {
+                for child in node.children().into_iter().flatten() {
+                    words(child, out);
+                }
+                out.push_str(" · ");
+            }
+            _ => {
+                let block = matches!(node, Node::Paragraph(_) | Node::Heading(_) | Node::ListItem(_) | Node::TableRow(_));
+                for child in node.children().into_iter().flatten() {
+                    words(child, out);
+                }
+                if block {
+                    out.push(' ');
+                }
+            }
+        }
+    }
+    let mut options = markdown::ParseOptions::gfm();
+    options.constructs.math_flow = true;
+    options.constructs.math_text = true;
+    let Ok(tree) = markdown::to_mdast(markdown, &options) else { return String::new() };
+    let mut out = String::new();
+    words(&tree, &mut out);
+    let text = out.split_whitespace().collect::<Vec<_>>().join(" ");
+    text.trim_end_matches('·').trim().to_string()
+}
+
 impl Enso {
     pub fn outline_rail(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         if !settings::document_outline(cx) {
             return div().into_any_element();
         }
+        let live = self.live_view(cx);
         let Some(doc) = self
             .active
             .and_then(|i| self.documents.get(i))
@@ -219,13 +264,12 @@ impl Enso {
                                     .font_weight(FontWeight::SEMIBOLD)
                                     .child(heading.title.clone()),
                             )
-                            .when(!heading.preview.is_empty(), |card| {
-                                card.child(
-                                    div()
-                                        .text_sm()
-                                        .text_color(theme.muted_foreground)
-                                        .child(heading.preview.clone()),
-                                )
+                            .map(|card| {
+                                // Live Preview never shows Markdown: the text as read.
+                                let preview = if live { heading.plain.clone() } else { heading.preview.clone() };
+                                card.when(!preview.is_empty(), |card| {
+                                    card.child(div().text_sm().text_color(theme.muted_foreground).child(preview))
+                                })
                             }),
                     )
                     .with_priority(1),
@@ -288,6 +332,12 @@ impl Enso {
 }
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn previews_read_without_markdown() {
+        let section = "| Area | Reviewer |\n| :--- | :--- |\n| Copy | **Leena** |\n\n- [ ] Pack `bags`\n\n```sh\ncargo run\n```\n";
+        assert_eq!(super::plain_text(section), "Area · Reviewer · Copy · Leena · Pack bags");
+    }
+
     #[test]
     fn headings_skip_code_and_keep_offsets() {
         let source = "# A\n\n```md\n# fake\n```\n\nSub\n---\n\n## B\n";
