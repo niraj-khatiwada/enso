@@ -30,5 +30,5 @@ Your files stay on your computer, in ordinary folders. Changes save automaticall
 | New file | ⌘ N | Ctrl N |
 | Close file | ⌘ W or Ctrl W | Ctrl W |
 | Save | ⌘ S | Ctrl S |
-| Edit / Read | ⌘ E or Ctrl E | Ctrl E |
+| Edit / View | ⌘ E or Ctrl E | Ctrl E |
 | Toggle split | ⌘ \\ or Ctrl \\ | Ctrl \\ |

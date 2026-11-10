@@ -169,11 +169,14 @@ impl LiveView {
     }
 
     /// What ⌘/ offers here, group by group.
-    pub(super) fn actions(&self) -> Vec<Action> {
+    /// `split`: the page is Split's, its Markdown already beside it.
+    pub(super) fn actions(&self, split: bool) -> Vec<Action> {
         let mut out = Vec::new();
         // A picked image (or diagram, rule…): the block as a whole.
         if self.picked_range().is_some() {
-            out.push(action("Block", "Edit as Markdown", &["raw", "source", "markdown"], Act::EditMarkdown));
+            if !split {
+                out.push(action("Block", "Edit as Markdown", &["raw", "source", "markdown"], Act::EditMarkdown));
+            }
             out.push(action("Block", "Duplicate", &["copy", "clone"], Act::Duplicate));
             out.push(action("Block", "Delete", &["remove"], Act::Delete));
             return out;
@@ -343,7 +346,7 @@ impl LiveView {
         }
         // The block as a whole.
         if !matches!(leaf.kind, Kind::Cell { .. }) {
-            if self.raw.is_none() {
+            if self.raw.is_none() && !split {
                 out.push(action("Block", "Edit as Markdown", &["raw", "source", "markdown"], Act::EditMarkdown));
             }
             out.push(action("Block", "Duplicate", &["copy", "clone"], Act::Duplicate));

@@ -503,13 +503,13 @@ mod ui_tests {
 
     #[gpui_kit::test]
     fn document_menu_changes_reading_style_and_saves_on_slider_release(cx: &mut TestAppContext) {
+        // The classic reader's own controls (large notes use it).
+        crate::use_classic_reader_for_test();
         let path = std::env::temp_dir().join(format!("enso-reading-menu-{}", std::process::id()));
         cx.update(|cx| {
             gpui_kit::init(cx);
             settings::init(cx);
             cx.update_global::<settings::Preferences, _>(|p, _| {
-                // The classic reader, whose layout this measures.
-                p.live_preview = false;
                 p.reading = ReadingStyle::default();
                 p.reading_path = Some(path.clone());
             });

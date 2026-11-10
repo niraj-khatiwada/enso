@@ -309,7 +309,7 @@ impl Enso {
             });
         }
         // Live Preview: the caret on the heading in the page, in view.
-        if let Some(live) = doc.live.clone().filter(|_| settings::live_preview(cx)) {
+        if let Some(live) = doc.live.clone().filter(|_| self.mode != Mode::Edit) {
             live.update(cx, |live, cx| live.jump_to(offset, window, cx));
             cx.notify();
             return;
@@ -364,6 +364,8 @@ mod ui_tests {
     };
     #[gpui_kit::test]
     fn rail_previews_follow_pointer_and_click_navigates(cx: &mut TestAppContext) {
+        // The classic reader's own controls (large notes use it).
+        crate::use_classic_reader_for_test();
         cx.update(gpui_kit::init);
         let source = (0..80)
             .map(|i| format!("## Section {i}\n\nParagraph for section {i}.\n\n"))

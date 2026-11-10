@@ -596,6 +596,9 @@ struct Enso {
     /// The match a search result opened at, highlighted once it's shown.
     pending_flash: Option<(EntityId, Vec<std::ops::Range<usize>>)>,
     flash_task: Option<Task<()>>,
+    /// Split: the Markdown of what was clicked on the page, filled in the
+    /// editor for a moment, and the wait before it goes.
+    editor_flash: Option<(gpui_kit::component::input::RangeDecorationCollection, Task<()>)>,
     page_find: Option<find::PageFind>,
     /// Focus Mode: only the page, centred.
     focus_mode: bool,
@@ -735,6 +738,7 @@ impl Enso {
             pending_jump: None,
             pending_flash: None,
             flash_task: None,
+            editor_flash: None,
             page_find: None,
             focus_mode: false,
             focus_track: None,
@@ -776,17 +780,16 @@ impl Enso {
         cx.notify();
     }
 
-    pub(crate) fn live_view(&self, cx: &App) -> bool {
-        settings::live_preview(cx) && self.active.is_some_and(|i| self.documents[i].live.is_some())
+    /// Whether the active note's page is the live one (View and Split of a
+    /// Markdown note that isn't too large for it).
+    pub(crate) fn live_view(&self, _: &App) -> bool {
+        self.mode != Mode::Edit && self.active.is_some_and(|i| self.documents[i].live.is_some())
     }
 
     fn set_mode(&mut self, mode: Mode, window: &mut Window, cx: &mut Context<Self>) {
         let Some(index) = self.active else {
             return;
         };
-        if self.live_view(cx) && mode != Mode::Read {
-            return;
-        }
         // Focus Mode is one page: Read or Edit, never Split.
         if self.focus_mode && mode == Mode::Split {
             return;
@@ -818,8 +821,12 @@ impl Enso {
             }
             self.reveal_editor_cursor(index, cx);
         }
+        // View: the page takes the keys (the live page, to type in).
         let focus = if mode == Mode::Read {
-            self.focus.clone()
+            match &self.documents[index].live {
+                Some(live) => live.read(cx).focus.clone(),
+                None => self.focus.clone(),
+            }
         } else {
             self.documents[index].editor.focus_handle(cx)
         };
@@ -915,6 +922,60 @@ impl Enso {
         self.toast(toast, cx);
     }
 
+    /// Split: the page beside the editor was clicked at `offset` (in the
+    /// note); the editor's caret goes there, so it scrolls there too.
+    /// `focus`: the editor takes the keys (a block's Edit button).
+    pub(crate) fn live_clicked(
+        &mut self,
+        editor_id: EntityId,
+        offset: usize,
+        block: Option<std::ops::Range<usize>>,
+        focus: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.mode != Mode::Split {
+            return;
+        }
+        let Some(doc) = self.documents.iter_mut().find(|d| d.editor.entity_id() == editor_id) else { return };
+        // The editor's caret moving would bring the page there again; it's
+        // already there.
+        doc.last_reader_cursor = Some(offset);
+        let editor = doc.editor.clone();
+        editor.update(cx, |editor, cx| {
+            let text = editor.text().clone();
+            let mut at = offset.min(text.len());
+            while at > 0 && !text.is_char_boundary(at) {
+                at -= 1;
+            }
+            editor.set_selected_range(at..at, cx);
+        });
+        if focus {
+            let handle = editor.focus_handle(cx);
+            window.focus(&handle, cx);
+        }
+        // Its Markdown, filled for a second, so it's plain where it is.
+        if let Some((old, _)) = self.editor_flash.take() {
+            old.dispose(cx);
+        }
+        if let Some(block) = block.filter(|b| !b.is_empty()) {
+            use gpui_kit::component::input::{RangeDecoration, RangeDecorationStyle};
+            let color = cx.theme().selection;
+            let fill = RangeDecoration::new(block).with_style(RangeDecorationStyle::Fill).with_color(color);
+            let flash = editor.update(cx, |editor, cx| editor.create_range_decorations_collection(vec![fill], cx));
+            let task = cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(std::time::Duration::from_secs(1)).await;
+                let _ = this.update(cx, |this, cx| {
+                    if let Some((flash, _)) = this.editor_flash.take() {
+                        flash.dispose(cx);
+                    }
+                });
+            });
+            self.editor_flash = Some((flash, task));
+        }
+        cx.notify();
+    }
+
     /// The reader was clicked at `position`: put the editor's caret on the
     /// source behind it, so Split's editor scrolls there (and Edit opens
     /// there). A drag follows its selection's start, exactly; a plain click
@@ -957,6 +1018,11 @@ impl Enso {
         }
         let cursor = doc.editor.read(cx).cursor();
         doc.last_reader_cursor = Some(cursor);
+        // The live page: the same place brought into view.
+        if let Some(live) = doc.live.clone() {
+            live.update(cx, |live, cx| live.reveal_source(cursor, cx));
+            return;
+        }
         if let Some(reader) = &doc.large_reader {
             reader.update(cx, |reader, cx| reader.reveal_source(cursor, cx));
         } else {
@@ -1345,7 +1411,7 @@ impl Enso {
         });
         let spellcheck = markdown.then(|| cx.new(|cx| spellcheck::Spellcheck::new(&editor, source.len(), cx)));
         // Live Preview's page, for ordinary Markdown notes.
-        let live = (markdown && large_reader.is_none()).then(|| {
+        let live = (markdown && large_reader.is_none() && !classic_reader()).then(|| {
             let owner = cx.entity().downgrade();
             let base = path.as_ref().and_then(|p| p.parent()).map(PathBuf::from);
             let editor = editor.clone();
@@ -3085,8 +3151,7 @@ impl Render for Enso {
             }
         }
         let markdown = self.active.is_none_or(|i| self.documents[i].markdown);
-        let live_view = self.live_view(cx);
-        let mode = if live_view { Mode::Read } else if markdown { self.mode } else { Mode::Edit };
+        let mode = if markdown { self.mode } else { Mode::Edit };
         let active_doc = self.active.map(|i| self.documents[i].editor.entity_id());
         if active_doc != self.warmed_doc {
             self.warmed_doc = active_doc;
@@ -4065,8 +4130,8 @@ impl Render for Enso {
                 );
             }
             if mode != Mode::Edit {
-                if let Some(live) = document.live.as_ref().filter(|_| settings::live_preview(cx)) {
-                    // Live Preview: the page, edited where it stands.
+                if let Some(live) = document.live.as_ref() {
+                    // The page, edited where it stands.
                     reading_pane = Some(
                         div()
                             .id(("preview-pane", document.editor.entity_id()))
@@ -4261,13 +4326,11 @@ impl Render for Enso {
             .child(
                 h_flex().gap_1().items_center().flex_shrink_0().children(
                     [
-                        (Mode::Read, "Read", IconName::BookOpen),
+                        (Mode::Read, "View", IconName::BookOpen),
                         (Mode::Edit, "Edit", IconName::Pencil),
                         (Mode::Split, "Split", IconName::Columns2),
                     ]
                     .into_iter()
-                    // Live Preview has the one view.
-                    .filter(|_| !live_view)
                     .enumerate()
                     .map(|(i, (value, label, icon))| {
                         ui::icon_button(("mode", i), icon, label)
@@ -5170,6 +5233,23 @@ fn main() {
         });
 }
 
+thread_local! {
+    /// Tests of the classic reader's own controls: notes open in it rather
+    /// than the live page (as large notes do).
+    static CLASSIC_READER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether notes open in the classic reader (only ever in tests).
+fn classic_reader() -> bool {
+    cfg!(test) && CLASSIC_READER.with(|c| c.get())
+}
+
+/// Tests of the classic reader: notes opened after this use it.
+#[cfg(test)]
+pub(crate) fn use_classic_reader_for_test() {
+    CLASSIC_READER.with(|c| c.set(true));
+}
+
 #[cfg(all(test, feature = "ui-tests"))]
 mod transition_tests {
     use super::{Enso, Mode, bind_view_keys, reader};
@@ -5918,7 +5998,6 @@ mod transition_tests {
             bind_view_keys(cx);
             crate::live::init(cx);
             crate::settings::init(cx);
-            gpui_kit::BorrowAppContext::update_global::<crate::settings::Preferences, _>(cx, |p, _| p.live_preview = true);
         });
         let source = "# Plan\n\nPack the  umbrella.\n\n<mark color=\"blue\">kept</mark>  exactly\n";
         let (handle, view) = cx.update(|cx| gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
@@ -5980,7 +6059,6 @@ mod transition_tests {
             bind_view_keys(cx);
             crate::live::init(cx);
             crate::settings::init(cx);
-            gpui_kit::BorrowAppContext::update_global::<crate::settings::Preferences, _>(cx, |p, _| p.live_preview = true);
         });
         let source = "Before\n\n![one](a.png)\n\n<img src=\"b.png\" width=\"30%\" />\n\nAfter\n";
         let (handle, view) = cx.update(|cx| gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
@@ -6051,7 +6129,6 @@ mod transition_tests {
             bind_view_keys(cx);
             crate::live::init(cx);
             crate::settings::init(cx);
-            gpui_kit::BorrowAppContext::update_global::<crate::settings::Preferences, _>(cx, |p, _| p.live_preview = true);
         });
         let source = "So $x^2$ here.[^1]\n\n[^1]: Note.\n";
         let (handle, view) = cx.update(|cx| gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
@@ -6101,7 +6178,6 @@ mod transition_tests {
             bind_view_keys(cx);
             crate::live::init(cx);
             crate::settings::init(cx);
-            gpui_kit::BorrowAppContext::update_global::<crate::settings::Preferences, _>(cx, |p, _| p.live_preview = true);
         });
         let source = "Some **bold** text\n\n$$\nE = mc^2\n$$\n\nAfter\n";
         let (handle, view) = cx.update(|cx| gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
@@ -6182,7 +6258,6 @@ mod transition_tests {
             bind_view_keys(cx);
             crate::live::init(cx);
             crate::settings::init(cx);
-            gpui_kit::BorrowAppContext::update_global::<crate::settings::Preferences, _>(cx, |p, _| p.live_preview = true);
         });
         let source = "A <mark color=\"blue\">noted</mark> word\n";
         let (handle, view) = cx.update(|cx| gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
@@ -6235,7 +6310,6 @@ mod transition_tests {
             bind_view_keys(cx);
             crate::live::init(cx);
             crate::settings::init(cx);
-            gpui_kit::BorrowAppContext::update_global::<crate::settings::Preferences, _>(cx, |p, _| p.live_preview = true);
         });
         let source = "Some **bold** words and <mark color=\"#bbf7d0\">marked</mark> text.\n\n- [ ] pack bags\n";
         let (handle, view) = cx.update(|cx| gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
@@ -6356,7 +6430,6 @@ mod transition_tests {
             bind_view_keys(cx);
             crate::live::init(cx);
             crate::settings::init(cx);
-            gpui_kit::BorrowAppContext::update_global::<crate::settings::Preferences, _>(cx, |p, _| p.live_preview = true);
         });
         let source = "> Intro\n>\n> - one\n\n- Item:\n\n  ```sh\n  cargo run\n  ```\n\n- Quoting:\n\n  > said\n";
         let (handle, view) = cx.update(|cx| gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
@@ -6417,7 +6490,6 @@ mod transition_tests {
             bind_view_keys(cx);
             crate::live::init(cx);
             crate::settings::init(cx);
-            gpui_kit::BorrowAppContext::update_global::<crate::settings::Preferences, _>(cx, |p, _| p.live_preview = true);
         });
         let source = "First\n\nSecond\n";
         let (handle, view) = cx.update(|cx| gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
@@ -6493,7 +6565,6 @@ mod transition_tests {
             bind_view_keys(cx);
             crate::live::init(cx);
             crate::settings::init(cx);
-            gpui_kit::BorrowAppContext::update_global::<crate::settings::Preferences, _>(cx, |p, _| p.live_preview = true);
         });
         let source = "<b>Bold</b>, <i>italic</i>, <u>under</u>, <s>struck</s> and ~~gone~~.\n";
         let (handle, view) = cx.update(|cx| gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
@@ -6561,7 +6632,6 @@ mod transition_tests {
             bind_view_keys(cx);
             crate::live::init(cx);
             crate::settings::init(cx);
-            gpui_kit::BorrowAppContext::update_global::<crate::settings::Preferences, _>(cx, |p, _| p.live_preview = true);
         });
         let source = "# Plan\n\nFind the **word** here.\n\n## Later\n\nAnd the word again.\n";
         let (handle, view) = cx.update(|cx| gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
@@ -6605,7 +6675,6 @@ mod transition_tests {
             bind_view_keys(cx);
             crate::live::init(cx);
             crate::settings::init(cx);
-            gpui_kit::BorrowAppContext::update_global::<crate::settings::Preferences, _>(cx, |p, _| p.live_preview = true);
         });
         let source = "Some plain words.\n";
         let (handle, view) = cx.update(|cx| gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
@@ -6742,13 +6811,81 @@ mod transition_tests {
     }
 
     #[gpui_kit::test]
+    fn view_is_the_live_page_and_split_pairs_it_with_the_editor(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            bind_view_keys(cx);
+            crate::live::init(cx);
+            crate::settings::init(cx);
+        });
+        let source = "# Title\n\nSome text.\n";
+        let (handle, view) = cx.update(|cx| gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+            cx.new(|cx| {
+                let mut app = Enso::new(window, cx);
+                app.add_document(Some(PathBuf::from("modes.md")), source.into(), None, window, cx);
+                app
+            })
+        }).unwrap());
+        for _ in 0..3 { draw(cx, handle); cx.run_until_parked(); }
+        let (live, editor) = cx.update(|cx| {
+            let doc = &view.read(cx).documents[0];
+            (doc.live.clone().unwrap(), doc.editor.clone())
+        });
+        let text = |cx: &mut TestAppContext| cx.update(|cx| editor.read(cx).value().to_string());
+        // View: the live page, typed in.
+        cx.update_window(handle, |_, window, cx| view.update(cx, |app, cx| app.set_mode(Mode::Read, window, cx))).unwrap();
+        cx.update_window(handle, |_, window, cx| {
+            let focus = live.read(cx).focus.clone();
+            window.focus(&focus, cx);
+            live.update(cx, |live, _| live.set_caret_for_test(source.find("text").unwrap() + 4));
+        }).unwrap();
+        draw(cx, handle);
+        cx.simulate_input(handle, "!");
+        draw(cx, handle);
+        assert_eq!(text(cx), "# Title\n\nSome text!.\n");
+        assert_eq!(cx.update(|cx| live.read(cx).undo_steps_for_test()), 1);
+        // Edit and Split are there too.
+        cx.update_window(handle, |_, window, cx| view.update(cx, |app, cx| app.set_mode(Mode::Edit, window, cx))).unwrap();
+        assert!(cx.update(|cx| view.read(cx).mode == Mode::Edit && !view.read(cx).live_view(cx)));
+        cx.update_window(handle, |_, window, cx| view.update(cx, |app, cx| app.set_mode(Mode::Split, window, cx))).unwrap();
+        draw(cx, handle);
+        assert!(cx.update(|cx| view.read(cx).mode == Mode::Split && view.read(cx).live_view(cx)));
+        // Typed in the editor beside it: the page follows, and its own undo
+        // can't take the note back past that.
+        cx.update_window(handle, |_, window, cx| editor.update(cx, |e, cx| {
+            let end = e.value().len();
+            e.set_selected_range(end..end, cx);
+            e.replace("More.\n".to_string(), window, cx);
+        })).unwrap();
+        draw(cx, handle);
+        assert_eq!(cx.update(|cx| live.read(cx).undo_steps_for_test()), 0);
+        assert!(text(cx).ends_with("Some text!.\nMore.\n"));
+        // A click on the page: the editor's caret goes to the same place.
+        let title = cx.update(|cx| live.read(cx).text_bounds_for_test(2));
+        let mut visual = gpui_kit::VisualTestContext::from_window(handle, cx);
+        visual.simulate_click(gpui_kit::point(title.left() + gpui_kit::px(1.), title.center().y), gpui_kit::Modifiers::default());
+        draw(cx, handle);
+        cx.run_until_parked();
+        assert_eq!(cx.update(|cx| editor.read(cx).cursor()), 2);
+        // Its Markdown is filled in the editor for a second.
+        assert!(cx.update(|cx| view.read(cx).editor_flash.is_some()));
+        cx.executor().advance_clock(std::time::Duration::from_millis(1100));
+        cx.run_until_parked();
+        assert!(cx.update(|cx| view.read(cx).editor_flash.is_none()));
+        // The Markdown is beside the page: Cmd/Ctrl+Shift+E doesn't show it
+        // in the page too.
+        cx.simulate_keystrokes(handle, if cfg!(target_os = "macos") { "cmd-shift-e" } else { "ctrl-shift-e" });
+        draw(cx, handle);
+        assert_eq!(cx.update(|cx| live.read(cx).raw_for_test()), None);
+    }
+
+    #[gpui_kit::test]
     fn live_preview_edits_inline_html_and_entities(cx: &mut TestAppContext) {
         cx.update(|cx| {
             gpui_kit::init(cx);
             bind_view_keys(cx);
             crate::live::init(cx);
             crate::settings::init(cx);
-            gpui_kit::BorrowAppContext::update_global::<crate::settings::Preferences, _>(cx, |p, _| p.live_preview = true);
         });
         let source = "A <mark>note</mark> &amp; <b>bold</b>\n";
         let (handle, view) = cx.update(|cx| gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
@@ -6792,7 +6929,6 @@ mod transition_tests {
             bind_view_keys(cx);
             crate::live::init(cx);
             crate::settings::init(cx);
-            gpui_kit::BorrowAppContext::update_global::<crate::settings::Preferences, _>(cx, |p, _| p.live_preview = true);
         });
         let source = "# Title\n\nSome __bold__ words.\n";
         let (handle, view) = cx.update(|cx| gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
@@ -6845,7 +6981,6 @@ mod transition_tests {
             bind_view_keys(cx);
             crate::live::init(cx);
             crate::settings::init(cx);
-            gpui_kit::BorrowAppContext::update_global::<crate::settings::Preferences, _>(cx, |p, _| p.live_preview = true);
         });
         let source = "Packing:\n\n- [ ] bags\n- [x] tickets\n";
         let (handle, view) = cx.update(|cx| gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
@@ -6903,7 +7038,6 @@ mod transition_tests {
             bind_view_keys(cx);
             crate::live::init(cx);
             crate::settings::init(cx);
-            gpui_kit::BorrowAppContext::update_global::<crate::settings::Preferences, _>(cx, |p, _| p.live_preview = true);
         });
         let source = "Pack the **blue** umbrella\n";
         let (handle, view) = cx.update(|cx| gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
@@ -6963,7 +7097,6 @@ mod transition_tests {
             super::bind_markdown_keys(cx);
             crate::live::init(cx);
             crate::settings::init(cx);
-            gpui_kit::BorrowAppContext::update_global::<crate::settings::Preferences, _>(cx, |p, _| p.live_preview = true);
         });
         let source = "Shopping\n\n";
         let (handle, view) = cx.update(|cx| gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
@@ -7008,7 +7141,6 @@ mod transition_tests {
             bind_view_keys(cx);
             crate::live::init(cx);
             crate::settings::init(cx);
-            gpui_kit::BorrowAppContext::update_global::<crate::settings::Preferences, _>(cx, |p, _| p.live_preview = true);
         });
         let source = "First line here\n\nSecond **bold** line\n";
         let (handle, view) = cx.update(|cx| gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
@@ -7067,7 +7199,6 @@ mod transition_tests {
             bind_view_keys(cx);
             crate::live::init(cx);
             crate::settings::init(cx);
-            gpui_kit::BorrowAppContext::update_global::<crate::settings::Preferences, _>(cx, |p, _| p.live_preview = true);
         });
         let source = "> Quote one\n\n```rust\nlet a = 1;\n```";
         let (handle, view) = cx.update(|cx| gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
@@ -7118,7 +7249,6 @@ mod transition_tests {
             bind_view_keys(cx);
             crate::live::init(cx);
             crate::settings::init(cx);
-            gpui_kit::BorrowAppContext::update_global::<crate::settings::Preferences, _>(cx, |p, _| p.live_preview = true);
         });
         let source = "- [ ] Review **empty states** and *error messages*\n";
         let (handle, view) = cx.update(|cx| gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
@@ -7161,7 +7291,6 @@ mod transition_tests {
             bind_view_keys(cx);
             crate::live::init(cx);
             crate::settings::init(cx);
-            gpui_kit::BorrowAppContext::update_global::<crate::settings::Preferences, _>(cx, |p, _| p.live_preview = true);
         });
         // (source, where the caret is, key, the note after, where the caret ends)
         let cases = [
@@ -7206,7 +7335,6 @@ mod transition_tests {
             bind_view_keys(cx);
             crate::live::init(cx);
             crate::settings::init(cx);
-            gpui_kit::BorrowAppContext::update_global::<crate::settings::Preferences, _>(cx, |p, _| p.live_preview = true);
         });
         let source = "Make this bold now\n";
         let (handle, view) = cx.update(|cx| gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
@@ -7280,7 +7408,6 @@ mod transition_tests {
             bind_view_keys(cx);
             crate::live::init(cx);
             crate::settings::init(cx);
-            gpui_kit::BorrowAppContext::update_global::<crate::settings::Preferences, _>(cx, |p, _| p.live_preview = true);
         });
         let source = "| Area | Status |\n| :--- | ---: |\n| Copy |  |";
         let (handle, view) = cx.update(|cx| gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
@@ -7387,7 +7514,6 @@ mod transition_tests {
             bind_view_keys(cx);
             crate::live::init(cx);
             crate::settings::init(cx);
-            gpui_kit::BorrowAppContext::update_global::<crate::settings::Preferences, _>(cx, |p, _| p.live_preview = true);
         });
         let source = "Plain words then [the docs](https://enso.app) here\n";
         let (handle, view) = cx.update(|cx| gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
@@ -8035,6 +8161,8 @@ mod transition_tests {
 
     #[gpui_kit::test]
     fn clicking_the_reader_moves_the_editor_there(cx: &mut TestAppContext) {
+        // The classic reader's own controls (large notes use it).
+        crate::use_classic_reader_for_test();
         use gpui_kit::{Modifiers, VisualTestContext, point};
         cx.update(|cx| { gpui_kit::init(cx); bind_view_keys(cx); });
         let mut source = String::new();
@@ -8072,6 +8200,8 @@ mod transition_tests {
 
     #[gpui_kit::test]
     fn the_reader_lists_one_item_per_block_for_the_features_sample(cx: &mut TestAppContext) {
+        // The classic reader's own controls (large notes use it).
+        crate::use_classic_reader_for_test();
         cx.update(|cx| { gpui_kit::init(cx); bind_view_keys(cx); });
         let source = include_str!("../Get Started.md").to_string()
             + "\n\n> quote\n>\n> > nested\n\n<table><tr><td>x</td></tr></table>\n\n<img src=\"a.png\" width=\"50%\" />\n\nA footnote.[^1]\n\n[^1]: Note.\n[gfm]: https://example.com\n\n$$\nE = mc^2\n$$\n\n```mermaid\nflowchart LR\n  A --> B\n```\n\n- [x] done\n\n---\n";

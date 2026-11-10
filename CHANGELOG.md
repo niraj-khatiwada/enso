@@ -4,7 +4,7 @@
 
 Features:
 
-- **Live Preview**: Edit right on the page, as in Notion: the Markdown is never shown. On by default (Settings › Editor › Live Preview); off, Edit, Read and Split are as before. The note stays plain Markdown underneath: each keystroke changes only the text you're editing, so everything else keeps its exact bytes, and undo, saving and sync work on the file itself.
+- **View is editable**: View, where every note opens, is now the page edited where it stands, as in Notion: the Markdown is never shown. Edit is the raw Markdown, and Split puts the two side by side, each following the other. The note stays plain Markdown underneath: each keystroke changes only the text you're editing, so everything else keeps its exact bytes, and undo, saving and sync work on the file itself.
   - Paragraphs and headings with bold, italic, strikethrough, inline code, links and wiki links, edited as drawn; `# ` and `- [ ] ` typed at a line's start become a heading and a checkbox.
   - Bullet, numbered and checkbox lists: Enter for the next item, Enter on an empty one to leave the list, Tab and Shift + Tab to indent, and checkboxes that tick.
   - Quotes, code blocks with highlighting, and tables, each cell edited in place: Tab and Enter move between cells and add rows.
@@ -22,9 +22,9 @@ Features:
   - **Cmd/Ctrl + Shift + E** shows the block at the caret as its Markdown, to edit as text; again, Escape or moving away draws it again.
   - Blocks inside blocks are edited in place too: lists in quotes, and code, quotes and further paragraphs in list items; Enter keeps each line in its container.
   - **Cmd/Ctrl + /** opens actions for what the caret is in, with Convert To, Color and Case as menus of their own: formatting buttons (bold, italic, underline, strikethrough, code, link, highlight, math, clear formatting; written as Markdown or HTML alike), highlight colours, letter case, Convert To, Mark as Done, table rows and columns, and Duplicate, Delete or Edit as Markdown for the block.
-- The outline's section previews read as text in Live Preview, without Markdown.
+- The outline's section previews read as text in View, without Markdown.
 - Cmd/Ctrl + = and − make the reading text larger and smaller, as the ⋯ menu's size slider does; Cmd/Ctrl + 0 resets it.
-- Find (Cmd/Ctrl + F) highlights its matches on the live page and scrolls to each; a search result opened flashes its match there; and a heading picked in the outline puts the caret on it.
+- Find (Cmd/Ctrl + F) highlights its matches on the page in View and scrolls to each; a search result opened flashes its match there; and a heading picked in the outline puts the caret on it.
 
 ### 1.2.0
 

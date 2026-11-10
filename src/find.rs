@@ -35,14 +35,15 @@ impl Enso {
     /// The live page showing the note `id`, when Live Preview shows it.
     fn live_page(&self, id: EntityId, cx: &App) -> Option<Entity<crate::live::LiveView>> {
         let doc = self.documents.iter().find(|d| d.editor.entity_id() == id)?;
-        doc.live.clone().filter(|_| settings::live_preview(cx))
+        let _ = cx;
+        doc.live.clone().filter(|_| self.mode != Mode::Edit)
     }
 
     /// Cmd/Ctrl+F: in the editor its own Find opens (it binds the keys
     /// closer in); here the reading view gets one.
     pub(crate) fn open_page_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(index) = self.active else { return };
-        if (self.mode == Mode::Edit && !self.live_view(cx)) || !self.documents[index].markdown {
+        if self.mode == Mode::Edit || !self.documents[index].markdown {
             cx.propagate();
             return;
         }

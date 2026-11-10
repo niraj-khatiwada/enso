@@ -2462,6 +2462,8 @@ mod ui_tests {
 
     #[gpui_kit::test]
     fn rendered_checkboxes_toggle_source_in_read_mode(cx: &mut TestAppContext) {
+        // The classic reader's own controls (large notes use it).
+        crate::use_classic_reader_for_test();
         let source = "- [ ] **Task**\n- [x] Done\n  - [ ] Nested\n";
         let (handle, view) = setup(cx, source);
         let mut visual = gpui_kit::VisualTestContext::from_window(handle, cx);

@@ -482,8 +482,8 @@ impl Enso {
         if self.active.is_some_and(|i| self.documents[i].markdown) {
             app.extend([
                 entry(
-                    "Read View",
-                    &["preview", "reading"],
+                    "View",
+                    &["preview", "reading", "read", "page", "live"],
                     Choice::Mode(Mode::Read),
                     None,
                 ),
@@ -534,10 +534,6 @@ impl Enso {
                     None,
                 ),
             ]);
-            // Live Preview has one view: no switching views or Split's sides.
-            if self.live_view(cx) {
-                app.retain(|e| !matches!(e.command, Choice::Mode(_) | Choice::Swap));
-            }
         }
         if self
             .active
@@ -2472,7 +2468,8 @@ mod ui_tests {
         draw(cx, handle);
         cx.update(|cx| {
             let p = view.read(cx).palette.as_ref().unwrap();
-            assert!(p.groups[1].is_empty() && p.groups[2].is_empty());
+            // View edits the page: inserting and formatting are offered.
+            assert!(!p.groups[1].is_empty() && !p.groups[2].is_empty());
         });
         cx.simulate_keystrokes(handle, "escape");
         cx.update_window(handle, |_, window, cx| {

@@ -315,6 +315,8 @@ pub struct LiveView {
     /// A block without text (an image, a diagram) picked by a click, by its
     /// start: Backspace or Delete removes it.
     picked: Option<usize>,
+    /// An edit of its own in flight (its undo still applies after it).
+    own_edit: bool,
     /// Find's matches on the page (in the note), and which is the current.
     found: Vec<Range<usize>>,
     found_current: Option<usize>,
@@ -379,6 +381,7 @@ impl LiveView {
             picked: None,
             picked_at: None,
             found: Vec::new(),
+            own_edit: false,
             found_current: None,
             closing: None,
             geometry: Rc::default(),
@@ -397,6 +400,12 @@ impl LiveView {
     fn refresh(&mut self, cx: &App) {
         let value = self.editor.read(cx).value();
         if value.as_ref() != self.source.as_str() {
+            // Changed from elsewhere (the editor beside it in Split, the file
+            // on disk): this page's undo no longer applies to it.
+            if !std::mem::take(&mut self.own_edit) {
+                self.undo.clear();
+                self.redo.clear();
+            }
             self.source = value.to_string();
             self.revision += 1;
             // Changed from elsewhere: the raw block may be gone.
@@ -614,6 +623,12 @@ impl LiveView {
         self.choose_text_color(Some(color), window, cx);
     }
 
+    /// How many steps this page can undo.
+    #[cfg(all(test, feature = "ui-tests"))]
+    pub(crate) fn undo_steps_for_test(&self) -> usize {
+        self.undo.len()
+    }
+
     #[cfg(all(test, feature = "ui-tests"))]
     pub(crate) fn table_card_for_test(&self) -> bool {
         self.table_card.is_some()
@@ -734,6 +749,7 @@ impl LiveView {
         // (A click on a link opens it: the text's own link handling. Its card
         // shows on hover, or with ⌘K.)
         self.link_card = None;
+        self.follow_in_editor(at, window, cx);
         cx.notify();
     }
 
@@ -912,7 +928,7 @@ impl LiveView {
             cx.notify();
             return;
         }
-        let actions = self.actions();
+        let actions = self.actions(self.in_split(cx));
         let buttons = self.buttons();
         if actions.is_empty() && buttons.is_empty() {
             return;
@@ -1158,6 +1174,7 @@ impl LiveView {
         self.parked = None;
         self.picked = self.editor.read(cx).is_editable().then_some(start);
         window.focus(&self.focus, cx);
+        self.follow_in_editor(start, window, cx);
         cx.notify();
     }
 
@@ -1198,6 +1215,16 @@ impl LiveView {
     /// content (past a fence's first line).
     fn edit_raw(&mut self, start: usize, window: &mut Window, cx: &mut Context<Self>) {
         if !self.editor.read(cx).is_editable() {
+            return;
+        }
+        // Split: its Markdown is beside the page; the editor goes there.
+        if self.in_split(cx) {
+            let content = self.source[start..].find('\n').map_or(start, |n| start + n + 1).min(self.source.len());
+            let block = self.block_markdown(start).unwrap_or(start..start);
+            let (owner, editor) = (self.owner.clone(), self.editor_id);
+            window.defer(cx, move |window, cx| {
+                let _ = owner.update(cx, |app, cx| app.live_clicked(editor, content, Some(block.clone()), true, window, cx));
+            });
             return;
         }
         let Some((range, _)) = self.page.blocks.iter().find(|(r, _)| r.start == start).cloned() else { return };
@@ -1241,6 +1268,17 @@ impl LiveView {
         if let Some(at) = at {
             self.reveal(at);
         }
+        cx.notify();
+    }
+
+    /// Split: the editor's caret at `at`; the same place brought into view.
+    pub(crate) fn reveal_source(&mut self, at: usize, cx: &mut Context<Self>) {
+        self.refresh(cx);
+        let at = self.page.leaf_at(at).map_or_else(
+            || self.page.leaves.iter().find(|l| l.span.start >= at).map_or(at, |l| l.span.start),
+            |_| at,
+        );
+        self.reveal(at);
         cx.notify();
     }
 
@@ -1315,6 +1353,42 @@ impl LiveView {
         self.caret = Some(at.min(self.source.len()));
         window.focus(&self.focus, cx);
         cx.notify();
+    }
+
+    /// Whether the page is Split's, beside the editor (where the Markdown
+    /// is already shown).
+    pub(super) fn in_split(&self, cx: &App) -> bool {
+        self.owner.upgrade().is_some_and(|app| app.read(cx).mode == crate::Mode::Split)
+    }
+
+    /// The Markdown of what's at `at` (in the note): a list item's line, a
+    /// table's cell, else the whole block.
+    fn block_markdown(&self, at: usize) -> Option<Range<usize>> {
+        if let Some(leaf) = self.page.leaf_at(at) {
+            match &self.page.leaves[leaf].kind {
+                Kind::Item(item) => {
+                    let end = self.source[item.line_start..].find('\n').map_or(self.source.len(), |n| item.line_start + n);
+                    return Some(item.line_start..end);
+                }
+                Kind::Cell { .. } => return Some(self.page.leaves[leaf].span.clone()),
+                _ => {}
+            }
+        }
+        self.page.blocks.iter().find(|(r, _)| r.start <= at && at <= r.end).map(|(r, _)| r.clone())
+    }
+
+    /// Split: the editor beside goes to `at` too (a click on the page).
+    fn follow_in_editor(&self, at: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.in_split(cx) {
+            return;
+        }
+        let editor = self.editor_id;
+        let owner = self.owner.clone();
+        let block = self.block_markdown(at);
+        // After this event: the app may be the one dispatching it.
+        window.defer(cx, move |window, cx| {
+            let _ = owner.update(cx, |app, cx| app.live_clicked(editor, at, block, false, window, cx));
+        });
     }
 
     /// The picked block's range, while it's still there.
@@ -1570,11 +1644,13 @@ impl LiveView {
             };
         }
         let text = text.to_string();
+        self.own_edit = true;
         self.editor.update(cx, |editor, cx| {
             editor.set_selected_range(range.clone(), cx);
             editor.replace(text.clone(), window, cx);
         });
         self.refresh(cx);
+        self.own_edit = false;
         self.caret = Some(range.start + text.len());
         cx.notify();
     }
@@ -1600,6 +1676,7 @@ impl LiveView {
         let (text, caret) = to;
         // The block shown as Markdown stays so when what changes is in it.
         self.raw = self.raw.clone().and_then(|raw| moved_range(&self.source, &text, raw));
+        self.own_edit = true;
         self.editor.update(cx, |editor, cx| editor.set_value(text.as_str(), window, cx));
         self.refresh(cx);
         self.caret = Some(caret.min(self.source.len()));
@@ -2411,6 +2488,10 @@ impl LiveView {
     fn toggle_markdown(&mut self, _: &ToggleMarkdown, _: &mut Window, cx: &mut Context<Self>) {
         if self.raw.is_some() {
             self.leave_raw(cx);
+            return;
+        }
+        // Split shows the Markdown beside the page already.
+        if self.in_split(cx) {
             return;
         }
         if !self.editor.read(cx).is_editable() {
@@ -3402,6 +3483,11 @@ impl Render for LiveView {
         {
             rows.push(gap(at, rows.is_empty(), window, cx));
         }
+        // The notes linking here, at the end, as the reader lists them.
+        let editor_id = self.editor_id;
+        if let Ok(footer) = self.owner.update(cx, |app, cx| app.linked_from(editor_id, cx)) {
+            rows.push(footer);
+        }
         // The link card closes once the caret leaves the link (unless it's
         // being typed in).
         if let Some(card) = &self.link_card {
@@ -3670,7 +3756,7 @@ impl Render for LiveView {
         // The menu follows what changes while it's open (⌘B on the
         // selection, say): its buttons, its list, and where it works.
         if self.action_menu.is_some() && (self.caret.is_some() || self.picked.is_some()) {
-            let (buttons, actions) = (self.buttons(), self.actions());
+            let (buttons, actions) = (self.buttons(), self.actions(self.in_split(cx)));
             let scope = actions::Scope { caret: self.caret, anchor: self.anchor, picked: self.picked };
             if let Some(menu) = self.action_menu.as_mut() {
                 menu.buttons = buttons;
