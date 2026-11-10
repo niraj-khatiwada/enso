@@ -599,6 +599,7 @@ struct Enso {
     /// Split: the Markdown of what was clicked on the page, filled in the
     /// editor for a moment, and the wait before it goes.
     editor_flash: Option<(gpui_kit::component::input::RangeDecorationCollection, Task<()>)>,
+
     page_find: Option<find::PageFind>,
     /// Focus Mode: only the page, centred.
     focus_mode: bool,
@@ -739,6 +740,7 @@ impl Enso {
             pending_flash: None,
             flash_task: None,
             editor_flash: None,
+
             page_find: None,
             focus_mode: false,
             focus_track: None,
@@ -948,12 +950,27 @@ impl Enso {
             while at > 0 && !text.is_char_boundary(at) {
                 at -= 1;
             }
+            // In one move with the caret: a line that would land near the
+            // editor's top or bottom edge (or off it) is brought a third of
+            // the way down instead; one well in view stays where it is.
             editor.set_selected_range(at..at, cx);
+            if let Some(line_height) = editor.line_height() {
+                let line = text.slice(0..at).to_string().matches('\n').count();
+                let row = editor.display_map().buffer_line_to_display_row(line);
+                let view = editor.input_bounds().size.height;
+                let offset = editor.scroll_offset();
+                let y = line_height * row as f32 + offset.y;
+                if view > px(0.) && (y < view * 0.2 || y > view * 0.8) {
+                    let wanted = -(line_height * row as f32 - view / 3.);
+                    editor.set_scroll_offset(point(offset.x, wanted.min(px(0.))), cx);
+                }
+            }
         });
         if focus {
             let handle = editor.focus_handle(cx);
             window.focus(&handle, cx);
         }
+
         // Its Markdown, filled for a second, so it's plain where it is.
         if let Some((old, _)) = self.editor_flash.take() {
             old.dispose(cx);
@@ -7077,6 +7094,52 @@ mod transition_tests {
         for _ in 0..3 { draw(cx, handle); cx.run_until_parked(); }
         assert_eq!(cx.update(|cx| live.read(cx).scroll_for_test()), before, "after letting go");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[gpui_kit::test]
+    fn split_brings_the_clicked_markdown_well_into_the_editor(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            bind_view_keys(cx);
+            crate::live::init(cx);
+            crate::settings::init(cx);
+        });
+        let mut source = String::new();
+        for n in 0..120 {
+            source.push_str(&format!("Line {n} of the note.\n\n"));
+        }
+        let (handle, view) = cx.update(|cx| gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+            cx.new(|cx| {
+                let mut app = Enso::new(window, cx);
+                app.add_document(Some(PathBuf::from("centre.md")), source.clone().into(), None, window, cx);
+                app
+            })
+        }).unwrap());
+        cx.update_window(handle, |_, window, cx| view.update(cx, |app, cx| app.set_mode(Mode::Split, window, cx))).unwrap();
+        for _ in 0..3 { draw(cx, handle); cx.run_until_parked(); }
+        let (live, editor) = cx.update(|cx| {
+            let doc = &view.read(cx).documents[0];
+            (doc.live.clone().unwrap(), doc.editor.clone())
+        });
+        // The page scrolled to line 80, and it clicked.
+        let at = source.find("Line 80 ").unwrap();
+        cx.update(|cx| live.update(cx, |live, cx| live.reveal_source(at, cx)));
+        for _ in 0..2 { draw(cx, handle); cx.run_until_parked(); }
+        let line = cx.update(|cx| live.read(cx).text_bounds_for_test(at));
+        let mut visual = gpui_kit::VisualTestContext::from_window(handle, cx);
+        visual.simulate_click(gpui_kit::point(line.left() + gpui_kit::px(2.), line.center().y), gpui_kit::Modifiers::default());
+        // One frame: it's there at once, not at an edge first.
+        cx.run_until_parked();
+        draw(cx, handle);
+        // The editor's caret is on it, well inside the editor, not at an edge.
+        assert_eq!(cx.update(|cx| editor.read(cx).cursor()), at);
+        let (caret, view) = cx.update(|cx| {
+            let e = editor.read(cx);
+            let (caret, _) = e.cursor_layout().expect("the caret laid out");
+            (caret.center().y + e.scroll_offset().y, e.input_bounds())
+        });
+        let (top, height) = (view.top(), view.size.height);
+        assert!(caret > top + height * 0.15 && caret < top + height * 0.85, "caret {caret:?} in {view:?}");
     }
 
     #[gpui_kit::test]
