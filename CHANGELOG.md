@@ -14,15 +14,16 @@ Features:
   - Backspace or Delete in an empty block removes it; the slash menu works on an empty line.
   - Tables like Notion's: each cell is its own field, the arrow keys stay in it, a click anywhere in a cell lands there, and + bars under and beside the table add a row or column. Hovering a cell shows its column's alignment and a ⋯ menu to insert, align and delete rows and columns.
   - Inline HTML formatting (`<b>`, `<u>`, `<mark>`…), entities, reference links, footnotes and inline math are edited in place; a footnote mark or a formula moves and deletes as one, and Cmd/Ctrl + K edits a formula's TeX.
-  - Hovering a highlight shows its colours and a colour picker.
+  - Hovering a highlight shows its colours and a colour picker. Text can be coloured too (Cmd/Ctrl + / › Color › Text Color, with a custom colour picker), written as `<span style="color: …">`.
   - A click on an image (or a diagram, a rule…) selects it; Backspace or Delete removes it, and Enter starts a new line under it.
   - Enter on an empty line adds another, as in Notion: extra blank lines show as empty lines to click into, type on and move through with the arrow keys.
   - Mermaid diagrams, block math, HTML blocks and callouts have an Edit button: their Markdown on the left, drawn live on the right as it's typed; undo and redo stay in it.
-  - Images inside a sentence are drawn in the line, which stays editable around them; callouts are drawn as callouts.
+  - Images inside a sentence (Markdown or `<img>`) are drawn in the line, which stays editable around them, resized by their handles or Cmd/Ctrl + /, with the same toolbar as other images; callouts are drawn as callouts.
   - **Cmd/Ctrl + Shift + E** shows the block at the caret as its Markdown, to edit as text; again, Escape or moving away draws it again.
   - Blocks inside blocks are edited in place too: lists in quotes, and code, quotes and further paragraphs in list items; Enter keeps each line in its container.
   - **Cmd/Ctrl + /** opens actions for what the caret is in, with Convert To, Color and Case as menus of their own: formatting buttons (bold, italic, underline, strikethrough, code, link, highlight, math, clear formatting; written as Markdown or HTML alike), highlight colours, letter case, Convert To, Mark as Done, table rows and columns, and Duplicate, Delete or Edit as Markdown for the block.
 - The outline's section previews read as text in Live Preview, without Markdown.
+- Cmd/Ctrl + = and − make the reading text larger and smaller, as the ⋯ menu's size slider does; Cmd/Ctrl + 0 resets it.
 - Find (Cmd/Ctrl + F) highlights its matches on the live page and scrolls to each; a search result opened flashes its match there; and a heading picked in the outline puts the caret on it.
 
 ### 1.2.0

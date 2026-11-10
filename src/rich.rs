@@ -147,13 +147,23 @@ fn dimension(value: &str) -> Option<DefiniteLength> {
     }
 }
 impl Picture {
+    /// An image in a line of text (no alignment).
+    pub(crate) fn inline(src: &str, alt: &str, width: Option<&str>, height: Option<&str>) -> Self {
+        Self {
+            src: src.to_string(),
+            alt: alt.to_string(),
+            width: width.unwrap_or_default().to_string(),
+            height: height.unwrap_or_default().to_string(),
+            title: String::new(),
+            alignment: Alignment::Left,
+        }
+    }
+
     fn html(&self) -> String {
-        let mut out = format!(
-            "<img src=\"{}\" alt=\"{}\" width=\"{}\"",
-            escape(&self.src),
-            escape(&self.alt),
-            escape(&self.width)
-        );
+        let mut out = format!("<img src=\"{}\" alt=\"{}\"", escape(&self.src), escape(&self.alt));
+        if !self.width.is_empty() {
+            out.push_str(&format!(" width=\"{}\"", escape(&self.width)));
+        }
         if !self.height.is_empty() {
             out.push_str(&format!(" height=\"{}\"", escape(&self.height)));
         }
@@ -361,6 +371,144 @@ pub(crate) fn decorate_mapped(
 #[derive(Clone)]
 struct MermaidBlock {
     source: String,
+}
+
+/// An image's toolbar, at its top right. Every image's toolbar is this one.
+pub(crate) fn image_toolbar_frame(theme: &gpui_kit::component::Theme) -> Div {
+    h_flex()
+        .absolute()
+        .top(px(6.))
+        .right(px(6.))
+        .gap(px(2.))
+        .p(px(2.))
+        .toolbar_surface(theme)
+        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+}
+
+/// An image's tools on its toolbar: view full size, copy and save (for a
+/// file beside the note, or a web image), then Edit. `divider`: one goes
+/// first (after alignment buttons). Returns the toolbar, and what full size
+/// shows (for a double-click).
+pub(crate) fn image_tools(
+    mut toolbar: Div,
+    src: &str,
+    base: Option<&std::path::Path>,
+    owner: WeakEntity<Enso>,
+    theme: &gpui_kit::component::Theme,
+    divider: bool,
+    edit: Option<DiagramEdit>,
+) -> (Div, Option<crate::media::Lightbox>) {
+    let line = || div().w(px(1.)).h(px(14.)).mx(px(2.)).bg(theme.border);
+    let editable = edit.is_some();
+    // The file behind the picture, for viewing full size, copying and saving
+    // it. Web images only exist in GPUI's cache, so they have neither.
+    let local = crate::export::html::local_path(src, base).filter(|p| p.is_file());
+    let web = src.starts_with("https://") || src.starts_with("http://");
+    let full = match &local {
+        Some(path) => Some(crate::media::Lightbox::Image(path.clone())),
+        None if web => Some(crate::media::Lightbox::Web(src.to_string().into())),
+        None => None,
+    };
+    if let Some(full) = full.clone() {
+        let owner = owner.clone();
+        toolbar = toolbar.when(divider, |t| t.child(line())).child(
+            ui::icon_button("image-full", IconName::Maximize, "View Full Size")
+                .xsmall()
+                .compact()
+                .on_click(move |_, w, cx| {
+                    cx.stop_propagation();
+                    let full = full.clone();
+                    let _ = owner.update(cx, |app, cx| app.open_lightbox(full, w, cx));
+                }),
+        );
+    }
+    // A web image copies and saves by downloading it.
+    if local.is_none() && web {
+        let url: SharedString = src.to_string().into();
+        toolbar = toolbar
+            .child({
+                let owner = owner.clone();
+                let url = url.clone();
+                ui::icon_button("image-copy", IconName::Copy, "Copy Image")
+                    .xsmall()
+                    .compact()
+                    .on_click(move |_, _, cx| {
+                        cx.stop_propagation();
+                        let _ = owner.update(cx, |app, cx| app.copy_web_image(url.clone(), cx));
+                    })
+            })
+            .child({
+                let owner = owner.clone();
+                ui::icon_button("image-save", IconName::Download, "Save Image As…")
+                    .xsmall()
+                    .compact()
+                    .on_click(move |_, w, cx| {
+                        cx.stop_propagation();
+                        let _ = owner.update(cx, |app, cx| app.save_web_image(url.clone(), w, cx));
+                    })
+            })
+            .when(editable, |t| t.child(line()));
+    }
+    if let Some(path) = local {
+        toolbar = toolbar
+            .child({
+                let owner = owner.clone();
+                let path = path.clone();
+                ui::icon_button("image-copy", IconName::Copy, "Copy Image")
+                    .xsmall()
+                    .compact()
+                    .on_click(move |_, _, cx| {
+                        cx.stop_propagation();
+                        let _ = owner.update(cx, |app, cx| app.copy_image(path.clone(), cx));
+                    })
+            })
+            .child({
+                let owner = owner.clone();
+                ui::icon_button("image-save", IconName::Download, "Save Image As…")
+                    .xsmall()
+                    .compact()
+                    .on_click(move |_, w, cx| {
+                        cx.stop_propagation();
+                        let _ = owner.update(cx, |app, cx| app.save_image_as(path.clone(), w, cx));
+                    })
+            })
+            .when(editable, |t| t.child(line()));
+    }
+    toolbar = toolbar.when_some(edit, |toolbar, edit| {
+        toolbar.child(
+            div().debug_selector(|| "image-edit-button".into()).child(
+                ui::icon_button("edit-image", IconName::Pencil, "Edit image")
+                    .xsmall()
+                    .compact()
+                    .on_click(move |_, w, cx| {
+                        cx.stop_propagation();
+                        edit(w, cx);
+                    }),
+            ),
+        )
+    });
+    (toolbar, full)
+}
+
+/// An image's resize handle on its `left` (or right) edge, centred on it:
+/// a grab area with a dark bar in it. Every image's handles are this one.
+pub(crate) fn resize_handle<E: Styled + ParentElement + InteractiveElement>(element: E, left: bool) -> E {
+    let element = element.absolute().top(relative(0.5)).mt(px(-24.)).w(px(14.)).h(px(48.));
+    let element = if left { element.left(px(0.)) } else { element.right(px(0.)) };
+    element
+        .flex()
+        .items_center()
+        .justify_center()
+        .cursor(CursorStyle::ResizeLeftRight)
+        .child(
+            div()
+                .w(px(4.))
+                .h(px(32.))
+                .rounded_full()
+                .bg(black().opacity(0.45))
+                .border_1()
+                .border_color(white().opacity(0.85)),
+        )
 }
 
 /// What a diagram's Edit button does (Live Preview: its Markdown, to edit).
@@ -822,33 +970,9 @@ fn render_picture(
                         "image-handle-right".into()
                     }
                 })
-                .absolute()
-                .top(relative(0.5))
-                .mt(px(-24.))
-                .w(px(14.))
-                .h(px(48.))
-                .map(|d| {
-                    if left {
-                        d.left(px(0.))
-                    } else {
-                        d.right(px(0.))
-                    }
-                })
-                .flex()
-                .items_center()
-                .justify_center()
-                .cursor(CursorStyle::ResizeLeftRight)
+                .map(|d| resize_handle(d, left))
                 .opacity(if preview.is_some() { 1. } else { 0. })
                 .group_hover("enso-image", |d| d.opacity(1.))
-                .child(
-                    div()
-                        .w(px(4.))
-                        .h(px(32.))
-                        .rounded_full()
-                        .bg(black().opacity(0.45))
-                        .border_1()
-                        .border_color(white().opacity(0.85)),
-                )
                 .on_click(|_, _, cx| cx.stop_propagation())
                 .on_mouse_down(MouseButton::Left, move |_, w, cx| {
                     cx.stop_propagation();
@@ -873,16 +997,9 @@ fn render_picture(
         );
     }
     let theme = cx.theme().clone();
-    let mut toolbar = h_flex()
-        .absolute()
-        .top(px(6.))
-        .right(px(6.))
-        .gap(px(2.))
-        .p(px(2.))
-        .toolbar_surface(&theme)
+    let mut toolbar = image_toolbar_frame(&theme)
         .opacity(0.)
-        .group_hover("enso-image", |bar| bar.opacity(1.))
-        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation());
+        .group_hover("enso-image", |bar| bar.opacity(1.));
     for (alignment, icon, label) in (!locked).then_some([
         (
             Alignment::Left,
@@ -933,106 +1050,18 @@ fn render_picture(
                 ),
         );
     }
-    // The file behind the picture, for viewing full size, copying and saving
-    // it. Web images only exist in GPUI's cache, so they have neither.
-    let local = crate::export::html::local_path(&picture.src, base.as_deref()).filter(|p| p.is_file());
-    let full = match &local {
-        Some(path) => Some(crate::media::Lightbox::Image(path.clone())),
-        None if picture.src.starts_with("https://") || picture.src.starts_with("http://") => {
-            Some(crate::media::Lightbox::Web(picture.src.clone().into()))
-        }
-        None => None,
-    };
-    if let Some(full) = full.clone() {
-        let owner = owner.clone();
-        toolbar = toolbar
-            .when(!locked, |t| t.child(div().w(px(1.)).h(px(14.)).mx(px(2.)).bg(theme.border)))
-            .child(
-                ui::icon_button("image-full", IconName::Maximize, "View Full Size")
-                    .xsmall()
-                    .compact()
-                    .on_click(move |_, w, cx| {
-                        cx.stop_propagation();
-                        let full = full.clone();
-                        let _ = owner.update(cx, |app, cx| app.open_lightbox(full, w, cx));
-                    }),
-            );
-    }
-    // A web image copies and saves by downloading it.
-    if local.is_none() && (picture.src.starts_with("https://") || picture.src.starts_with("http://")) {
-        let url: SharedString = picture.src.clone().into();
-        toolbar = toolbar
-            .child({
-                let owner = owner.clone();
-                let url = url.clone();
-                ui::icon_button("image-copy", IconName::Copy, "Copy Image")
-                    .xsmall()
-                    .compact()
-                    .on_click(move |_, _, cx| {
-                        cx.stop_propagation();
-                        let _ = owner.update(cx, |app, cx| app.copy_web_image(url.clone(), cx));
-                    })
-            })
-            .child({
-                let owner = owner.clone();
-                ui::icon_button("image-save", IconName::Download, "Save Image As…")
-                    .xsmall()
-                    .compact()
-                    .on_click(move |_, w, cx| {
-                        cx.stop_propagation();
-                        let _ = owner.update(cx, |app, cx| app.save_web_image(url.clone(), w, cx));
-                    })
-            })
-            .when(!locked, |t| t.child(div().w(px(1.)).h(px(14.)).mx(px(2.)).bg(theme.border)));
-    }
-    if let Some(path) = local {
-        toolbar = toolbar
-            .child({
-                let owner = owner.clone();
-                let path = path.clone();
-                ui::icon_button("image-copy", IconName::Copy, "Copy Image")
-                    .xsmall()
-                    .compact()
-                    .on_click(move |_, _, cx| {
-                        cx.stop_propagation();
-                        let _ = owner.update(cx, |app, cx| app.copy_image(path.clone(), cx));
-                    })
-            })
-            .child({
-                let owner = owner.clone();
-                ui::icon_button("image-save", IconName::Download, "Save Image As…")
-                    .xsmall()
-                    .compact()
-                    .on_click(move |_, w, cx| {
-                        cx.stop_propagation();
-                        let _ = owner.update(cx, |app, cx| app.save_image_as(path.clone(), w, cx));
-                    })
-            })
-            .when(!locked, |t| t.child(div().w(px(1.)).h(px(14.)).mx(px(2.)).bg(theme.border)));
-    }
     let opener = owner.clone();
-    toolbar = toolbar.when(!locked, |toolbar| toolbar.child(
-        div().debug_selector(|| "image-edit-button".into()).child(
-            ui::icon_button("edit-image", IconName::Pencil, "Edit image")
-                .xsmall()
-                .compact()
-                .on_click(move |_, w, cx| {
-                    cx.stop_propagation();
-                    if let Some(range) = range.clone() {
-                        let _ = owner.update(cx, |app, cx| {
-                            app.open_picture(
-                                editor_id,
-                                range,
-                                expected.clone(),
-                                picture.clone(),
-                                w,
-                                cx,
-                            )
-                        });
-                    }
-                }),
-        ),
-    ));
+    // Edit: the image's form (alt text, size).
+    let edit: Option<DiagramEdit> = (!locked).then(|| {
+        let owner = owner.clone();
+        let picture = picture.clone();
+        std::rc::Rc::new(move |w: &mut Window, cx: &mut App| {
+            if let Some(range) = range.clone() {
+                let _ = owner.update(cx, |app, cx| app.open_picture(editor_id, range, expected.clone(), picture.clone(), w, cx));
+            }
+        }) as DiagramEdit
+    });
+    let (toolbar, full) = image_tools(toolbar, &picture.src, base.as_deref(), owner.clone(), &theme, !locked, edit);
     let alignment = node.data::<Picture>().unwrap().alignment;
     div()
         .id(("editable-image", node.source_range().map_or(0, |r| r.start)))
@@ -1558,7 +1587,7 @@ impl Enso {
             focus: window.focused(cx),
         })
     }
-    fn open_picture(
+    pub(crate) fn open_picture(
         &mut self,
         id: EntityId,
         range: Range<usize>,

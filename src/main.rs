@@ -68,6 +68,9 @@ actions!(
         ReopenClosedTab,
         Save,
         ToggleView,
+        ZoomIn,
+        ZoomOut,
+        ZoomReset,
         ToggleSplit,
         SwapSplitSides,
         ToggleSidebar,
@@ -759,6 +762,20 @@ impl Enso {
     }
 
     /// Live Preview shows one view, the editable page: no Edit or Split.
+    /// Cmd/Ctrl + = and −: the reading text a point larger or smaller (as
+    /// the ⋯ menu's slider sets it, and kept); Cmd/Ctrl + 0: back to 16.
+    fn zoom(&mut self, step: Option<i8>, cx: &mut Context<Self>) {
+        let style = typography::current(cx);
+        let size = match step {
+            Some(step) => style.size.saturating_add_signed(step),
+            None => typography::ReadingStyle::default().size,
+        };
+        if let Err(error) = typography::set(typography::ReadingStyle { size, ..style }, true, cx) {
+            self.message(error.to_string(), true, cx);
+        }
+        cx.notify();
+    }
+
     pub(crate) fn live_view(&self, cx: &App) -> bool {
         settings::live_preview(cx) && self.active.is_some_and(|i| self.documents[i].live.is_some())
     }
@@ -4491,6 +4508,9 @@ impl Render for Enso {
                     this.delete_entries(picked, w, cx);
                 }
             }))
+            .on_action(cx.listener(|this, _: &ZoomIn, _, cx| this.zoom(Some(1), cx)))
+            .on_action(cx.listener(|this, _: &ZoomOut, _, cx| this.zoom(Some(-1), cx)))
+            .on_action(cx.listener(|this, _: &ZoomReset, _, cx| this.zoom(None, cx)))
             .on_action(cx.listener(|this, _: &ToggleView, window, cx| {
                 let next = if this.mode == Mode::Edit {
                     Mode::Read
@@ -4653,6 +4673,12 @@ fn bind_view_keys(cx: &mut App) {
             // Ctrl+Tab on every platform: on macOS, Cmd+Tab belongs to the
             // system's app switcher, and browsers use Ctrl+Tab there too.
             KeyBinding::new(primary("cmd-shift-enter", "ctrl-shift-enter"), ToggleFocusMode, Some(context)),
+            // Text size, as the ⋯ menu's slider sets it.
+            KeyBinding::new(primary("cmd-=", "ctrl-="), ZoomIn, Some(context)),
+            KeyBinding::new(primary("cmd-+", "ctrl-+"), ZoomIn, Some(context)),
+            KeyBinding::new(primary("cmd-shift-=", "ctrl-shift-="), ZoomIn, Some(context)),
+            KeyBinding::new(primary("cmd--", "ctrl--"), ZoomOut, Some(context)),
+            KeyBinding::new(primary("cmd-0", "ctrl-0"), ZoomReset, Some(context)),
             KeyBinding::new("ctrl-tab", NextTab, Some(context)),
             KeyBinding::new("ctrl-shift-tab", PreviousTab, Some(context)),
         ]);
@@ -6281,10 +6307,14 @@ mod transition_tests {
         caret_at(cx, "marked", 3);
         let labels = menu(cx);
         assert!(labels.contains(&"Sky".to_string()) && !labels.contains(&"Mint".to_string()), "{labels:?}");
-        assert!(labels.contains(&"Custom Color…".to_string()));
-        // Color opens beside the menu; Escape goes back to the menu.
+        assert!(labels.contains(&"Custom Background Color…".to_string()));
+        // Color opens beside the menu, which stays where it is; Escape goes
+        // back to the menu.
+        let before = gpui_kit::VisualTestContext::from_window(handle, cx).debug_bounds("live-actions").expect("the menu");
         cx.update_window(handle, |_, window, cx| live.update(cx, |live, cx| live.open_sub_for_test("Color", window, cx))).unwrap();
         draw(cx, handle);
+        let after = gpui_kit::VisualTestContext::from_window(handle, cx).debug_bounds("live-actions").expect("the menu");
+        assert_eq!(before, after);
         assert_eq!(cx.update(|cx| live.read(cx).sub_for_test()), Some("Color"));
         cx.simulate_keystrokes(handle, "escape");
         draw(cx, handle);
@@ -6566,6 +6596,149 @@ mod transition_tests {
         cx.update_window(handle, |_, window, cx| view.update(cx, |app, cx| app.jump_to_heading(id, later, window, cx))).unwrap();
         draw(cx, handle);
         assert_eq!(cx.update(|cx| live.read(cx).caret_for_test()), Some(later + 3));
+    }
+
+    #[gpui_kit::test]
+    fn live_preview_colors_text(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            bind_view_keys(cx);
+            crate::live::init(cx);
+            crate::settings::init(cx);
+            gpui_kit::BorrowAppContext::update_global::<crate::settings::Preferences, _>(cx, |p, _| p.live_preview = true);
+        });
+        let source = "Some plain words.\n";
+        let (handle, view) = cx.update(|cx| gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+            cx.new(|cx| {
+                let mut app = Enso::new(window, cx);
+                app.add_document(Some(PathBuf::from("colors.md")), source.into(), None, window, cx);
+                app
+            })
+        }).unwrap());
+        for _ in 0..3 { draw(cx, handle); cx.run_until_parked(); }
+        let (live, editor) = cx.update(|cx| {
+            let doc = &view.read(cx).documents[0];
+            (doc.live.clone().unwrap(), doc.editor.clone())
+        });
+        let text = |cx: &mut TestAppContext| cx.update(|cx| editor.read(cx).value().to_string());
+        let open = if cfg!(target_os = "macos") { "cmd-/" } else { "ctrl-/" };
+        let menu = |cx: &mut TestAppContext| {
+            cx.simulate_keystrokes(handle, open);
+            draw(cx, handle);
+            cx.update(|cx| live.read(cx).actions_for_test()).expect("the actions menu")
+        };
+        let choose = |cx: &mut TestAppContext, label: &'static str| {
+            cx.update_window(handle, |_, window, cx| live.update(cx, |live, cx| live.choose_for_test(label, window, cx))).unwrap();
+            draw(cx, handle);
+        };
+        cx.update_window(handle, |_, window, cx| {
+            let focus = live.read(cx).focus.clone();
+            window.focus(&focus, cx);
+            live.update(cx, |live, _| live.select_for_test(5..10));
+        }).unwrap();
+        draw(cx, handle);
+        // A colour on the selection, another instead, then the page's own.
+        let labels = menu(cx);
+        assert!(labels.contains(&"Blue Text".to_string()) && !labels.contains(&"Default Text".to_string()), "{labels:?}");
+        choose(cx, "Blue Text");
+        assert_eq!(text(cx), "Some <span style=\"color: #337ea9\">plain</span> words.\n");
+        let labels = menu(cx);
+        assert!(labels.contains(&"Default Text".to_string()) && !labels.contains(&"Blue Text".to_string()), "{labels:?}");
+        choose(cx, "Red Text");
+        assert_eq!(text(cx), "Some <span style=\"color: #d44c47\">plain</span> words.\n");
+        menu(cx);
+        choose(cx, "Default Text");
+        assert_eq!(text(cx), source);
+        // Custom: the card, and a colour from its picker.
+        cx.update_window(handle, |_, window, cx| {
+            let focus = live.read(cx).focus.clone();
+            window.focus(&focus, cx);
+            live.update(cx, |live, _| live.select_for_test(5..10));
+        }).unwrap();
+        draw(cx, handle);
+        menu(cx);
+        choose(cx, "Custom Text Color…");
+        cx.update_window(handle, |_, window, cx| {
+            live.update(cx, |live, cx| live.pick_text_color_for_test(gpui_kit::rgb(0x123456).into(), window, cx))
+        })
+        .unwrap();
+        draw(cx, handle);
+        assert_eq!(text(cx), "Some <span style=\"color: #123456\">plain</span> words.\n");
+        // An image in the text: its size from the menu, as <img width>.
+        let picture = "Text ![p](a.png) here\n";
+        cx.update_window(handle, |_, window, cx| editor.update(cx, |e, cx| e.set_value(picture, window, cx))).unwrap();
+        draw(cx, handle);
+        cx.update_window(handle, |_, window, cx| {
+            let focus = live.read(cx).focus.clone();
+            window.focus(&focus, cx);
+            live.update(cx, |live, _| live.set_caret_for_test(picture.find(" here").unwrap()));
+        }).unwrap();
+        draw(cx, handle);
+        let labels = menu(cx);
+        assert!(labels.contains(&"Medium".to_string()) && !labels.contains(&"Default Size".to_string()), "{labels:?}");
+        choose(cx, "Medium");
+        assert_eq!(text(cx), "Text <img src=\"a.png\" alt=\"p\" width=\"240\" /> here\n");
+        let labels = menu(cx);
+        assert!(labels.contains(&"Default Size".to_string()) && !labels.contains(&"Medium".to_string()), "{labels:?}");
+        choose(cx, "Full Width");
+        assert_eq!(text(cx), "Text <img src=\"a.png\" alt=\"p\" width=\"100%\" /> here\n");
+        cx.simulate_keystrokes(handle, "escape");
+        // Resting the pointer on it: its handles; the right one dragged
+        // 100px left makes it 100px narrower.
+        let on = cx.update(|cx| live.read(cx).image_point_for_test()).expect("the image");
+        let mut visual = gpui_kit::VisualTestContext::from_window(handle, cx);
+        visual.simulate_event(gpui_kit::MouseMoveEvent { position: on, pressed_button: None, modifiers: gpui_kit::Modifiers::none() });
+        draw(cx, handle);
+        let rect = cx.update(|cx| live.read(cx).hovered_image_for_test()).expect("the image's handles");
+        // Its toolbar too: the same one as an image's on its own line.
+        assert!(gpui_kit::VisualTestContext::from_window(handle, cx).debug_bounds("image-edit-button").is_some());
+        let grip = gpui_kit::point(rect.right() - gpui_kit::px(6.), rect.center().y);
+        let mut visual = gpui_kit::VisualTestContext::from_window(handle, cx);
+        visual.simulate_event(gpui_kit::MouseDownEvent { position: grip, button: gpui_kit::MouseButton::Left, modifiers: gpui_kit::Modifiers::none(), click_count: 1, first_mouse: false });
+        visual.simulate_event(gpui_kit::MouseMoveEvent { position: gpui_kit::point(grip.x - gpui_kit::px(100.), grip.y), pressed_button: Some(gpui_kit::MouseButton::Left), modifiers: gpui_kit::Modifiers::none() });
+        visual.simulate_event(gpui_kit::MouseUpEvent { position: gpui_kit::point(grip.x - gpui_kit::px(100.), grip.y), button: gpui_kit::MouseButton::Left, modifiers: gpui_kit::Modifiers::none(), click_count: 1 });
+        draw(cx, handle);
+        let narrower = (f32::from(rect.size.width) - 100.).round() as i32;
+        let written: i32 = text(cx).split("width=\"").nth(1).and_then(|w| w.split('"').next()).and_then(|w| w.parse().ok()).unwrap_or(-1);
+        assert!((written - narrower).abs() <= 1, "{} vs {narrower}", text(cx));
+        cx.update_window(handle, |_, window, cx| {
+            let focus = live.read(cx).focus.clone();
+            window.focus(&focus, cx);
+            let at = editor.read(cx).value().find(" here").unwrap();
+            live.update(cx, |live, _| live.set_caret_for_test(at));
+        }).unwrap();
+        draw(cx, handle);
+        menu(cx);
+        choose(cx, "Default Size");
+        assert_eq!(text(cx), picture);
+    }
+
+    #[gpui_kit::test]
+    fn zoom_keys_set_the_reading_size(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            bind_view_keys(cx);
+            crate::settings::init(cx);
+        });
+        let (handle, view) = cx.update(|cx| gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+            cx.new(|cx| {
+                let mut app = Enso::new(window, cx);
+                app.add_document(Some(PathBuf::from("zoom.md")), "# Zoom\n".into(), None, window, cx);
+                app
+            })
+        }).unwrap());
+        cx.update_window(handle, |_, window, cx| view.update(cx, |app, cx| app.set_mode(Mode::Read, window, cx))).unwrap();
+        for _ in 0..3 { draw(cx, handle); cx.run_until_parked(); }
+        let size = |cx: &mut TestAppContext| cx.update(|cx| crate::typography::current(cx).size);
+        let key = |k: &str| if cfg!(target_os = "macos") { format!("cmd-{k}") } else { format!("ctrl-{k}") };
+        let start = size(cx);
+        cx.simulate_keystrokes(handle, &key("="));
+        assert_eq!(size(cx), start + 1);
+        cx.simulate_keystrokes(handle, &key("-"));
+        cx.simulate_keystrokes(handle, &key("-"));
+        assert_eq!(size(cx), start - 1);
+        cx.simulate_keystrokes(handle, &key("0"));
+        assert_eq!(size(cx), 16);
     }
 
     #[gpui_kit::test]

@@ -49,8 +49,8 @@ dirs = "6.0.0"
 futures = "0.3"
 chrono = "0.4"
 url = "2"
-gpui-test = { package = "gpui-pre", version = "=0.3.10", features = ["test-support"], optional = true }
-gpui-kit = "0.8.1"
+gpui-test = { package = "gpui-pre", version = "=0.3.12", features = ["test-support"], optional = true }
+gpui-kit = "0.9.1"
 ropey = "=2.0.0-beta.1"
 # Export: Markdown parsed as the reader parses it, HTML with its images, PDFs
 # laid out by enso itself and written by krilla (text shaped by rustybuzz, in
@@ -76,6 +76,7 @@ resvg = { version = "0.46", default-features = false, features = ["text", "syste
 # rather than a bundled TLS stack.
 ureq = { version = "3.5", default-features = false, features = ["native-tls-no-default"] }
 bytes = "1"
+anyhow = "1"
 latex-rust = { version = "=2.1.1", default-features = false, features = ["std"] }
 
 # Moving deleted files to the Trash: the trash crate on macOS and Linux;
@@ -112,7 +113,7 @@ codegen-units = 1
 opt-level = "s"
 strip = true
 
-# Upstream 0.3.10 uses unstable Option::map_or_default on macOS.
+# Upstream 0.3.12 uses unstable Option::map_or_default on macOS.
 # Keep the supplied GPUI Kit version working with stable Rust.
 [patch.crates-io]
 gpui-pre-macos = { path = "vendor/gpui-pre-macos" }

@@ -35,6 +35,13 @@ pub enum Act {
     /// The highlight card, held open for its colour picker.
     CustomColor,
     RemoveHighlight,
+    /// The image in the text at this width in pixels (`Some(0)`: the
+    /// line's; `None`: the default size).
+    ImageSize(Option<u16>),
+    /// The text's colour (`None`: back to the page's own).
+    TextColor(Option<u32>),
+    /// The text colour card, with its picker.
+    CustomTextColor,
     EditLink,
     RemoveLink,
     OpenLink(String),
@@ -100,11 +107,39 @@ pub struct Action {
     pub act: Act,
     /// A colour shown beside it (a highlight swatch).
     pub swatch: Option<Hsla>,
+    /// The swatch is a letter in that colour (a text colour).
+    pub letter: bool,
+    /// Its heading within its group's submenu (Text Color, Background
+    /// Color), when the group has more than one.
+    pub section: Option<&'static str>,
 }
 
 fn action(group: &'static str, label: impl std::convert::Into<String>, keywords: &'static [&'static str], act: Act) -> Action {
-    Action { group, label: label.into(), keywords, act, swatch: None }
+    Action { group, label: label.into(), keywords, act, swatch: None, letter: false, section: None }
 }
+
+/// The sizes offered for an image in the text: pixels wide (`Some(0)`: the
+/// line's width; `None`: the default size).
+pub const IMAGE_SIZES: [(&str, Option<u16>); 5] = [
+    ("Small", Some(120)),
+    ("Medium", Some(240)),
+    ("Large", Some(400)),
+    ("Full Width", Some(0)),
+    ("Default Size", None),
+];
+
+/// The text colours offered, by name: Notion's, legible on light and dark.
+pub const TEXT_COLORS: [(&str, u32); 9] = [
+    ("Gray", 0x8a8986),
+    ("Brown", 0xa27763),
+    ("Orange", 0xd9730d),
+    ("Yellow", 0xcb912f),
+    ("Green", 0x448361),
+    ("Blue", 0x337ea9),
+    ("Purple", 0x9065b0),
+    ("Pink", 0xc14c8a),
+    ("Red", 0xd44c47),
+];
 
 /// Where the menu was opened: restored before an action runs, since the
 /// menu's search field takes the focus (and with it the caret) meanwhile.
@@ -172,6 +207,43 @@ impl LiveView {
                 let inner = flow.shown_for(m.open.end)..flow.shown_for(m.close.start);
                 inner.start <= shown.start && shown.end <= inner.end
             });
+            // An image in the text, beside the caret: its size.
+            if let Some(image) = flow.image_at(shown.start).filter(|_| !selected || flow.image_at(shown.end).is_some()) {
+                let current = image.width.as_deref().and_then(|w| w.trim().trim_end_matches("px").parse::<u16>().ok());
+                for (label, size) in IMAGE_SIZES {
+                    let now = match size {
+                        None => image.width.is_none(),
+                        Some(0) => image.width.as_deref() == Some("100%"),
+                        Some(px) => current == Some(px),
+                    };
+                    if !now {
+                        out.push(action("Image", label, &["image", "picture", "size", "resize", "width"], Act::ImageSize(size)));
+                    }
+                }
+            }
+            // Text colour: of the selection, or the word at the caret.
+            if let Some(word) = self.selection_or_word(i).filter(|w| !w.is_empty()) {
+                let current = flow.color_over(word).map(|(_, _, c)| rich::highlight_hex(c));
+                let mut text = |label: String, act: Act, swatch: Hsla| {
+                    let mut a = action("Color", label, &["text", "color", "colour", "font"], act);
+                    a.swatch = Some(swatch);
+                    a.letter = true;
+                    a.section = Some("Text Color");
+                    out.push(a);
+                };
+                if current.is_some() {
+                    text("Default Text".into(), Act::TextColor(None), gpui_kit::transparent_black());
+                }
+                for (name, value) in TEXT_COLORS {
+                    let swatch: Hsla = rgb(value).into();
+                    if current.as_deref() != Some(rich::highlight_hex(swatch).as_str()) {
+                        text(format!("{name} Text"), Act::TextColor(Some(value)), swatch);
+                    }
+                }
+                let mut custom = action("Color", "Custom Text Color…", &["text", "picker", "color", "colour", "font"], Act::CustomTextColor);
+                custom.section = Some("Text Color");
+                out.push(custom);
+            }
             if mark.is_some() || selected {
                 let current = mark.as_ref().map(|m| rich::highlight_hex(m.color));
                 for (name, value) in rich::HIGHLIGHTS {
@@ -179,13 +251,18 @@ impl LiveView {
                     if current.as_deref() == Some(rich::highlight_hex(swatch).as_str()) {
                         continue;
                     }
-                    let mut a = action("Color", name, &["highlight", "mark", "color", "colour"], Act::Highlight(value));
+                    let mut a = action("Color", name, &["highlight", "mark", "color", "colour", "background"], Act::Highlight(value));
                     a.swatch = Some(swatch);
+                    a.section = Some("Background Color");
                     out.push(a);
                 }
-                out.push(action("Color", "Custom Color…", &["highlight", "picker", "color", "colour"], Act::CustomColor));
+                let mut custom = action("Color", "Custom Background Color…", &["highlight", "picker", "color", "colour", "background"], Act::CustomColor);
+                custom.section = Some("Background Color");
+                out.push(custom);
                 if mark.is_some() {
-                    out.push(action("Color", "Remove Highlight", &["mark", "color", "colour"], Act::RemoveHighlight));
+                    let mut remove = action("Color", "Remove Highlight", &["mark", "color", "colour", "background"], Act::RemoveHighlight);
+                    remove.section = Some("Background Color");
+                    out.push(remove);
                 }
             }
             // A link: edit, open or remove it. A selection: link it.
@@ -453,6 +530,13 @@ impl LiveView {
             Act::Case(case) => self.change_case(case, window, cx),
             Act::Highlight(value) => self.highlight(Some(rgb(value).into()), window, cx),
             Act::CustomColor => self.highlight(None, window, cx),
+            Act::ImageSize(size) => self.image_size(size, window, cx),
+            Act::TextColor(color) => self.apply_text_color(color.map(|c| rgb(c).into()), window, cx),
+            Act::CustomTextColor => {
+                let Some(Spot::Leaf(i)) = self.spot() else { return };
+                let current = self.selection_or_word(i).and_then(|w| self.page.leaves[i].flow.color_over(w)).map(|(_, _, c)| c);
+                self.open_text_color_card(current, window, cx);
+            }
             Act::RemoveHighlight => {
                 if self.open_mark_card_at_caret(false, window, cx) {
                     self.recolor_mark(None, window, cx);
@@ -507,6 +591,67 @@ impl LiveView {
                 self.remove_block(range, true, window, cx);
             }
         }
+    }
+
+    /// The image in the text beside the caret, rewritten at `size` percent
+    /// of the line (`<img … width>`), or as `![alt](src)` at its own size.
+    fn image_size(&mut self, size: Option<u16>, window: &mut Window, cx: &mut Context<Self>) {
+        let (Some(caret), Some(Spot::Leaf(i))) = (self.caret, self.spot()) else { return };
+        let flow = self.page.leaves[i].flow.clone();
+        let Some(image) = flow.image_at(flow.shown_for(caret)).cloned() else { return };
+        self.resize_image(&image, size, window, cx);
+    }
+
+    /// `image` rewritten at `size`: `<img … width>` in pixels (`Some(0)`:
+    /// the line's whole width), or `![alt](src)` at the default size.
+    pub(super) fn resize_image(&mut self, image: &super::flow::InlineImage, size: Option<u16>, window: &mut Window, cx: &mut Context<Self>) {
+        let caret = self.caret.unwrap_or(image.source.end);
+        let quote = |text: &str| text.replace('"', "&quot;");
+        let markdown = match size {
+            Some(width) => {
+                let width = if width == 0 { "100%".to_string() } else { width.to_string() };
+                format!("<img src=\"{}\" alt=\"{}\" width=\"{width}\" />", quote(&image.url), quote(&image.alt))
+            }
+            None => format!("![{}]({})", image.alt.replace(['[', ']'], ""), image.url),
+        };
+        let after = caret >= image.source.end;
+        self.edit(image.source.clone(), &markdown, window, cx);
+        self.anchor = None;
+        self.caret = Some(if after { image.source.start + markdown.len() } else { image.source.start });
+        cx.notify();
+    }
+
+    /// The selection's (or word's) text colour: the colour it's in changed,
+    /// or a new `<span style="color: …">` around it; `None`: back to the
+    /// page's own colour.
+    pub(super) fn apply_text_color(&mut self, color: Option<Hsla>, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(Spot::Leaf(i)) = self.spot() else { return };
+        let Some(shown) = self.selection_or_word(i).filter(|s| !s.is_empty()) else { return };
+        let flow = self.page.leaves[i].flow.clone();
+        let tag = color.map(|c| format!("<span style=\"color: {}\">", rich::highlight_hex(c)));
+        let (caret, anchor) = (self.caret, self.anchor);
+        match (flow.color_over(shown.clone()), tag) {
+            // Coloured already: a new colour in its tag, or the tags gone.
+            (Some((open, _, _)), Some(tag)) => {
+                let grown = tag.len() as isize - open.len() as isize;
+                self.edit(open.clone(), &tag, window, cx);
+                let keep = |at: usize| if at >= open.end { (at as isize + grown) as usize } else { at };
+                self.caret = caret.map(keep);
+                self.anchor = anchor.map(keep);
+            }
+            (Some((open, close, _)), None) => self.remove_tags(open, close, window, cx),
+            (None, Some(tag)) => {
+                let Some(span) = flow.char_span(shown) else { return };
+                self.edit(span.end..span.end, "</span>", window, cx);
+                self.last_edit = Some(std::time::Instant::now());
+                self.edit(span.start..span.start, &tag, window, cx);
+                let keep = |at: usize| if at >= span.end { at + tag.len() + 7 } else if at >= span.start { at + tag.len() } else { at };
+                self.caret = caret.map(keep);
+                self.anchor = anchor.map(keep);
+            }
+            (None, None) => return,
+        }
+        cx.notify();
     }
 
     /// The selection (or the word at the caret) in a new case, letter by

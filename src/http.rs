@@ -6,7 +6,7 @@
 use bytes::Bytes;
 use futures::future::BoxFuture;
 use gpui_kit::http_client::{
-    self, AsyncBody, HttpClient, Url,
+    AsyncBody, HttpClient, Url,
     http::{HeaderValue, Request, Response},
 };
 use std::{
@@ -66,33 +66,33 @@ impl HttpClient for Client {
         None
     }
 
-    fn send(&self, request: Request<AsyncBody>) -> BoxFuture<'static, http_client::Result<Response<AsyncBody>>> {
+    fn send(&self, request: Request<AsyncBody>) -> BoxFuture<'static, anyhow::Result<Response<AsyncBody>>> {
         let agent = self.agent.clone();
         let user_agent = self.user_agent.clone();
         let uri = request.uri().to_string();
         let enabled = self.enabled.load(Ordering::Relaxed);
         Box::pin(async move {
             if !enabled {
-                return Err(http_client::anyhow!("Web images are turned off in Settings."));
+                return Err(anyhow::anyhow!("Web images are turned off in Settings."));
             }
             if !(uri.starts_with("https://") || uri.starts_with("http://")) {
-                return Err(http_client::anyhow!("Only web addresses are fetched: {uri}"));
+                return Err(anyhow::anyhow!("Only web addresses are fetched: {uri}"));
             }
             // ureq blocks; the window's executor must not.
             let (tx, rx) = futures::channel::oneshot::channel();
             std::thread::spawn(move || {
                 let _ = tx.send(fetch(&agent, &uri, &user_agent));
             });
-            rx.await.map_err(|_| http_client::anyhow!("The download stopped."))?
+            rx.await.map_err(|_| anyhow::anyhow!("The download stopped."))?
         })
     }
 }
 
 /// Download `uri` (blocking: call it off the window's thread), within the
 /// same limits as images shown in notes. The bytes and their content type.
-pub fn download(uri: &str) -> http_client::Result<(Vec<u8>, Option<String>)> {
+pub fn download(uri: &str) -> anyhow::Result<(Vec<u8>, Option<String>)> {
     if !ENABLED.load(Ordering::Relaxed) {
-        return Err(http_client::anyhow!("Web images are turned off in Settings."));
+        return Err(anyhow::anyhow!("Web images are turned off in Settings."));
     }
     let client = Client::new();
     let mut response = client
@@ -100,7 +100,7 @@ pub fn download(uri: &str) -> http_client::Result<(Vec<u8>, Option<String>)> {
         .get(uri)
         .header("User-Agent", client.user_agent.to_str().unwrap_or("enso"))
         .call()
-        .map_err(|e| http_client::anyhow!("{e}"))?;
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
     let content_type = response
         .headers()
         .get("content-type")
@@ -111,14 +111,14 @@ pub fn download(uri: &str) -> http_client::Result<(Vec<u8>, Option<String>)> {
         .with_config()
         .limit(LIMIT)
         .read_to_vec()
-        .map_err(|e| http_client::anyhow!("{e}"))?;
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
     Ok((bytes, content_type))
 }
 
 /// Fetch a small text document such as a JSON API reply (blocking: call it
 /// off the window's thread). Not governed by Load Web Images, which is only
 /// about pictures in notes; callers have their own switch.
-pub fn get_text(uri: &str, accept: &str) -> http_client::Result<String> {
+pub fn get_text(uri: &str, accept: &str) -> anyhow::Result<String> {
     let client = Client::new();
     let mut response = client
         .agent
@@ -126,21 +126,21 @@ pub fn get_text(uri: &str, accept: &str) -> http_client::Result<String> {
         .header("User-Agent", client.user_agent.to_str().unwrap_or("enso"))
         .header("Accept", accept)
         .call()
-        .map_err(|e| http_client::anyhow!("{e}"))?;
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
     response
         .body_mut()
         .with_config()
         .limit(1024 * 1024)
         .read_to_string()
-        .map_err(|e| http_client::anyhow!("{e}"))
+        .map_err(|e| anyhow::anyhow!("{e}"))
 }
 
-fn fetch(agent: &ureq::Agent, uri: &str, user_agent: &HeaderValue) -> http_client::Result<Response<AsyncBody>> {
+fn fetch(agent: &ureq::Agent, uri: &str, user_agent: &HeaderValue) -> anyhow::Result<Response<AsyncBody>> {
     let mut response = agent
         .get(uri)
         .header("User-Agent", user_agent.to_str().unwrap_or("enso"))
         .call()
-        .map_err(|e| http_client::anyhow!("{e}"))?;
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
     let status = response.status();
     let content_type = response.headers().get("content-type").cloned();
     let bytes = response
@@ -148,14 +148,14 @@ fn fetch(agent: &ureq::Agent, uri: &str, user_agent: &HeaderValue) -> http_clien
         .with_config()
         .limit(LIMIT)
         .read_to_vec()
-        .map_err(|e| http_client::anyhow!("{e}"))?;
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
     let mut builder = Response::builder().status(status);
     if let Some(content_type) = content_type {
         builder = builder.header("content-type", content_type);
     }
     builder
         .body(AsyncBody::from_bytes(Bytes::from(bytes)))
-        .map_err(|e| http_client::anyhow!("{e}"))
+        .map_err(|e| anyhow::anyhow!("{e}"))
 }
 
 #[cfg(test)]

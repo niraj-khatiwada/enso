@@ -42,6 +42,20 @@ impl Wrap {
     }
 }
 
+/// An image in a line of text, drawn as one unit.
+#[derive(Clone, Debug, PartialEq)]
+pub struct InlineImage {
+    /// Where it's drawn (its `U+FFFC`).
+    pub shown: Range<usize>,
+    /// Its Markdown (`![…](…)` or `<img …>`).
+    pub source: Range<usize>,
+    pub url: String,
+    pub alt: String,
+    /// As written: `50%`, `120` (pixels).
+    pub width: Option<String>,
+    pub height: Option<String>,
+}
+
 /// A highlight: its Markdown, its tags, and its colour.
 #[derive(Clone, Debug, PartialEq)]
 pub struct MarkAt {
@@ -86,7 +100,9 @@ pub struct Flow {
     pub maths: Vec<(Range<usize>, Range<usize>, String)>,
     /// Images in the text, each drawn as one unit (`U+FFFC`): where, and
     /// its address and alt text.
-    pub images: Vec<(Range<usize>, String, String)>,
+    pub images: Vec<InlineImage>,
+    /// Text drawn in a colour of its own (`<span style="color: …">`).
+    pub colors: Vec<(Range<usize>, gpui_kit::Hsla)>,
 }
 
 /// The drawn form of the block at `range` of `source`, or `None` when it holds
@@ -288,19 +304,43 @@ fn walk(block: &str, base: usize, nodes: &[Node], mark: TextMark, flow: &mut Flo
                 if closing {
                     return None;
                 }
+                // `<img src="…" width="…">` in the text: the image, at its size.
+                if name == "img" {
+                    let url = attribute(&attrs, "src")?;
+                    let start = flow.text.len();
+                    push_atom(flow, "\u{FFFC}", base + at.start..base + at.end, TextMark::default());
+                    flow.images.push(InlineImage {
+                        shown: start..flow.text.len(),
+                        source: base + at.start..base + at.end,
+                        url,
+                        alt: attribute(&attrs, "alt").unwrap_or_default(),
+                        width: attribute(&attrs, "width"),
+                        height: attribute(&attrs, "height"),
+                    });
+                    continue;
+                }
                 if name == "br" {
                     let start = flow.text.len();
                     flow.text.push('\n');
                     flow.chars.push(Char { shown: start..start + 1, source: base + at.start..base + at.end });
                     continue;
                 }
-                let tag_mark = html_mark(&name, &attrs)?;
+                // A text colour (`<span style="color">`, `<font color>`), or
+                // formatting.
+                let color = text_color(&name, &attrs);
+                let tag_mark = match color {
+                    Some(_) => TextMark::default(),
+                    None => html_mark(&name, &attrs)?,
+                };
                 let close = matching_close(nodes, index - 1, &name)?;
                 let close_at = nodes[close].position()?;
                 let mut inner_mark = mark.clone();
                 inner_mark.merge(tag_mark);
                 let start = flow.text.len();
                 walk(block, base, &nodes[index..close], inner_mark, flow)?;
+                if let Some(color) = color {
+                    flow.colors.push((start..flow.text.len(), color));
+                }
                 flow.wrappers.push(Wrapper {
                     kind: Wrap::Html,
                     shown: start..flow.text.len(),
@@ -409,7 +449,14 @@ fn walk(block: &str, base: usize, nodes: &[Node], mark: TextMark, flow: &mut Flo
             Node::Image(image) => {
                 let start = flow.text.len();
                 push_atom(flow, "\u{FFFC}", base + at.start..base + at.end, TextMark::default());
-                flow.images.push((start..flow.text.len(), image.url.clone(), image.alt.clone()));
+                flow.images.push(InlineImage {
+                    shown: start..flow.text.len(),
+                    source: base + at.start..base + at.end,
+                    url: image.url.clone(),
+                    alt: image.alt.clone(),
+                    width: None,
+                    height: None,
+                });
             }
             // Anything else: not drawn by this editor yet.
             _ => return None,
@@ -444,6 +491,50 @@ fn html_mark(name: &str, attrs: &str) -> Option<TextMark> {
         _ => return None,
     }
     Some(mark)
+}
+
+/// A tag's attribute value (`name="…"` or `name='…'`).
+fn attribute(attrs: &str, name: &str) -> Option<String> {
+    let at = attrs.find(&format!("{name}="))? + name.len() + 1;
+    let rest = &attrs[at..];
+    let quote = rest.chars().next().filter(|c| *c == '"' || *c == '\'')?;
+    let end = rest[1..].find(quote)? + 1;
+    Some(rest[1..end].to_string())
+}
+
+/// A CSS colour as `#rgb`, `#rrggbb`, `#rrggbbaa` or a few names.
+fn parse_color(value: &str) -> Option<gpui_kit::Hsla> {
+    let value = value.trim();
+    if value.starts_with('#') {
+        return gpui_kit::Rgba::try_from(value).ok().map(Into::into);
+    }
+    let rgb = |hex: u32| Some(gpui_kit::rgb(hex).into());
+    match value.to_ascii_lowercase().as_str() {
+        "black" => rgb(0x000000),
+        "white" => rgb(0xffffff),
+        "gray" | "grey" => rgb(0x787774),
+        "red" => rgb(0xd44c47),
+        "orange" => rgb(0xd9730d),
+        "yellow" => rgb(0xcb912f),
+        "green" => rgb(0x448361),
+        "blue" => rgb(0x337ea9),
+        "purple" => rgb(0x9065b0),
+        "pink" => rgb(0xc14c8a),
+        "brown" => rgb(0x9f6b53),
+        _ => None,
+    }
+}
+
+/// The text colour a tag gives: `<span style="color: …">`, `<font color>`.
+fn text_color(name: &str, attrs: &str) -> Option<gpui_kit::Hsla> {
+    match name {
+        "font" => attribute(attrs, "color").and_then(|c| parse_color(&c)),
+        "span" => attribute(attrs, "style")?.split(';').find_map(|d| {
+            let (key, value) = d.split_once(':')?;
+            key.trim().eq_ignore_ascii_case("color").then(|| parse_color(value)).flatten()
+        }),
+        _ => None,
+    }
 }
 
 /// A `<mark>`'s colour: `color`, else `style`'s `background-color`, else
@@ -976,6 +1067,24 @@ impl Flow {
         Some(LinkAt { source: w.source.clone(), text: self.text[w.shown.clone()].to_string(), url, wiki: w.kind == Wrap::Wiki })
     }
 
+    /// The image in the text at (or right beside) drawn position `at`.
+    pub fn image_at(&self, at: usize) -> Option<&InlineImage> {
+        self.images.iter().find(|i| i.shown.start <= at && at <= i.shown.end)
+    }
+
+    /// The text colour (`<span style="color">`, `<font color>`) around drawn
+    /// text `shown`: its opening and closing tags, and the colour.
+    pub fn color_over(&self, shown: Range<usize>) -> Option<(Range<usize>, Range<usize>, gpui_kit::Hsla)> {
+        let w = self
+            .wrappers
+            .iter()
+            .filter(|w| w.kind == Wrap::Html && !w.shown.is_empty() && w.shown.start <= shown.start && shown.end <= w.shown.end)
+            .filter_map(|w| inline_tag(&w.open).and_then(|(_, name, attrs)| text_color(&name, &attrs)).map(|c| (w, c)))
+            .min_by_key(|(w, _)| w.source.len())?;
+        let (w, color) = w;
+        Some((w.source.start..w.source.start + w.open.len(), w.source.end - w.close.len()..w.source.end, color))
+    }
+
     /// The highlight (`<mark>`) at drawn position `at` (`within`: strictly
     /// on a letter of it, as under the pointer): the whole run, its opening
     /// and closing tags, and its colour.
@@ -1212,11 +1321,33 @@ mod tests {
         let f = of(source);
         assert_eq!(f.text, "Text with \u{FFFC} in it");
         let at = f.text.find('\u{FFFC}').unwrap();
-        assert_eq!(f.images, vec![(at..at + 3, "photo.jpg".to_string(), "a photo".to_string())]);
+        assert_eq!((f.images[0].shown.clone(), f.images[0].url.as_str(), f.images[0].alt.as_str()), (at..at + 3, "photo.jpg", "a photo"));
+        // As HTML, with its size.
+        let html = "Text <img src=\"a.png\" alt=\"x\" width=\"40%\" /> here";
+        let h = of(html);
+        assert_eq!(h.text, "Text \u{FFFC} here");
+        assert_eq!((h.images[0].url.as_str(), h.images[0].width.as_deref()), ("a.png", Some("40%")));
+        assert_eq!(&html[h.images[0].source.clone()], "<img src=\"a.png\" alt=\"x\" width=\"40%\" />");
         assert_eq!(f.step(at, true), at + 3);
         assert_eq!(&source[f.delete_before(at + 3).unwrap()], "![a photo](photo.jpg)");
         // Typing just after it goes after its Markdown.
         assert_eq!(&source[..f.source_for(at + 3)], "Text with ![a photo](photo.jpg)");
+    }
+
+    #[test]
+    fn text_colors_come_from_spans_and_fonts() {
+        let source = "A <span style=\"color: #d44c47\">red</span> and <font color=\"blue\">blue</font> word";
+        let f = of(source);
+        assert_eq!(f.text, "A red and blue word");
+        let red: gpui_kit::Hsla = gpui_kit::rgb(0xd44c47).into();
+        assert_eq!(f.colors.len(), 2);
+        assert_eq!(f.colors[0], (2..5, red));
+        assert_eq!(f.colors[1].0, 10..14);
+        let (open, close, color) = f.color_over(3..3).unwrap();
+        assert_eq!((&source[open], &source[close], color), ("<span style=\"color: #d44c47\">", "</span>", red));
+        // A span with no colour is HTML this editor doesn't draw.
+        let plain = "a <span class=\"x\">b</span>";
+        assert!(flow(plain, 0..plain.len()).is_none());
     }
 
     #[test]

@@ -18,7 +18,7 @@ mod page;
 use crate::{Enso, rich, typography};
 use crate::ui::SurfaceExt;
 use element::{GAP_LEAF, LiveElement, leaf_key};
-use flow::{Flow, LinkAt, MarkAt, Wrap};
+use flow::{Flow, InlineImage, LinkAt, MarkAt, Wrap};
 use gpui_kit::base::text::editor_host::{
     BlockNode, CodeBlock, FlowPosition, InlineNode, LeafGeometry, Paragraph, RenderContext,
 };
@@ -148,6 +148,26 @@ struct MarkCard {
     _picker: Subscription,
 }
 
+/// The text colour card (⌘/ › Text Color › Custom Color…): where it works
+/// (the selection, kept while its picker has the keys), and where it shows.
+struct TextColorCard {
+    scope: actions::Scope,
+    at: Point<Pixels>,
+    current: Option<Hsla>,
+    picker: Entity<ColorPickerState>,
+    _picker: Subscription,
+}
+
+/// An image in the text being resized by a handle: where the drag began,
+/// the width then and now, and which side's handle.
+struct ImageDrag {
+    image: InlineImage,
+    from: Pixels,
+    start: Pixels,
+    width: Pixels,
+    left: bool,
+}
+
 /// The ⌘/ menu: what it offers, where it was opened, and where it shows.
 struct ActionMenu {
     state: Entity<CommandState>,
@@ -275,6 +295,13 @@ pub struct LiveView {
     link_card: Option<LinkCard>,
     math_card: Option<MathCard>,
     mark_card: Option<MarkCard>,
+    /// The image in the text under the pointer (its handles show), and its
+    /// line.
+    hovered_image: Option<(usize, InlineImage)>,
+    image_drag: Option<ImageDrag>,
+    text_color_card: Option<TextColorCard>,
+    /// A press landed in the ⌘/ submenu (not outside the menu).
+    sub_pressed: bool,
     action_menu: Option<ActionMenu>,
     /// The table card (⌘K in a cell): the cell, and where the card shows.
     table_card: Option<(usize, Point<Pixels>)>,
@@ -340,6 +367,10 @@ impl LiveView {
             table_card: None,
             math_card: None,
             mark_card: None,
+            hovered_image: None,
+            image_drag: None,
+            text_color_card: None,
+            sub_pressed: false,
             action_menu: None,
             hovered_cell: None,
             hovering: None,
@@ -556,6 +587,33 @@ impl LiveView {
         (self.found.clone(), self.found_current)
     }
 
+    /// Where the hovered image in the text is drawn, while its handles show.
+    #[cfg(all(test, feature = "ui-tests"))]
+    pub(crate) fn hovered_image_for_test(&self) -> Option<Bounds<Pixels>> {
+        let (leaf, image) = self.hovered_image.as_ref()?;
+        self.image_rect(*leaf, image)
+    }
+
+    /// A point on the first image in the text.
+    #[cfg(all(test, feature = "ui-tests"))]
+    pub(crate) fn image_point_for_test(&self) -> Option<Point<Pixels>> {
+        let geometry = self.geometry.borrow();
+        self.page.leaves.iter().enumerate().find_map(|(i, leaf)| {
+            let image = leaf.flow.images.first()?;
+            let g = geometry.get(&leaf_key(i))?;
+            let start = g.position_for_index(image.shown.start);
+            let end = g.position_for_index(image.shown.end);
+            Some(point((start.x + end.x) / 2., start.y + g.line_height() / 2.))
+        })
+    }
+
+    /// A colour picked in the text colour card (which must be open).
+    #[cfg(all(test, feature = "ui-tests"))]
+    pub(crate) fn pick_text_color_for_test(&mut self, color: Hsla, window: &mut Window, cx: &mut Context<Self>) {
+        assert!(self.text_color_card.is_some(), "the text colour card");
+        self.choose_text_color(Some(color), window, cx);
+    }
+
     #[cfg(all(test, feature = "ui-tests"))]
     pub(crate) fn table_card_for_test(&self) -> bool {
         self.table_card.is_some()
@@ -647,6 +705,7 @@ impl LiveView {
         self.picked = None;
         self.math_card = None;
         self.mark_card = None;
+        self.text_color_card = None;
         self.action_menu = None;
         window.focus(&self.focus, cx);
         let at = self.source_at_point(leaf, event.position).unwrap_or(self.page.leaves[leaf].span.start);
@@ -711,6 +770,58 @@ impl LiveView {
         })
     }
 
+    /// The image in the text under the pointer, and its line.
+    fn image_under(&self, at: Point<Pixels>) -> Option<(usize, InlineImage)> {
+        let geometry = self.geometry.borrow();
+        self.page.leaves.iter().enumerate().find_map(|(i, leaf)| {
+            if leaf.flow.images.is_empty() {
+                return None;
+            }
+            let g = geometry.get(&leaf_key(i))?;
+            let atom = g.atom_at(at)?;
+            leaf.flow.images.iter().find(|image| image.shown.start == atom.start).map(|image| (i, image.clone()))
+        })
+    }
+
+    /// Where an image in the text is drawn (from its line's last layout):
+    /// its left from its place in the text, its other edges found by asking
+    /// what's drawn where.
+    fn image_rect(&self, leaf: usize, image: &InlineImage) -> Option<Bounds<Pixels>> {
+        let geometry = self.geometry.borrow();
+        let g = geometry.get(&leaf_key(leaf))?;
+        let start = g.position_for_index(image.shown.start);
+        let on = |x: Pixels, y: Pixels| g.atom_at(point(x, y)).is_some_and(|a| a.start == image.shown.start);
+        let x = start.x + px(1.);
+        let bounds = g.bounds();
+        // A point on it: down from where it starts.
+        let mut y = start.y;
+        while y < bounds.bottom() && !on(x, y) {
+            y += px(2.);
+        }
+        if !on(x, y) {
+            return None;
+        }
+        // Each edge: halving the gap between a point on it and one off it.
+        let edge = |inside: Pixels, outside: Pixels, on_it: &dyn Fn(Pixels) -> bool| {
+            let (mut a, mut b) = (inside, outside);
+            for _ in 0..24 {
+                let mid = (a + b) / 2.;
+                if on_it(mid) { a = mid } else { b = mid }
+            }
+            a
+        };
+        let right = edge(x, bounds.right() + px(1.), &|r| on(r, y));
+        let top = edge(y, bounds.top() - px(1.), &|t| on(x, t));
+        let bottom = edge(y, bounds.bottom() + px(1.), &|b| on(x, b));
+        Some(Bounds::from_corners(point(start.x, top), point(right, bottom)))
+    }
+
+    /// A press on an image's handle: resizing it begins.
+    fn start_image_drag(&mut self, image: InlineImage, width: Pixels, left: bool, at: Pixels, cx: &mut Context<Self>) {
+        self.image_drag = Some(ImageDrag { image, from: at, start: width, width, left });
+        cx.notify();
+    }
+
     /// The highlight under the pointer, and its line.
     fn mark_under(&self, at: Point<Pixels>) -> Option<(usize, MarkAt)> {
         let geometry = self.geometry.borrow();
@@ -745,6 +856,40 @@ impl LiveView {
         });
         self.mark_card = Some(MarkCard { mark, at, hover, pinned, picker, _picker: subscription });
         cx.notify();
+    }
+
+    /// The text colour card under the caret: the text colours and a picker.
+    pub(super) fn open_text_color_card(&mut self, current: Option<Hsla>, window: &mut Window, cx: &mut Context<Self>) {
+        let at = self
+            .active_key()
+            .zip(self.caret_in_active())
+            .and_then(|(key, local)| {
+                let geometry = self.geometry.borrow();
+                let g = geometry.get(&key)?;
+                let p = g.position_for_index(local);
+                Some(point(p.x, p.y + g.line_height() + px(6.)))
+            })
+            .unwrap_or(point(px(120.), px(120.)));
+        let ink = current.unwrap_or(cx.theme().foreground);
+        let picker = cx.new(|cx| ColorPickerState::new(window, cx).default_value(ink));
+        let subscription = cx.subscribe_in(&picker, window, |this, _, event: &ColorPickerEvent, window, cx| {
+            let ColorPickerEvent::Change(Some(color)) = event else { return };
+            this.choose_text_color(Some(*color), window, cx);
+        });
+        let scope = actions::Scope { caret: self.caret, anchor: self.anchor, picked: None };
+        self.text_color_card = Some(TextColorCard { scope, at, current, picker, _picker: subscription });
+        cx.notify();
+    }
+
+    /// A colour from the text colour card (`None`: the page's own), on the
+    /// text it was opened for.
+    fn choose_text_color(&mut self, color: Option<Hsla>, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(card) = self.text_color_card.take() else { return };
+        self.focus_page(window, cx);
+        self.caret = card.scope.caret;
+        self.anchor = card.scope.anchor;
+        self.parked = None;
+        self.apply_text_color(color, window, cx);
     }
 
     /// The highlight card for the highlight at the caret. False when the
@@ -893,6 +1038,16 @@ impl LiveView {
     /// The pointer resting on a link for a moment (0.8 s) shows its card; leaving
     /// the link (and not onto the card) puts a hover card away.
     fn hover(&mut self, at: Point<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
+        // An image in the text: its resize handles.
+        let image = self.image_under(at).filter(|_| self.editor.read(cx).is_editable());
+        if self.hovered_image.as_ref().map(|(_, i)| &i.source) != image.as_ref().map(|(_, i)| &i.source) {
+            self.hovered_image = image.clone();
+            cx.notify();
+        }
+        if image.is_some() {
+            self.hovering = None;
+            return;
+        }
         let target = match self.link_under(at) {
             Some((leaf, link)) => Some((leaf, Ok(link))),
             None => self.mark_under(at).map(|(leaf, mark)| (leaf, Err(mark))),
@@ -957,6 +1112,22 @@ impl LiveView {
     }
 
     fn mouse_drag(&mut self, event: &MouseMoveEvent, window: &mut Window, cx: &mut Context<Self>) {
+        // An image's handle dragged: it's drawn at the new width as it goes.
+        let line = self.line_width();
+        if let Some(drag) = self.image_drag.as_mut() {
+            let moved = event.position.x - drag.from;
+            drag.width = (drag.start + if drag.left { -moved } else { moved }).max(px(24.)).min(line);
+            let (source, width) = (drag.image.source.clone(), drag.width);
+            for leaf in &mut self.page.leaves {
+                for image in &mut leaf.flow.images {
+                    if image.source == source {
+                        image.width = Some(format!("{}", f32::from(width).round()));
+                    }
+                }
+            }
+            cx.notify();
+            return;
+        }
         if !self.dragging || event.pressed_button != Some(MouseButton::Left) {
             self.hover(event.position, window, cx);
             return;
@@ -1113,6 +1284,22 @@ impl LiveView {
         let max = self.scroll.max_offset();
         let moved = offset.y - (y - (view.top() + view.size.height / 3.));
         self.scroll.set_offset(point(offset.x, moved.min(px(0.)).max(-max.y.abs())));
+    }
+
+    /// How wide a line of text is on the page.
+    fn line_width(&self) -> Pixels {
+        let page = self.scroll.bounds().size.width - px(crate::reader::TEXT_INSET_X) - px(16.);
+        if page > px(80.) { page } else { px(680.) }
+    }
+
+    /// The button let go: a drag's selection ends; an image's handle sets
+    /// its new width.
+    fn mouse_up(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.dragging = false;
+        if let Some(drag) = self.image_drag.take() {
+            let width = f32::from(drag.width).round() as u16;
+            self.resize_image(&drag.image, Some(width.max(1)), window, cx);
+        }
     }
 
     /// A press on an empty line: the caret there.
@@ -2528,7 +2715,7 @@ impl LiveView {
             self.close_math_card(window, cx);
             return;
         }
-        if self.mark_card.take().is_some() {
+        if self.mark_card.take().is_some() || self.text_color_card.take().is_some() {
             cx.notify();
             return;
         }
@@ -2554,12 +2741,12 @@ impl LiveView {
     /// A line of text drawn from its flow, reporting its layout under `key`
     /// so clicks, the caret and the selection can find its letters.
     fn flow_node(flow: &Flow, key: u64) -> BlockNode {
-        Self::flow_node_selected(flow, key, None)
+        Self::flow_node_selected(flow, key, None, px(680.))
     }
 
     /// The same, with drawn text `selected` selected: its highlight (a
     /// `<mark>` colour) drops out there, or it would hide the selection.
-    fn flow_node_selected(flow: &Flow, key: u64, selected: Option<&Range<usize>>) -> BlockNode {
+    fn flow_node_selected(flow: &Flow, key: u64, selected: Option<&Range<usize>>, line: Pixels) -> BlockNode {
         let mut marks = Vec::new();
         for (range, mark) in &flow.marks {
             match selected.filter(|s| mark.highlight.is_some() && s.start < range.end && range.start < s.end) {
@@ -2592,13 +2779,29 @@ impl LiveView {
                 .collect();
             paragraph.push(InlineNode::new(flow.text[range].to_string()).marks(marks));
         };
-        for (at, url, alt) in &flow.images {
-            run(&mut paragraph, from..at.start);
+        // Pixels, or `50%` of the line (in pixels: a relative size would be
+        // of the image's own box).
+        let length = |value: &Option<String>| -> Option<DefiniteLength> {
+            let value = value.as_deref()?.trim();
+            match value.strip_suffix('%') {
+                Some(percent) => percent.trim().parse::<f32>().ok().map(|p| (line * (p / 100.)).into()),
+                None => value.trim_end_matches("px").parse::<f32>().ok().map(|p| px(p).min(line).into()),
+            }
+        };
+        for picture in &flow.images {
+            run(&mut paragraph, from..picture.shown.start);
             let mut image = gpui_kit::base::text::editor_host::ImageNode::default();
-            image.url = url.clone().into();
-            image.alt = (!alt.is_empty()).then(|| alt.clone().into());
+            image.url = picture.url.clone().into();
+            image.alt = (!picture.alt.is_empty()).then(|| picture.alt.clone().into());
+            image.width = length(&picture.width);
+            image.height = length(&picture.height);
+            // Its own size, at most the line's width (a photo is often far
+            // wider).
+            if image.width.is_none() && image.height.is_none() {
+                image.width = Some(line.min(px(240.)).into());
+            }
             paragraph.push(InlineNode::image(image));
-            from = at.end;
+            from = picture.shown.end;
         }
         run(&mut paragraph, from..flow.text.len());
         let paragraph = paragraph.with_leaf_key(key);
@@ -2614,7 +2817,7 @@ impl Render for LiveView {
         let focused = self.focus.is_focused(window);
         // The ⌘/ menu's search took the keys: the caret and selection stay,
         // drawn, so it shows what the menu works on.
-        if self.was_focused && !focused && self.action_menu.is_none() {
+        if self.was_focused && !focused && self.action_menu.is_none() && self.text_color_card.is_none() {
             if self.raw.is_some() {
                 self.leave_raw(cx);
             }
@@ -2673,17 +2876,27 @@ impl Render for LiveView {
                 }
             })
         };
+        // Text in its own colour (`<span style="color">`), line by line.
+        let render_context = self.page.leaves.iter().enumerate().fold(render_context, |context, (i, leaf)| {
+            if leaf.flow.colors.is_empty() {
+                context
+            } else {
+                context.with_foreground_ranges(leaf_key(i), leaf.flow.colors.clone())
+            }
+        });
         let muted = cx.theme().muted_foreground;
         let weak = cx.entity().downgrade();
         let count = self.page.blocks.len();
         let mut rows: Vec<AnyElement> = Vec::new();
         let mut gap_placed = false;
+        // The width of a line of text, for images in the text.
+        let line_width = self.line_width();
         // What's selected, line by line (drawn ranges).
         let selected: HashMap<usize, Range<usize>> = self.selected_parts().into_iter().filter(|(_, r)| !r.is_empty()).collect();
         // A line of text: pressed, the caret goes there (and a drag selects).
         let line = |leaf: usize, first: bool, last: bool, rows_window: &mut Window, cx: &mut App| {
             let flow = &self.page.leaves[leaf].flow;
-            let node = Self::flow_node_selected(flow, leaf_key(leaf), selected.get(&leaf));
+            let node = Self::flow_node_selected(flow, leaf_key(leaf), selected.get(&leaf), line_width);
             let position = FlowPosition::at(&[&node], 0, last).first(first);
             let element = node.render_with_id(("live-line", leaf), position, &render_context, rows_window, cx);
             let weak = weak.clone();
@@ -2853,7 +3066,7 @@ impl Render for LiveView {
                     list.into_any_element()
                 }
                 Shape::Quote(leaves) => {
-                    let children = leaves.iter().map(|i| Self::flow_node_selected(&self.page.leaves[*i].flow, leaf_key(*i), selected.get(i))).collect();
+                    let children = leaves.iter().map(|i| Self::flow_node_selected(&self.page.leaves[*i].flow, leaf_key(*i), selected.get(i), line_width)).collect();
                     let node = BlockNode::Blockquote { children, span: None };
                     let position = FlowPosition::at(&[&node], 0, last).first(first);
                     let element = node.render_with_id(("live-quote", range.start), position, &render_context, window, cx);
@@ -2907,7 +3120,7 @@ impl Render for LiveView {
                                 line = line.child(cell);
                                 continue;
                             };
-                            let node = Self::flow_node_selected(&self.page.leaves[leaf].flow, leaf_key(leaf), selected.get(&leaf));
+                            let node = Self::flow_node_selected(&self.page.leaves[leaf].flow, leaf_key(leaf), selected.get(&leaf), line_width);
                             let position = FlowPosition::at(&[&node], 0, true).first(true);
                             let text = node.render_with_id(("live-cell-text", leaf), position, &render_context, window, cx);
                             let weak = weak.clone();
@@ -3329,6 +3542,68 @@ impl Render for LiveView {
         {
             self.mark_card = None;
         }
+        // A colour card's frame and its picker's slot: the highlight card's
+        // and the text colour card's are these same ones.
+        let swatch_card = |id: &'static str, theme: &gpui_kit::component::Theme| {
+            h_flex()
+                .id(id)
+                .occlude()
+                .p_1p5()
+                .gap_1p5()
+                .items_center()
+                .rounded_lg()
+                .border_1()
+                .border_color(theme.border)
+                .bg(theme.popover)
+                .shadow_md()
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+        };
+        let text_color_card = self.text_color_card.as_ref().map(|card| {
+            let theme = cx.theme().clone();
+            let current = card.current.map(rich::highlight_hex);
+            let swatches = actions::TEXT_COLORS.iter().enumerate().map(|(i, (name, value))| {
+                let swatch: Hsla = rgb(*value).into();
+                let selected = current.as_deref() == Some(rich::highlight_hex(swatch).as_str());
+                let name: SharedString = format!("{name} Text").into();
+                div()
+                    .id(("live-text-color", i))
+                    .size(px(22.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(6.))
+                    .border_1()
+                    .border_color(if selected { theme.foreground.opacity(0.45) } else { theme.border })
+                    .text_sm()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(swatch)
+                    .cursor_pointer()
+                    .hover(|tile| tile.bg(theme.secondary))
+                    .tooltip(move |window, cx| gpui_kit::component::tooltip::Tooltip::new(name.clone()).build(window, cx))
+                    .child("A")
+                    .on_click(cx.listener(move |this, _, window, cx| this.choose_text_color(Some(swatch), window, cx)))
+            });
+            deferred(
+                anchored().position(card.at).snap_to_window_with_margin(px(8.)).child(
+                    swatch_card("live-text-color-card", &theme)
+                        .children(swatches)
+                        .child(
+                            ColorPicker::new(&card.picker)
+                                .icon(IconName::Palette)
+                                .xsmall()
+                                .accessibility_label("Custom text color"),
+                        )
+                        .child(div().w_px().h(px(18.)).bg(theme.border))
+                        .child(
+                            crate::ui::icon_button("live-text-color-remove", IconName::CircleX, "Default Text")
+                                .xsmall()
+                                .compact()
+                                .on_click(cx.listener(|this, _, window, cx| this.choose_text_color(None, window, cx))),
+                        ),
+                ),
+            )
+            .with_priority(1)
+        });
         let mark_card = self.mark_card.as_ref().map(|card| {
             let theme = cx.theme();
             let current = rich::highlight_hex(card.mark.color);
@@ -3355,18 +3630,7 @@ impl Render for LiveView {
             });
             deferred(
                 anchored().position(card.at).snap_to_window_with_margin(px(8.)).child(
-                    h_flex()
-                        .id("live-mark-card")
-                        .occlude()
-                        .p_1p5()
-                        .gap_1p5()
-                        .items_center()
-                        .rounded_lg()
-                        .border_1()
-                        .border_color(theme.border)
-                        .bg(theme.popover)
-                        .shadow_md()
-                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    swatch_card("live-mark-card", theme)
                         .on_hover(cx.listener(|this, hovered: &bool, window, cx| {
                             this.over_card = *hovered;
                             if *hovered {
@@ -3437,6 +3701,8 @@ impl Render for LiveView {
             let item = |action: &actions::Action, group: &'static str, main: bool, n: usize| {
                 let label = action.label.clone();
                 let swatch = action.swatch;
+                let letter = action.letter;
+                let ink = theme.foreground;
                 let border = theme.border;
                 let weak = hover_weak.clone();
                 CommandItem::new()
@@ -3456,8 +3722,26 @@ impl Render for LiveView {
                                     }
                                 })
                             })
-                            .when_some(swatch, |row, swatch| {
+                            .when_some(swatch.filter(|_| !letter), |row, swatch| {
                                 row.child(div().size(px(14.)).rounded(px(4.)).bg(swatch).border_1().border_color(border))
+                            })
+                            // A text colour: an "A" in it, the page's own for Default.
+                            .when_some(swatch.filter(|_| letter), |row, swatch| {
+                                let color = if swatch.a == 0. { ink } else { swatch };
+                                row.child(
+                                    div()
+                                        .size(px(18.))
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .rounded(px(4.))
+                                        .border_1()
+                                        .border_color(border)
+                                        .text_xs()
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(color)
+                                        .child("A"),
+                                )
                             })
                             .child(label.clone())
                     })
@@ -3545,20 +3829,32 @@ impl Render for LiveView {
             // The open submenu: its group's actions.
             let sub = menu.sub.as_ref().map(|(name, state)| {
                 let rows = groups.iter().find(|(g, _)| g == name).map(|(_, rows)| rows.clone()).unwrap_or_default();
-                let title = if *name == "Color" { "Background Color" } else { name };
-                let items: Vec<CommandItem> = rows.iter().map(|i| item(&menu.actions[*i], name, false, 1000 + *i)).collect();
+                // Its sections (Text Color, Background Color), in order.
+                let mut sections: Vec<(&'static str, Vec<usize>)> = Vec::new();
+                for &i in &rows {
+                    let title = menu.actions[i].section.unwrap_or(name);
+                    match sections.iter_mut().find(|(t, _)| *t == title) {
+                        Some((_, rows)) => rows.push(i),
+                        None => sections.push((title, vec![i])),
+                    }
+                }
                 let weak = cx.entity().downgrade();
                 let back = weak.clone();
-                let command = Command::new(state)
+                let mut command = Command::new(state)
                     .placeholder(SharedString::from(format!("{name}…")))
-                    .max_h(px(360.))
+                    .max_h(px(420.))
                     .scroll_bounce(false)
                     .rounded(crate::ui::MODAL_RADIUS - px(1.))
                     .bordered(false)
-                    .bg(gpui_kit::transparent_black())
-                    .group(CommandGroup::new().label(title).items(items))
+                    .bg(gpui_kit::transparent_black());
+                for (title, rows) in &sections {
+                    let items: Vec<CommandItem> = rows.iter().map(|i| item(&menu.actions[*i], name, false, 1000 + *i)).collect();
+                    command = command.group(CommandGroup::new().label(*title).items(items));
+                }
+                let order: Vec<Vec<usize>> = sections.into_iter().map(|(_, rows)| rows).collect();
+                let command = command
                     .on_confirm(move |index, window, cx| {
-                        if let Some(&i) = rows.get(index.row) {
+                        if let Some(&i) = order.get(index.section).and_then(|rows| rows.get(index.row)) {
                             let _ = weak.update(cx, |this, cx| this.choose_action(i, window, cx));
                         }
                     })
@@ -3573,18 +3869,43 @@ impl Render for LiveView {
                     .occlude()
                     .w(px(240.))
                     .modal_surface(&theme)
-                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                        // Not a press outside the menu: the menu stays.
+                        this.sub_pressed = true;
+                        cx.stop_propagation();
+                    }))
                     .child(div().rounded(crate::ui::MODAL_RADIUS - px(1.)).overflow_hidden().child(command))
             });
-            deferred(
+            // The submenu is placed on its own beside the menu (to its left
+            // near the window's right edge), so fitting it in the window
+            // never moves the menu under the pointer.
+            let sub = sub.map(|sub| {
+                let room = window.viewport_size().width;
+                let x = if menu.at.x + px(264. + 240. + 8.) > room { menu.at.x - px(244.) } else { menu.at.x + px(264.) };
+                deferred(anchored().position(point(x, menu.at.y)).snap_to_window_with_margin(px(8.)).child(sub))
+                    .with_priority(2)
+                    .into_any_element()
+            });
+            let main = deferred(
                 anchored().position(menu.at).snap_to_window_with_margin(px(8.)).child(
                     h_flex()
                         .items_start()
                         .gap_1()
-                        .on_mouse_down_out(cx.listener(|this, _, window, cx| this.close_actions(window, cx)))
+                        // A press outside the menu (and its submenu) closes it.
+                        .on_mouse_down_out(cx.listener(|_, _, window, cx| {
+                            let view = cx.entity().downgrade();
+                            window.defer(cx, move |window, cx| {
+                                let _ = view.update(cx, |this, cx| {
+                                    if !std::mem::take(&mut this.sub_pressed) {
+                                        this.close_actions(window, cx);
+                                    }
+                                });
+                            });
+                        }))
                         .child(
                     div()
                         .id("live-actions")
+                        .debug_selector(|| "live-actions".into())
                         .occlude()
                         .w(px(260.))
                         .modal_surface(&theme)
@@ -3610,12 +3931,74 @@ impl Render for LiveView {
                             .child(div().h_px().mx_1p5().bg(theme.border))
                         })
                         .child(div().rounded(crate::ui::MODAL_RADIUS - px(1.)).overflow_hidden().child(command)),
-                        )
-                        .children(sub),
+                        ),
                 ),
             )
             .with_priority(2)
+            .into_any_element();
+            std::iter::once(main).chain(sub).collect::<Vec<_>>()
         });
+        // The hovered (or resized) image in the text: a handle on each side,
+        // as images on their own line have. Placed in the page, so it scrolls
+        // with it, from where the image was last drawn.
+        let image_handles = self
+            .image_drag
+            .as_ref()
+            .map(|d| d.image.clone())
+            .and_then(|image| {
+                let leaf = self.page.leaves.iter().position(|l| l.flow.images.iter().any(|i| i.source == image.source))?;
+                Some((leaf, image))
+            })
+            .or_else(|| self.hovered_image.clone())
+            .filter(|_| self.editor.read(cx).is_editable())
+            .and_then(|(leaf, image)| Some((image.clone(), self.image_rect(leaf, &image)?)))
+            .map(|(image, rect)| {
+                let view = self.scroll.bounds();
+                let offset = self.scroll.offset();
+                let left = rect.left() - view.left() - offset.x;
+                let top = rect.top() - view.top() - offset.y;
+                // The same handles as an image on its own line.
+                let handle = |id: &'static str, side_left: bool| {
+                    let image = image.clone();
+                    let width = rect.size.width;
+                    rich::resize_handle(div().id(id), side_left)
+                        .on_mouse_down(MouseButton::Left, cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                            cx.stop_propagation();
+                            this.start_image_drag(image.clone(), width, side_left, event.position.x, cx);
+                        }))
+                };
+                // The same toolbar as an image on its own line, less its
+                // alignment (it's in a line of text).
+                let theme = cx.theme().clone();
+                let edit: rich::DiagramEdit = {
+                    let (owner, editor) = (self.owner.clone(), self.editor_id);
+                    let expected = self.source.get(image.source.clone()).unwrap_or_default().to_string();
+                    let picture = rich::Picture::inline(&image.url, &image.alt, image.width.as_deref(), image.height.as_deref());
+                    let range = image.source.clone();
+                    std::rc::Rc::new(move |w: &mut Window, cx: &mut App| {
+                        let _ = owner.update(cx, |app, cx| app.open_picture(editor, range.clone(), expected.clone(), picture.clone(), w, cx));
+                    })
+                };
+                let (toolbar, _) = rich::image_tools(
+                    rich::image_toolbar_frame(&theme),
+                    &image.url,
+                    self.base.as_deref(),
+                    self.owner.clone(),
+                    &theme,
+                    false,
+                    Some(edit),
+                );
+                div()
+                    .absolute()
+                    .left(left)
+                    .top(top)
+                    .w(rect.size.width)
+                    .h(rect.size.height)
+                    // The handles over the toolbar, so they're always grabbed.
+                    .child(toolbar)
+                    .child(handle("live-image-handle-left", true))
+                    .child(handle("live-image-handle-right", false))
+            });
         let math_card = self.math_card.as_ref().map(|card| {
             let theme = cx.theme();
             deferred(
@@ -3692,8 +4075,8 @@ impl Render for LiveView {
             .on_action(cx.listener(|this, _: &PageStart, _, cx| this.moving(false, cx, |t, cx| t.page_edge(false, cx))))
             .on_action(cx.listener(|this, _: &PageEnd, _, cx| this.moving(false, cx, |t, cx| t.page_edge(true, cx))))
             .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, w, cx| this.mouse_drag(event, w, cx)))
-            .on_mouse_up(MouseButton::Left, cx.listener(|this, _, _, _| this.dragging = false))
-            .on_mouse_up_out(MouseButton::Left, cx.listener(|this, _, _, _| this.dragging = false))
+            .on_mouse_up(MouseButton::Left, cx.listener(|this, _, w, cx| this.mouse_up(w, cx)))
+            .on_mouse_up_out(MouseButton::Left, cx.listener(|this, _, w, cx| this.mouse_up(w, cx)))
             .on_action(cx.listener(|this, _: &SelectLeft, _, cx| this.moving(true, cx, |t, cx| t.horizontal(false, cx))))
             .on_action(cx.listener(|this, _: &SelectRight, _, cx| this.moving(true, cx, |t, cx| t.horizontal(true, cx))))
             .on_action(cx.listener(|this, _: &SelectUp, _, cx| this.moving(true, cx, |t, cx| t.vertical(false, cx))))
@@ -3752,7 +4135,9 @@ impl Render for LiveView {
             .children(table_card)
             .children(math_card)
             .children(mark_card)
-            .children(action_menu)
+            .children(text_color_card)
+            .children(image_handles)
+            .children(action_menu.into_iter().flatten())
             // Below the last block: a click there writes a new paragraph at the end.
             .child(div().id("live-end").w_full().min_h(px(120.)).cursor_text().on_click(cx.listener(
                 |this, _, window, cx| {
