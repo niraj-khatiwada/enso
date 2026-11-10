@@ -91,12 +91,11 @@ pub fn init(cx: &mut App) {
         KeyBinding::new(primary("cmd-shift-c", "ctrl-shift-c"), CopyMarkdown, Some(CONTEXT)),
         KeyBinding::new(primary("cmd-x", "ctrl-x"), Cut, Some(CONTEXT)),
         KeyBinding::new(primary("cmd-v", "ctrl-v"), Paste, Some(CONTEXT)),
-        // The editor's formatting keys. Inline code is ⌘E here, as in Notion:
-        // ⌘⇧C copies Markdown.
+        // The editor's formatting keys. ⌘E is the app's (View and Edit);
+        // inline code is in ⌘/. ⌘⇧C copies Markdown.
         KeyBinding::new(primary("cmd-b", "ctrl-b"), Bold, Some(CONTEXT)),
         KeyBinding::new(primary("cmd-i", "ctrl-i"), Italic, Some(CONTEXT)),
         KeyBinding::new(primary("cmd-shift-x", "ctrl-shift-x"), Strike, Some(CONTEXT)),
-        KeyBinding::new(primary("cmd-e", "ctrl-e"), InlineCode, Some(CONTEXT)),
         KeyBinding::new(primary("cmd-shift-e", "ctrl-shift-e"), ToggleMarkdown, Some(CONTEXT)),
         KeyBinding::new(primary("cmd-/", "ctrl-/"), OpenActions, Some(CONTEXT)),
         KeyBinding::new(primary("cmd-k", "ctrl-k"), EditLink, Some(CONTEXT)),
@@ -627,6 +626,16 @@ impl LiveView {
     #[cfg(all(test, feature = "ui-tests"))]
     pub(crate) fn undo_steps_for_test(&self) -> usize {
         self.undo.len()
+    }
+
+    #[cfg(all(test, feature = "ui-tests"))]
+    pub(crate) fn scroll_for_test(&self) -> Point<Pixels> {
+        self.scroll.offset()
+    }
+
+    #[cfg(all(test, feature = "ui-tests"))]
+    pub(crate) fn set_scroll_for_test(&self, y: Pixels) {
+        self.scroll.set_offset(point(px(0.), -y));
     }
 
     #[cfg(all(test, feature = "ui-tests"))]
@@ -1677,7 +1686,28 @@ impl LiveView {
         // The block shown as Markdown stays so when what changes is in it.
         self.raw = self.raw.clone().and_then(|raw| moved_range(&self.source, &text, raw));
         self.own_edit = true;
-        self.editor.update(cx, |editor, cx| editor.set_value(text.as_str(), window, cx));
+        // Only what differs is replaced, so the editor (Split's) keeps its
+        // place, and the caret goes where the change was, not to the top.
+        let old = self.source.clone();
+        let prefix = old.bytes().zip(text.bytes()).take_while(|(a, b)| a == b).count();
+        let room = old.len().min(text.len()) - prefix;
+        let suffix = old.bytes().rev().zip(text.bytes().rev()).take(room).take_while(|(a, b)| a == b).count();
+        let mut start = prefix;
+        while !old.is_char_boundary(start) || !text.is_char_boundary(start) {
+            start -= 1;
+        }
+        let (old_end, new_end) = (old.len() - suffix, text.len() - suffix);
+        let mut cut = 0;
+        while !old.is_char_boundary(old_end + cut) || !text.is_char_boundary(new_end + cut) {
+            cut += 1;
+        }
+        let middle = text[start..new_end + cut].to_string();
+        let caret_at = caret.min(text.len());
+        self.editor.update(cx, |editor, cx| {
+            editor.set_selected_range(start..old_end + cut, cx);
+            editor.replace(middle, window, cx);
+            editor.set_selected_range(caret_at..caret_at, cx);
+        });
         self.refresh(cx);
         self.caret = Some(caret.min(self.source.len()));
         self.last_edit = None;
@@ -1806,6 +1836,20 @@ impl LiveView {
                 return;
             }
             _ => {}
+        }
+        // An empty line above a heading or paragraph: that line goes, and
+        // the block moves up to it.
+        if matches!(leaf.kind, Kind::Text { .. }) {
+            let block_start = match &leaf.kind {
+                Kind::Text { block } => block.start,
+                _ => start,
+            };
+            let before = &self.source[..block_start];
+            let top_blank = block_start > 0 && before.chars().all(|c| c == '\n');
+            if before.ends_with("\n\n\n") || top_blank {
+                self.edit_keeping_caret(block_start - 1..block_start, "", window, cx);
+                return;
+            }
         }
         // Right after an image (or another block without text): pick it, so
         // the next Backspace removes it.
@@ -1967,6 +2011,17 @@ impl LiveView {
         // On an empty line: one more empty line.
         if let Spot::Gap(at) = spot {
             self.edit(at..at, "\n", window, cx);
+            return;
+        }
+        // At a heading's or paragraph's start: the whole block moves down a
+        // line (its formatting with it), an empty line left above it.
+        if let Spot::Leaf(i) = spot
+            && let Kind::Text { block } = &self.page.leaves[i].kind
+            && flow.shown_for(caret) == 0
+            && !flow.text.is_empty()
+        {
+            let start = block.start;
+            self.edit_keeping_caret(start..start, "\n", window, cx);
             return;
         }
         // At a paragraph's end: an empty line after it, to type on.
@@ -2245,7 +2300,7 @@ impl LiveView {
         }
     }
 
-    /// ⌘B, ⌘I, ⌘⇧X, ⌘E: the mark on the selection (or the word at the
+    /// ⌘B, ⌘I, ⌘⇧X (and inline code from ⌘/): the mark on the selection (or the word at the
     /// caret) on or off, the selection kept.
     fn toggle_mark(&mut self, kind: Wrap, window: &mut Window, cx: &mut Context<Self>) {
         let (Some(caret), Some(Spot::Leaf(i))) = (self.caret, self.spot()) else { return };
@@ -3150,10 +3205,10 @@ impl Render for LiveView {
                     let children = leaves.iter().map(|i| Self::flow_node_selected(&self.page.leaves[*i].flow, leaf_key(*i), selected.get(i), line_width)).collect();
                     let node = BlockNode::Blockquote { children, span: None };
                     let position = FlowPosition::at(&[&node], 0, last).first(first);
-                    let element = node.render_with_id(("live-quote", range.start), position, &render_context, window, cx);
+                    let element = node.render_with_id(("live-quote", b), position, &render_context, window, cx);
                     let weak = weak.clone();
                     div()
-                        .id(("live-quote-row", range.start))
+                        .id(("live-quote-row", b))
                         .w_full()
                         .cursor_text()
                         .on_mouse_down(MouseButton::Left, move |event, window, cx| {
@@ -3186,7 +3241,7 @@ impl Render for LiveView {
                         for c in 0..width {
                             let align = aligns.get(c).copied().unwrap_or(Align::None);
                             let mut cell = div()
-                                .id(ElementId::Name(format!("live-cell-{start}-{r}-{c}").into()))
+                                .id(ElementId::Name(format!("live-cell-{b}-{r}-{c}").into()))
                                 .flex_basis(px(0.))
                                 .flex_grow(weights[c])
                                 .min_w(px(48.))
@@ -3268,13 +3323,13 @@ impl Render for LiveView {
                         frame = frame.child(line);
                     }
                     let element = div().w_full().pb(px(reading.size as f32 * 0.9)).child(frame);
-                    let group: SharedString = format!("live-table-{start}").into();
+                    let group: SharedString = format!("live-table-{b}").into();
                     // Notion's + bars: one beside the table adds a column,
                     // one under it adds a row. They show while the pointer is
                     // over the table.
                     let bar = |id: &'static str, op: TableOp, label: &'static str| {
                         div()
-                            .id((id, start))
+                            .id((id, b))
                             .flex()
                             .items_center()
                             .justify_center()
@@ -3291,7 +3346,7 @@ impl Render for LiveView {
                     };
                     let table = div().flex_1().min_w_0().child(element);
                     v_flex()
-                        .id(("live-table-row", start))
+                        .id(("live-table-row", b))
                         .group(group.clone())
                         .w_full()
                         .child(
@@ -3328,13 +3383,13 @@ impl Render for LiveView {
                     let node = BlockNode::CodeBlock(code);
                     // Beside a preview, the gap after it goes under both.
                     let position = FlowPosition::at(&[&node], 0, last || preview_of.is_some()).first(first);
-                    let element = node.render_with_id(("live-code", range.start), position, &render_context, window, cx);
+                    let element = node.render_with_id(("live-code", b), position, &render_context, window, cx);
                     let weak = weak.clone();
                     let theme = cx.theme().clone();
                     let preview = preview_of.map(|text| match mermaid_code(&text) {
                         Some(code) => rich::mermaid_preview(&code, self.owner.clone(), cx),
                         None => {
-                            let view = TextView::markdown(("live-raw-preview", range.start), text).selectable(false).w_full();
+                            let view = TextView::markdown(("live-raw-preview", b), text).selectable(false).w_full();
                             let view = typography::style(view, cx);
                             let view = rich::decorate(view, self.owner.clone(), self.editor_id, self.base.clone(), range.start, 0);
                             // A formula or HTML on a panel like the Markdown's.
@@ -3353,7 +3408,7 @@ impl Render for LiveView {
                     });
                     let gap_after = render_context.style().paragraph_gap();
                     let code = div()
-                        .id(("live-code-row", range.start))
+                        .id(("live-code-row", b))
                         .w_full()
                         .cursor_text()
                         .on_mouse_down(MouseButton::Left, move |event, window, cx| {
@@ -3375,7 +3430,7 @@ impl Render for LiveView {
                     }
                 }
                 Shape::Other => {
-                    let view = TextView::markdown(("live-view", range.start), self.source[range.clone()].to_string())
+                    let view = TextView::markdown(("live-view", b), self.source[range.clone()].to_string())
                         .selectable(false)
                         .w_full();
                     let view = typography::style(view, cx);
@@ -3406,15 +3461,22 @@ impl Render for LiveView {
                     };
                     let mermaid = mermaid_code(&self.source[range.clone()]);
                     let is_mermaid = mermaid.is_some();
-                    let group: SharedString = format!("live-block-{start}").into();
+                    let group: SharedString = format!("live-block-{b}").into();
                     let theme = cx.theme().clone();
                     let gap_after = render_context.style().paragraph_gap();
                     div()
-                        .id(("live-block", range.start))
+                        .id(("live-block", b))
                         .group(group.clone())
                         .w_full()
                         .relative()
                         .on_click(move |event, window, cx| {
+                            // A drag (an image's resize handle) isn't a click.
+                            if let ClickEvent::Mouse(click) = event {
+                                let moved = click.up.position - click.down.position;
+                                if moved.x.abs() > px(4.) || moved.y.abs() > px(4.) {
+                                    return;
+                                }
+                            }
                             let at = event.position();
                             let _ = weak.update(cx, |view, cx| view.click_other(start, Some(at), window, cx));
                         })
@@ -3439,7 +3501,7 @@ impl Render for LiveView {
                                     .group_hover(group.clone(), |bar| bar.opacity(1.))
                                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                                     .child(
-                                        crate::ui::icon_button(("live-block-edit", start), IconName::Pencil, "Edit")
+                                        crate::ui::icon_button(("live-block-edit", b), IconName::Pencil, "Edit")
                                             .xsmall()
                                             .compact()
                                             .on_click(move |_, window, cx| {
@@ -4119,6 +4181,7 @@ impl Render for LiveView {
             )
             .with_priority(1)
         });
+        let end_room = (window.viewport_size().height * 0.4).max(px(120.));
         let content = v_flex()
             .id("live-page")
             .key_context(CONTEXT)
@@ -4224,8 +4287,11 @@ impl Render for LiveView {
             .children(text_color_card)
             .children(image_handles)
             .children(action_menu.into_iter().flatten())
-            // Below the last block: a click there writes a new paragraph at the end.
-            .child(div().id("live-end").w_full().min_h(px(120.)).cursor_text().on_click(cx.listener(
+            // Below the last block: a click there writes a new paragraph at the
+            // end. It's tall (part of the window), so the page can scroll past
+            // its end: what shrinks near the end (an image resized) doesn't
+            // pull the page up with it.
+            .child(div().id("live-end").w_full().min_h(end_room).cursor_text().on_click(cx.listener(
                 |this, _, window, cx| {
                     if !this.editor.read(cx).is_editable() {
                         return;
@@ -4325,6 +4391,31 @@ impl EntityInputHandler for LiveView {
             text
         };
         let typed = range.is_none();
+        // An empty code block: its closing fence starts where the code would.
+        // What's typed goes on a line of its own before it.
+        let text = match self.spot() {
+            Some(Spot::Leaf(i))
+                if matches!(self.page.leaves[i].kind, Kind::Code { .. })
+                    && self.page.leaves[i].span.is_empty()
+                    && !text.ends_with('\n') =>
+            {
+                let lead = match &self.page.leaves[i].kind {
+                    Kind::Code { lead, .. } => lead.clone(),
+                    _ => String::new(),
+                };
+                let at = self.page.leaves[i].span.start;
+                let fence = self.source[at..].trim_start_matches(' ');
+                if fence.starts_with("```") || fence.starts_with("~~~") {
+                    let caret = at + text.len();
+                    self.edit(at..at, &format!("{text}\n{lead}"), window, cx);
+                    self.caret = Some(caret);
+                    cx.notify();
+                    return;
+                }
+                text
+            }
+            _ => text,
+        };
         let target = match range {
             Some(r) => {
                 let (Some(start), Some(end)) = (

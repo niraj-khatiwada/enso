@@ -1172,7 +1172,10 @@ impl Enso {
             .iter()
             .find(|d| d.editor.entity_id() == session.target.editor.entity_id())
         {
-            if let Some(reader) = &doc.large_reader {
+            // The page drawing it, at the new width on every move.
+            if let Some(live) = &doc.live {
+                live.update(cx, |_, cx| cx.notify());
+            } else if let Some(reader) = &doc.large_reader {
                 reader.update(cx, |r, cx| r.refresh_layout(cx));
             } else {
                 doc.preview
@@ -1196,10 +1199,17 @@ impl Enso {
             .get(session.target.range.clone())
             == Some(session.target.expected.as_str())
         {
-            session.target.editor.update(cx, |e, cx| {
+            let editor = session.target.editor.clone();
+            editor.update(cx, |e, cx| {
                 e.set_selected_range(session.target.range, cx);
                 e.replace(session.picture.html(), w, cx);
             });
+            // The editor's caret moved to the image to write it; the page
+            // beside it (Split) stays where it is.
+            let cursor = editor.read(cx).cursor();
+            if let Some(doc) = self.documents.iter_mut().find(|d| d.editor.entity_id() == editor.entity_id()) {
+                doc.last_reader_cursor = Some(cursor);
+            }
         }
         cx.notify();
     }

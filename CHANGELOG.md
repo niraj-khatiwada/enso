@@ -9,7 +9,7 @@ Features:
   - Bullet, numbered and checkbox lists: Enter for the next item, Enter on an empty one to leave the list, Tab and Shift + Tab to indent, and checkboxes that tick.
   - Quotes, code blocks with highlighting, and tables, each cell edited in place: Tab and Enter move between cells and add rows.
   - Selection by drag, Shift, double and triple click; Cmd/Ctrl + A selects the line, then the page. Copy gives plain text (Cmd/Ctrl + Shift + C the Markdown); a copy pasted back keeps its formatting.
-  - The editing keys of the system (word and line moves and deletes) and the editor's formatting keys: bold, italic, strikethrough, inline code (Cmd/Ctrl + E), links, headings, lists, checkboxes, quote and code block.
+  - The editing keys of the system (word and line moves and deletes) and the editor's formatting keys: bold, italic, strikethrough, links, headings, lists, checkboxes, quote and code block. Cmd/Ctrl + E switches between View and Edit.
   - Links open on click; resting the pointer on one, or Cmd/Ctrl + K, shows a card to edit its text and address.
   - Backspace or Delete in an empty block removes it; the slash menu works on an empty line.
   - Tables like Notion's: each cell is its own field, the arrow keys stay in it, a click anywhere in a cell lands there, and + bars under and beside the table add a row or column. Hovering a cell shows its column's alignment and a ⋯ menu to insert, align and delete rows and columns.

@@ -1403,6 +1403,11 @@ impl Enso {
                 return;
             };
             let doc = &this.documents[index];
+            // The classic reader, kept in step for exports, isn't the page
+            // shown: its changes don't move the live page.
+            if doc.live.is_some() {
+                return;
+            }
             if doc.preview.entity_id() == preview.entity_id()
                 && doc.last_preview_text.as_ref() != Some(&preview.read(cx).rendered_text())
             {
@@ -6512,6 +6517,18 @@ mod transition_tests {
             live.update(cx, |live, _| live.set_caret_for_test(5));
         }).unwrap();
         draw(cx, handle);
+        // At a line's start, Enter moves the whole line down (a heading
+        // stays a heading), an empty line left above it.
+        cx.update_window(handle, |_, _, cx| live.update(cx, |live, _| live.set_caret_for_test(source.find("Second").unwrap()))).unwrap();
+        draw(cx, handle);
+        cx.simulate_keystrokes(handle, "enter");
+        draw(cx, handle);
+        assert_eq!((text(cx).as_str(), caret(cx)), ("First\n\n\nSecond\n", Some(8)));
+        cx.simulate_keystrokes(handle, "backspace");
+        draw(cx, handle);
+        assert_eq!(text(cx), source);
+        cx.update_window(handle, |_, _, cx| live.update(cx, |live, _| live.set_caret_for_test(5))).unwrap();
+        draw(cx, handle);
         // Each Enter: one more empty line, the caret on it.
         cx.simulate_keystrokes(handle, "enter");
         draw(cx, handle);
@@ -6844,9 +6861,11 @@ mod transition_tests {
         draw(cx, handle);
         assert_eq!(text(cx), "# Title\n\nSome text!.\n");
         assert_eq!(cx.update(|cx| live.read(cx).undo_steps_for_test()), 1);
-        // Edit and Split are there too.
-        cx.update_window(handle, |_, window, cx| view.update(cx, |app, cx| app.set_mode(Mode::Edit, window, cx))).unwrap();
+        // Cmd/Ctrl+E on the page: Edit (not a format on the text).
+        cx.simulate_keystrokes(handle, if cfg!(target_os = "macos") { "cmd-e" } else { "ctrl-e" });
+        draw(cx, handle);
         assert!(cx.update(|cx| view.read(cx).mode == Mode::Edit && !view.read(cx).live_view(cx)));
+        assert_eq!(text(cx), "# Title\n\nSome text!.\n");
         cx.update_window(handle, |_, window, cx| view.update(cx, |app, cx| app.set_mode(Mode::Split, window, cx))).unwrap();
         draw(cx, handle);
         assert!(cx.update(|cx| view.read(cx).mode == Mode::Split && view.read(cx).live_view(cx)));
@@ -6877,6 +6896,187 @@ mod transition_tests {
         cx.simulate_keystrokes(handle, if cfg!(target_os = "macos") { "cmd-shift-e" } else { "ctrl-shift-e" });
         draw(cx, handle);
         assert_eq!(cx.update(|cx| live.read(cx).raw_for_test()), None);
+    }
+
+    #[gpui_kit::test]
+    fn live_preview_types_into_an_empty_code_block_and_undoes_in_place(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            bind_view_keys(cx);
+            crate::live::init(cx);
+            crate::settings::init(cx);
+        });
+        let source = "Before\n\n```\n```\n\nAfter\n";
+        let (handle, view) = cx.update(|cx| gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+            cx.new(|cx| {
+                let mut app = Enso::new(window, cx);
+                app.add_document(Some(PathBuf::from("empty-code.md")), source.into(), None, window, cx);
+                app
+            })
+        }).unwrap());
+        for _ in 0..3 { draw(cx, handle); cx.run_until_parked(); }
+        let (live, editor) = cx.update(|cx| {
+            let doc = &view.read(cx).documents[0];
+            (doc.live.clone().unwrap(), doc.editor.clone())
+        });
+        let text = |cx: &mut TestAppContext| cx.update(|cx| editor.read(cx).value().to_string());
+        cx.update_window(handle, |_, window, cx| {
+            let focus = live.read(cx).focus.clone();
+            window.focus(&focus, cx);
+            live.update(cx, |live, _| live.set_caret_for_test(source.find("```\n\n").unwrap()));
+        }).unwrap();
+        draw(cx, handle);
+        // Typed in: on its own line, the fence kept.
+        cx.simulate_input(handle, "lol");
+        draw(cx, handle);
+        assert_eq!(text(cx), "Before\n\n```\nlol\n```\n\nAfter\n");
+        cx.simulate_input(handle, "!");
+        draw(cx, handle);
+        assert_eq!(text(cx), "Before\n\n```\nlol!\n```\n\nAfter\n");
+        // Undo: the note as it was, the editor's caret where the change was
+        // (not at the top).
+        cx.simulate_keystrokes(handle, if cfg!(target_os = "macos") { "cmd-z" } else { "ctrl-z" });
+        draw(cx, handle);
+        assert_eq!(text(cx), source);
+        assert_eq!(cx.update(|cx| editor.read(cx).cursor()), source.find("```\n\n").unwrap());
+    }
+
+    #[gpui_kit::test]
+    fn dragging_an_image_handle_is_not_a_click_on_it(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            bind_view_keys(cx);
+            crate::live::init(cx);
+            crate::settings::init(cx);
+        });
+        let source = "Before\n\n<img src=\"b.png\" alt=\"b\" width=\"50%\" />\n\nAfter\n";
+        let (handle, view) = cx.update(|cx| gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+            cx.new(|cx| {
+                let mut app = Enso::new(window, cx);
+                app.add_document(Some(PathBuf::from("drag.md")), source.into(), None, window, cx);
+                app
+            })
+        }).unwrap());
+        cx.update_window(handle, |_, window, cx| view.update(cx, |app, cx| app.set_mode(Mode::Split, window, cx))).unwrap();
+        for _ in 0..3 { draw(cx, handle); cx.run_until_parked(); }
+        let (live, editor) = cx.update(|cx| {
+            let doc = &view.read(cx).documents[0];
+            (doc.live.clone().unwrap(), doc.editor.clone())
+        });
+        let cursor = cx.update(|cx| editor.read(cx).cursor());
+        let scrolled = cx.update(|cx| live.read(cx).scroll_for_test());
+        let mut visual = gpui_kit::VisualTestContext::from_window(handle, cx);
+        let grip = visual.debug_bounds("image-handle-right").expect("the image's handle").center();
+        let to = gpui_kit::point(grip.x - gpui_kit::px(60.), grip.y);
+        visual.simulate_event(gpui_kit::MouseDownEvent { position: grip, button: gpui_kit::MouseButton::Left, modifiers: gpui_kit::Modifiers::none(), click_count: 1, first_mouse: false });
+        visual.simulate_event(gpui_kit::MouseMoveEvent { position: to, pressed_button: Some(gpui_kit::MouseButton::Left), modifiers: gpui_kit::Modifiers::none() });
+        visual.simulate_event(gpui_kit::MouseUpEvent { position: to, button: gpui_kit::MouseButton::Left, modifiers: gpui_kit::Modifiers::none(), click_count: 1 });
+        draw(cx, handle);
+        cx.run_until_parked();
+        // Not picked, and Split's editor stays where it was, unhighlighted.
+        assert_eq!(cx.update(|cx| live.read(cx).picked_for_test()), None);
+        assert!(cx.update(|cx| view.read(cx).editor_flash.is_none()));
+        let _ = cursor;
+        // The new width is written; the page doesn't jump to it.
+        let text = cx.update(|cx| editor.read(cx).value().to_string());
+        assert!(!text.contains("width=\"50%\""), "{text}");
+        assert_eq!(cx.update(|cx| live.read(cx).scroll_for_test()), scrolled);
+    }
+
+    #[gpui_kit::test]
+    fn the_page_keeps_its_place_when_a_block_above_changes_length(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            bind_view_keys(cx);
+            crate::live::init(cx);
+            crate::settings::init(cx);
+        });
+        let mut source = String::from("<img src=\"a.png\" alt=\"a\" width=\"50%\" />\n\n");
+        for n in 0..80 {
+            source.push_str(&format!("Paragraph {n} with some words in it.\n\n"));
+        }
+        let (handle, view) = cx.update(|cx| gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+            cx.new(|cx| {
+                let mut app = Enso::new(window, cx);
+                app.add_document(Some(PathBuf::from("long.md")), source.clone().into(), None, window, cx);
+                app
+            })
+        }).unwrap());
+        for _ in 0..3 { draw(cx, handle); cx.run_until_parked(); }
+        let (live, editor) = cx.update(|cx| {
+            let doc = &view.read(cx).documents[0];
+            (doc.live.clone().unwrap(), doc.editor.clone())
+        });
+        cx.update(|cx| live.read(cx).set_scroll_for_test(gpui_kit::px(600.)));
+        draw(cx, handle);
+        let before = cx.update(|cx| live.read(cx).scroll_for_test());
+        // The image above resized: its Markdown a few letters longer.
+        cx.update_window(handle, |_, window, cx| editor.update(cx, |e, cx| {
+            let at = e.value().find("50%").unwrap();
+            e.set_selected_range(at..at + 3, cx);
+            e.replace("37.25%".to_string(), window, cx);
+        })).unwrap();
+        draw(cx, handle);
+        draw(cx, handle);
+        assert_eq!(cx.update(|cx| live.read(cx).scroll_for_test()), before);
+    }
+
+    #[gpui_kit::test]
+    fn resizing_a_loaded_image_keeps_the_page_in_place(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            bind_view_keys(cx);
+            crate::live::init(cx);
+            crate::settings::init(cx);
+        });
+        let dir = std::env::temp_dir().join(format!("enso-resize-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let picture = image::RgbImage::from_pixel(400, 600, image::Rgb([180, 120, 60]));
+        picture.save(dir.join("pic.png")).unwrap();
+        let mut source = String::new();
+        for n in 0..30 {
+            source.push_str(&format!("Before {n} with some words in it.\n\n"));
+        }
+        source.push_str("<img src=\"pic.png\" alt=\"pic\" width=\"50%\" />\n\n");
+        for n in 0..30 {
+            source.push_str(&format!("After {n} with some words in it.\n\n"));
+        }
+        let path = dir.join("note.md");
+        std::fs::write(&path, &source).unwrap();
+        let (handle, view) = cx.update(|cx| gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+            cx.new(|cx| {
+                let mut app = Enso::new(window, cx);
+                app.add_document(Some(path.clone()), source.clone().into(), None, window, cx);
+                app
+            })
+        }).unwrap());
+        // Split, the editor's caret far from the image (at the top).
+        cx.update_window(handle, |_, window, cx| view.update(cx, |app, cx| app.set_mode(Mode::Split, window, cx))).unwrap();
+        for _ in 0..6 { draw(cx, handle); cx.run_until_parked(); }
+        let live = cx.update(|cx| view.read(cx).documents[0].live.clone().unwrap());
+        let editor = cx.update(|cx| view.read(cx).documents[0].editor.clone());
+        cx.update(|cx| editor.update(cx, |e, cx| e.set_selected_range(0..0, cx)));
+        cx.run_until_parked();
+        // The image in the middle of the window.
+        let top = gpui_kit::VisualTestContext::from_window(handle, cx).debug_bounds("image-frame").expect("the image").top();
+        cx.update(|cx| live.read(cx).set_scroll_for_test(top - gpui_kit::px(200.)));
+        for _ in 0..3 { draw(cx, handle); cx.run_until_parked(); }
+        let before = cx.update(|cx| live.read(cx).scroll_for_test());
+        let mut visual = gpui_kit::VisualTestContext::from_window(handle, cx);
+        let grip = visual.debug_bounds("image-handle-right").expect("the image's handle").center();
+        visual.simulate_event(gpui_kit::MouseDownEvent { position: grip, button: gpui_kit::MouseButton::Left, modifiers: gpui_kit::Modifiers::none(), click_count: 1, first_mouse: false });
+        for step in 1..=6 {
+            let at = gpui_kit::point(grip.x - gpui_kit::px(20. * step as f32), grip.y);
+            visual.simulate_event(gpui_kit::MouseMoveEvent { position: at, pressed_button: Some(gpui_kit::MouseButton::Left), modifiers: gpui_kit::Modifiers::none() });
+            draw(cx, handle);
+            assert_eq!(cx.update(|cx| live.read(cx).scroll_for_test()), before, "while dragging (step {step})");
+            visual = gpui_kit::VisualTestContext::from_window(handle, cx);
+        }
+        let end = gpui_kit::point(grip.x - gpui_kit::px(120.), grip.y);
+        visual.simulate_event(gpui_kit::MouseUpEvent { position: end, button: gpui_kit::MouseButton::Left, modifiers: gpui_kit::Modifiers::none(), click_count: 1 });
+        for _ in 0..3 { draw(cx, handle); cx.run_until_parked(); }
+        assert_eq!(cx.update(|cx| live.read(cx).scroll_for_test()), before, "after letting go");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[gpui_kit::test]
