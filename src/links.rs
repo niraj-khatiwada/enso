@@ -856,12 +856,12 @@ fn make_record(stamp: (SystemTime, u64), text: &str) -> Record {
     }
 }
 #[cfg(unix)]
-fn file_identity(_: &Path, metadata: &std::fs::Metadata) -> Option<(u64, u64)> {
+pub(crate) fn file_identity(_: &Path, metadata: &std::fs::Metadata) -> Option<(u64, u64)> {
     use std::os::unix::fs::MetadataExt;
     Some((metadata.dev(), metadata.ino()))
 }
 #[cfg(windows)]
-fn file_identity(path: &Path, _: &std::fs::Metadata) -> Option<(u64, u64)> {
+pub(crate) fn file_identity(path: &Path, _: &std::fs::Metadata) -> Option<(u64, u64)> {
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::Storage::FileSystem::{
         BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
@@ -877,7 +877,7 @@ fn file_identity(path: &Path, _: &std::fs::Metadata) -> Option<(u64, u64)> {
     ))
 }
 #[cfg(not(any(unix, windows)))]
-fn file_identity(_: &Path, _: &std::fs::Metadata) -> Option<(u64, u64)> {
+pub(crate) fn file_identity(_: &Path, _: &std::fs::Metadata) -> Option<(u64, u64)> {
     None
 }
 
@@ -897,6 +897,12 @@ pub struct Changes {
     pub changed_notes: Vec<PathBuf>,
 }
 impl Index {
+    pub(crate) fn path_for_identity(&self, identity: (u64, u64)) -> Option<&PathBuf> {
+        let mut paths = self.files.iter().filter(|(_, file)| file.identity == Some(identity)).map(|(path, _)| path);
+        let first = paths.next()?;
+        paths.next().is_none().then_some(first)
+    }
+
     pub fn observe(&mut self, root: &Path, explicit_moves: Vec<Move>) -> Changes {
         let mut current = HashMap::new();
         let mut dirs = vec![root.to_owned()];

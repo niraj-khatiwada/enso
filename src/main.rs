@@ -9,6 +9,7 @@ mod math;
 mod diagram;
 mod export;
 mod files;
+mod file_icons;
 mod find;
 mod focus;
 mod http;
@@ -549,6 +550,9 @@ struct Enso {
     marked: Vec<PathBuf>,
     active: Option<usize>,
     root: Option<PathBuf>,
+    file_icons: file_icons::Metadata,
+    icon_picker: Option<(PathBuf, Entity<file_icons::Picker>)>,
+    icon_error: Option<String>,
     folders: HashMap<PathBuf, Vec<files::Entry>>,
     /// Each listed folder's modified time when it was read: adding, removing
     /// or renaming an entry moves it, which is when the listing is redone.
@@ -708,6 +712,9 @@ impl Enso {
             marked: Vec::new(),
             active: None,
             root: None,
+            file_icons: Default::default(),
+            icon_picker: None,
+            icon_error: None,
             folders: HashMap::new(),
             folder_stamps: HashMap::new(),
             expanded: HashSet::new(),
@@ -1670,6 +1677,10 @@ impl Enso {
         self.repairing_links = false;
         self.wiki_completion = None;
         self.root = Some(path.clone());
+        self.file_icons = Default::default();
+        self.icon_picker = None;
+        self.icon_error = None;
+        self.refresh_file_icons(file_icons::reconcile(&path, &[], &[]), cx);
         self.refresh_links(cx);
         self.folders.clear();
         self.expanded.clear();
@@ -2504,6 +2515,9 @@ impl Enso {
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_default();
             // On the main thread: Windows' "delete permanently?" dialog needs it.
+            if let Some(root) = self.root.clone() {
+                self.refresh_file_icons(file_icons::reconcile(&root, &[], &[]), cx);
+            }
             match files::move_to_trash(&path) {
                 Ok(()) => {
                     self.forget_entry(&path, cx);
@@ -2527,6 +2541,10 @@ impl Enso {
     /// Drop everything that pointed at a file or folder that is gone: its
     /// tabs (their edits went with it), tree state and selection.
     fn forget_entry(&mut self, path: &PathBuf, cx: &mut Context<Self>) {
+        if let Some(root) = self.root.clone() {
+            self.refresh_file_icons(file_icons::reconcile(&root, &[], &[]), cx);
+        }
+        if self.icon_picker.as_ref().is_some_and(|(p, _)| p.starts_with(path)) { self.icon_picker = None; }
         for index in (0..self.documents.len()).rev() {
             if self.documents[index]
                 .path
@@ -2613,6 +2631,10 @@ impl Enso {
     }
 
     fn follow_entry_move(&mut self, old: &PathBuf, new: &PathBuf, cx: &mut Context<Self>) {
+        if let Some(root) = self.root.clone() {
+            self.refresh_file_icons(file_icons::reconcile(&root, &[links::Move { old: old.clone(), new: new.clone() }], &[]), cx);
+        }
+        if self.icon_picker.as_ref().is_some_and(|(p, _)| p.starts_with(old)) { self.icon_picker = None; }
         lock::moved(old, new, cx);
         let moved = |path: &PathBuf| {
             path.strip_prefix(old)
@@ -2755,12 +2777,14 @@ impl Enso {
                 this.finish(busy, None, cx);
                 if this.root.as_ref() != Some(&root) { return; }
                 let mut copied = Vec::new();
-                for (_, result) in results {
+                let mut icon_copies = Vec::new();
+                for (old, result) in results {
                     match result {
-                        Ok(path) => copied.push(path),
+                        Ok(path) => { icon_copies.push(links::Move { old, new: path.clone() }); copied.push(path); },
                         Err(error) => this.message(error.to_string(), true, cx),
                     }
                 }
+                this.refresh_file_icons(file_icons::reconcile(&root, &[], &icon_copies), cx);
                 // Wake the same filesystem reconciliation used for external
                 // file-manager changes and sync arrivals. No link rewriting here.
                 this.refresh_links(cx);
@@ -3772,7 +3796,7 @@ impl Render for Enso {
                             div()
                                 .relative()
                                 .flex_shrink_0()
-                                .w(px(TREE_INDENT))
+                                .w(px(TREE_INDENT + if own { 4. } else { 0. }))
                                 .h_full()
                                 .when(!own && continues, |col| {
                                     col.child(
@@ -3791,7 +3815,7 @@ impl Render for Enso {
                                             .absolute()
                                             .left(half)
                                             .top_0()
-                                            .w(half)
+                                            .w(half + px(4.))
                                             .h(mid)
                                             .border_l_1()
                                             .border_b_1()
@@ -3878,13 +3902,13 @@ impl Render for Enso {
                             .when(!active && !renaming, |row| row.text_color(muted))
                             .group("tree-row")
                             // Selection and hover start where the indent guides
-                            // end, at the row's own chevron, and run to its end.
+                            // end, at the row's icon, and run to its end.
                             .child(
                                 div()
                                     .absolute()
                                     .top_0()
                                     .bottom_0()
-                                    .left(px(4. + TREE_INDENT * (depth + 1) as f32))
+                                    .left(px(8. + TREE_INDENT * (depth + 1) as f32))
                                     .right_0()
                                     .rounded_md()
                                     .when(active || renaming, |fill| fill.bg(selected_bg))
@@ -3895,40 +3919,15 @@ impl Render for Enso {
                                     }),
                             )
                             .children(guides)
-                            .child(
-                                div()
-                                    .flex_shrink_0()
-                                    .w(px(16.))
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .when(entry.directory, |slot| {
-                                        slot.child(
-                                            Icon::new(if expanded {
-                                                IconName::ChevronDown
-                                            } else {
-                                                IconName::ChevronRight
-                                            })
-                                            .size_3p5()
-                                            .text_color(muted),
-                                        )
-                                    }),
-                            )
-                            .child(
-                                Icon::new(if entry.directory {
-                                    if expanded {
-                                        IconName::FolderOpen
-                                    } else {
-                                        IconName::Folder
-                                    }
-                                } else {
-                                    IconName::File
-                                })
-                                .size_4()
-                                .flex_shrink_0()
-                                .mr_1p5()
-                                .text_color(muted),
-                            )
+                            .child(div().w(px(4.)).flex_shrink_0())
+                            .child(if entry.directory {
+                                div().debug_selector(|| "sidebar-folder-icon".into()).w(px(16.)).h(px(16.)).flex_shrink_0().mr_1p5()
+                                    .child(Icon::new(if expanded { IconName::FolderOpen } else { IconName::Folder }).size_4().text_color(muted)).into_any_element()
+                            } else if pending || renaming {
+                                Icon::new(IconName::File).size_4().flex_shrink_0().mr_1p5().text_color(muted).into_any_element()
+                            } else {
+                                div().flex_shrink_0().w(px(16.)).h(px(24.)).mr_1p5().child(div().relative().left(px(-4.)).w(px(24.)).h(px(24.)).child(self.file_icon_button(&path, cx))).into_any_element()
+                            })
                             .when(!renaming, |row| {
                                 let path = path.clone();
                                 row.child(
@@ -3936,6 +3935,7 @@ impl Render for Enso {
                                     // the label is as wide as its text.
                                     div()
                                         .id(("file-name", i))
+                                        .debug_selector(move || if entry.directory { "sidebar-folder-name".into() } else { "sidebar-file-name".into() })
                                         .min_w_0()
                                         .truncate()
                                         .child(label)
@@ -5332,6 +5332,98 @@ mod transition_tests {
         })
         .unwrap();
         cx.run_until_parked();
+    }
+
+    #[gpui_kit::test]
+    fn sidebar_icon_picker_searches_applies_and_keeps_markdown_unchanged(cx: &mut TestAppContext) {
+        cx.update(|cx| { gpui_kit::init(cx); bind_view_keys(cx); });
+        let root = std::env::temp_dir().join(format!("enso-icon-picker-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(root.join("Folder")).unwrap();
+        let path = root.join("note.md");
+        std::fs::write(&path, "Original Markdown.").unwrap();
+        let (handle, view) = cx.update(|cx| gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+            cx.new(|cx| {
+                let mut app = Enso::new(window, cx);
+                app.open_folder(root.clone(), cx);
+                app.sidebar_open = true;
+                app
+            })
+        }).unwrap());
+        for _ in 0..3 { draw(cx, handle); }
+        let mut visual = gpui_kit::VisualTestContext::from_window(handle, cx);
+        let bounds = visual.debug_bounds("sidebar-file-icon").expect("file icon trigger");
+        let folder = visual.debug_bounds("sidebar-folder-icon").unwrap();
+        let file_name = visual.debug_bounds("sidebar-file-name").unwrap();
+        let folder_name = visual.debug_bounds("sidebar-folder-name").unwrap();
+        assert!((bounds.center().x - folder.center().x).abs() < px(1.), "file and folder icons align");
+        assert_eq!(file_name.left(), folder_name.left(), "file and folder names align");
+        visual.simulate_click(bounds.center(), gpui_kit::Modifiers::default());
+        draw(cx, handle);
+        assert!(cx.update(|cx| view.read(cx).icon_picker.is_some()), "clicking the icon opens the picker");
+        assert!(cx.update(|cx| view.read(cx).documents.is_empty()), "clicking the icon does not open the note");
+        cx.simulate_input(handle, "rocket");
+        draw(cx, handle);
+        cx.simulate_keystrokes(handle, "enter");
+        draw(cx, handle);
+        cx.update(|cx| {
+            let app = view.read(cx);
+            assert!(app.icon_picker.is_none());
+            assert_eq!(app.file_icons.get(&root, &path), Some(&crate::file_icons::Choice::Icon { name: "rocket".into(), color: None }));
+        });
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "Original Markdown.");
+        assert!(root.join(".assets/file-icons.json").is_file());
+        let mut visual = gpui_kit::VisualTestContext::from_window(handle, cx);
+        visual.simulate_click(bounds.center(), gpui_kit::Modifiers::default());
+        draw(cx, handle);
+        let mut visual = gpui_kit::VisualTestContext::from_window(handle, cx);
+        let blue = visual.debug_bounds("file-icon-color-5").unwrap();
+        visual.simulate_click(blue.center(), gpui_kit::Modifiers::default());
+        draw(cx, handle);
+        assert_eq!(cx.update(|cx| view.read(cx).file_icons.get(&root, &path).cloned()), Some(crate::file_icons::Choice::Icon { name: "rocket".into(), color: Some("#498add".into()) }));
+        let picker = cx.update(|cx| view.read(cx).icon_picker.as_ref().unwrap().1.clone());
+        let custom = cx.update(|cx| picker.read(cx).color_picker.clone());
+        let mut visual = gpui_kit::VisualTestContext::from_window(handle, cx);
+        let custom_button = visual.debug_bounds("file-icon-custom-color").unwrap();
+        visual.simulate_click(custom_button.center(), gpui_kit::Modifiers::default());
+        draw(cx, handle);
+        assert!(cx.update(|cx| custom.read(cx).is_open()));
+        // A click beyond both surfaces dismisses only the nested palette.
+        let mut visual = gpui_kit::VisualTestContext::from_window(handle, cx);
+        visual.simulate_click(gpui_kit::point(px(950.), px(700.)), gpui_kit::Modifiers::default());
+        draw(cx, handle);
+        assert!(!cx.update(|cx| custom.read(cx).is_open()));
+        assert!(cx.update(|cx| view.read(cx).icon_picker.is_some()), "palette interaction keeps the icon chooser open");
+        custom.update(cx, |_, cx| cx.emit(gpui_kit::component::color_picker::ColorPickerEvent::Change(Some(gpui_kit::rgba(0x123456cc).into()))));
+        draw(cx, handle);
+        assert_eq!(cx.update(|cx| view.read(cx).file_icons.get(&root, &path).cloned()), Some(crate::file_icons::Choice::Icon { name: "rocket".into(), color: Some("#123456cc".into()) }));
+        let mut visual = gpui_kit::VisualTestContext::from_window(handle, cx);
+        let emoji = visual.debug_bounds("file-icon-emoji-tab").unwrap();
+        visual.simulate_click(emoji.center(), gpui_kit::Modifiers::default());
+        draw(cx, handle);
+        cx.simulate_input(handle, "usa");
+        draw(cx, handle);
+        cx.simulate_keystrokes(handle, "enter");
+        draw(cx, handle);
+        assert_eq!(cx.update(|cx| view.read(cx).file_icons.get(&root, &path).cloned()), Some(crate::file_icons::Choice::Emoji { value: "🇺🇸".into() }));
+        let mut visual = gpui_kit::VisualTestContext::from_window(handle, cx);
+        visual.simulate_click(bounds.center(), gpui_kit::Modifiers::default());
+        draw(cx, handle);
+        cx.simulate_input(handle, "👩🏽‍💻");
+        cx.executor().advance_clock(std::time::Duration::from_millis(200));
+        cx.run_until_parked();
+        draw(cx, handle);
+        assert_eq!(cx.update(|cx| view.read(cx).file_icons.get(&root, &path).cloned()), Some(crate::file_icons::Choice::Emoji { value: "👩🏽‍💻".into() }));
+        let mut visual = gpui_kit::VisualTestContext::from_window(handle, cx);
+        visual.simulate_click(bounds.center(), gpui_kit::Modifiers::default());
+        draw(cx, handle);
+        let mut visual = gpui_kit::VisualTestContext::from_window(handle, cx);
+        let reset = visual.debug_bounds("file-icon-reset").unwrap();
+        visual.simulate_click(reset.center(), gpui_kit::Modifiers::default());
+        draw(cx, handle);
+        assert!(cx.update(|cx| view.read(cx).file_icons.get(&root, &path).is_none()));
+        cx.update_window(handle, |_, window, _| window.remove_window()).unwrap();
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[gpui_kit::test]
