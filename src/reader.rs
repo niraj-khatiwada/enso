@@ -60,6 +60,7 @@ pub struct LargeReader {
     base: Option<PathBuf>,
     cursor_anchor: Option<usize>,
     controls: Option<(WeakEntity<crate::Enso>, EntityId)>,
+    split: bool,
     /// A highlighted match (a search jump, Find): its section is drawn from a
     /// state of its own, which can carry highlights; the others stay plain.
     highlight: Option<Highlight>,
@@ -72,6 +73,119 @@ struct Highlight {
     color: Hsla,
     state: Entity<gpui_kit::component::text::TextViewState>,
     applied: bool,
+}
+
+/// Only mounted sections acquire these states. Each block owns its hitbox,
+/// so a heading and a tall image do not share a proportional section mapping.
+struct SplitSection {
+    text: String,
+    blocks: Vec<SplitBlock>,
+}
+
+struct SplitBlock {
+    range: Range<usize>,
+    state: Entity<gpui_kit::component::text::TextViewState>,
+    painted: Option<(Vec<Range<usize>>, Hsla)>,
+}
+
+impl SplitSection {
+    fn new(text: String, cx: &mut App) -> Self {
+        let mut options = markdown::ParseOptions::gfm();
+        options.constructs.math_flow = true;
+        options.constructs.math_text = true;
+        let tree = markdown::to_mdast(&text, &options).ok();
+        let nodes: Vec<_> = tree.as_ref().and_then(|tree| tree.children()).into_iter().flatten().collect();
+        // Keep reference links working when a section's blocks render separately.
+        let definitions: String = nodes.iter().filter(|node| matches!(node, markdown::mdast::Node::Definition(_)))
+            .filter_map(|node| node.position()).map(|p| format!("\n\n{}", &text[p.start.offset..p.end.offset])).collect();
+        let mut ranges: Vec<_> = nodes.iter().filter(|node| !matches!(node, markdown::mdast::Node::Definition(_)))
+            .filter_map(|node| node.position().map(|p| p.start.offset..p.end.offset)).collect();
+        if tree.is_none() { ranges.push(0..text.len()); }
+        let blocks = ranges.into_iter().map(|range| {
+            let source = format!("{}{}", &text[range.clone()], definitions);
+            let state = cx.new(|cx| gpui_kit::component::text::TextViewState::markdown(&source, cx));
+            SplitBlock { range, state, painted: None }
+        }).collect();
+        Self { text, blocks }
+    }
+}
+
+fn split_section(
+    index: usize,
+    text: String,
+    section: &Section,
+    controls: &(WeakEntity<crate::Enso>, EntityId),
+    base: Option<PathBuf>,
+    highlight: Option<(Vec<Range<usize>>, Hsla)>,
+    window: &mut Window,
+    cx: &mut App,
+) -> AnyElement {
+    let cache = window.use_keyed_state(("split-section", index), cx, |_, cx| SplitSection::new(text.clone(), cx));
+    cache.update(cx, |cache, cx| {
+        if cache.text != text { *cache = SplitSection::new(text, cx); }
+        let mut content = gpui_kit::component::v_flex().w_full().gap(rems(0.75));
+        for block in &mut cache.blocks {
+            let range = block.range.clone();
+            let prefix = section.prefix.len();
+            let map = |at: usize| section.range.start + at.saturating_sub(prefix).min(section.range.len());
+            let source_range = map(range.start)..map(range.end);
+            let state = block.state.clone();
+            let local_highlight = highlight.as_ref().map(|(ranges, color)| {
+                (ranges.iter().filter_map(|r| {
+                    let start = r.start.max(range.start);
+                    let end = r.end.min(range.end);
+                    (start < end).then(|| start - range.start..end - range.start)
+                }).collect::<Vec<_>>(), *color)
+            });
+            if block.painted != local_highlight {
+                let rendered = state.read(cx).rendered_text();
+                if !rendered.source().is_empty() {
+                    let painted: Vec<_> = local_highlight.as_ref().map(|(ranges, color)| ranges.iter()
+                        .filter_map(|r| rendered.range_for_source(r.clone()))
+                        .map(|r| gpui_kit::component::text::RangeHighlight::new(r, *color)).collect()).unwrap_or_default();
+                    state.update(cx, |state, cx| { let _ = state.set_range_highlights(painted, cx); });
+                    block.painted = local_highlight;
+                } else { window.request_animation_frame(); }
+            }
+            let (owner, editor) = controls.clone();
+            let click_owner = owner.clone();
+            let image_base = base.clone();
+            let link_base = base.clone();
+            let start = source_range.start;
+            let local_prefix = prefix.saturating_sub(range.start);
+            let click_range = source_range.clone();
+            let click_state = state.clone();
+            content = content.child(div().id(("large-preview-block", start))
+                .debug_selector(move || format!("large-preview-block-{start}"))
+                .w_full()
+                .capture_any_mouse_up(move |event: &MouseUpEvent, window, cx| {
+                    if event.button != MouseButton::Left { return; }
+                    let owner = click_owner.clone();
+                    let state = click_state.clone();
+                    let range = click_range.clone();
+                    window.defer(cx, move |window, cx| {
+                        let offset = state.read(cx).selected_source_range()
+                            .map(|selected| range.start + selected.start.saturating_sub(local_prefix).min(range.len())).unwrap_or(range.start);
+                        let _ = owner.update(cx, |app, cx| app.live_clicked(editor, offset, Some(range), false, window, cx));
+                    });
+                })
+                .child(crate::rich::decorate(crate::typography::style(TextView::new(&state), cx), owner.clone(), editor, link_base, source_range.start, prefix.saturating_sub(range.start))
+                    .selectable(true).w_full()
+                    .image_source(move |uri| {
+                        let source = uri.to_string();
+                        if !source.contains(':') && let Some(base) = &image_base {
+                            return ImageSource::from(base.join(crate::links::decode(&source)));
+                        }
+                        ImageSource::from(uri.clone())
+                    })
+                    .on_link_click(move |url, event, window, cx| {
+                        if !event.is_right_click() {
+                            let _ = owner.update(cx, |app, cx| app.follow_note_link(editor, url, window, cx));
+                        }
+                    })));
+        }
+        content.into_any_element()
+    })
 }
 
 impl LargeReader {
@@ -264,8 +378,10 @@ impl LargeReader {
     pub fn set_base(&mut self, base: Option<PathBuf>, cx: &mut Context<Self>) {
         self.base = base; self.list.remeasure(); cx.notify();
     }
-    pub fn set_controls(&mut self, owner: WeakEntity<crate::Enso>, editor: EntityId) {
+    pub fn set_controls(&mut self, owner: WeakEntity<crate::Enso>, editor: EntityId, split: bool) {
         self.controls = Some((owner, editor));
+        if self.split != split { self.list.remeasure(); }
+        self.split = split;
     }
 
     pub fn new(source: Arc<String>, sections: Vec<Section>, base: Option<PathBuf>) -> Self {
@@ -278,6 +394,7 @@ impl LargeReader {
             base,
             cursor_anchor: None,
             controls: None,
+            split: false,
             highlight: None,
         }
     }
@@ -305,12 +422,14 @@ impl Render for LargeReader {
             }
         }
         let highlighted = self.highlight.as_ref().map(|h| (h.section, h.state.clone()));
+        let split_highlight = self.highlight.as_ref().map(|h| (h.section, h.ranges.clone(), h.color));
+        let split = self.split;
         let source = self.source.clone();
         let sections = self.sections.clone();
         let base = self.base.clone();
         let controls = self.controls.clone();
         let last = sections.len().saturating_sub(1);
-        let content = list(self.list.clone(), move |index, _, cx| {
+        let content = list(self.list.clone(), move |index, window, cx| {
             if index == sections.len() {
                 return div().pl(px(TEXT_INSET_X)).pr_4().child(
                     controls.as_ref().and_then(|(owner, editor)| owner.update(cx, |app, cx| app.linked_from(*editor, cx)).ok())
@@ -337,7 +456,10 @@ impl Render for LargeReader {
                 .when(index == 0, |d| d.pt(px(TEXT_INSET_Y)))
                 .when(index == last, |d| d.pb(px(TEXT_INSET_Y)))
                 .child(
-                    div().w_full().child(
+                    div().w_full().child(if split && controls.is_some() {
+                        split_section(index, text, section, controls.as_ref().unwrap(), base.clone(),
+                            split_highlight.as_ref().filter(|(section, _, _)| *section == index).map(|(_, ranges, color)| (ranges.clone(), *color)), window, cx)
+                    } else {
                         match &highlighted {
                             Some((section, state)) if *section == index => TextView::new(state),
                             _ => TextView::markdown(("section", index), text),
@@ -374,8 +496,8 @@ impl Render for LargeReader {
                                         let _ = owner.update(cx, |app, cx| app.follow_note_link(*editor, url, window, cx));
                                     }
                                 }
-                            }),
-                    ),
+                            }).into_any_element()
+                    }),
                 )
                 .into_any_element()
         })

@@ -4198,7 +4198,7 @@ impl Render for Enso {
                     );
                 } else if let Some(reader) = &document.large_reader {
                     let owner = cx.entity().downgrade();
-                    reader.update(cx, |reader, _| reader.set_controls(owner, document.editor.entity_id()));
+                    reader.update(cx, |reader, _| reader.set_controls(owner, document.editor.entity_id(), mode == Mode::Split));
                     reading_pane = Some(
                         div()
                             .id(("preview-pane", document.editor.entity_id()))
@@ -6049,6 +6049,66 @@ mod transition_tests {
         });
         cx.update_window(handle, |_, window, _| window.remove_window()).unwrap();
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn large_split_preview_clicks_reveal_and_highlight_source_blocks(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            bind_view_keys(cx);
+            crate::live::init(cx);
+            crate::settings::init(cx);
+        });
+        let beginning = "# Heading\n\nParagraph with **bold café 😀**.\n\n- First item\n- Second item\n\n```rust\nlet value = 42;\n```\n\n";
+        let mut source = beginning.to_string();
+        source.push_str(&"More paragraphs with Unicode café 😀.\n\n".repeat(30_000));
+        let code_start = source.len();
+        source.push_str("```rust\n");
+        source.push_str(&"let continued = 1;\n".repeat(600));
+        source.push_str("```\n");
+        assert!(source.len() > reader::LARGE_DOCUMENT_BYTES);
+        let sections = reader::LargeReader::index(&source);
+        let (handle, view) = cx.update(|cx| gpui_kit::open_window(WindowOptions {
+            window_bounds: Some(WindowBounds::Windowed(Bounds { origin: Default::default(), size: size(px(1200.), px(900.)) })),
+            ..Default::default()
+        }, cx, |window, cx| cx.new(|cx| {
+            let mut app = Enso::new(window, cx);
+            app.add_document(Some(PathBuf::from("large-clicks.md")), source.clone(), Some(sections), window, cx);
+            app.sidebar_open = false;
+            app
+        })).unwrap());
+        cx.update_window(handle, |_, window, cx| view.update(cx, |app, cx| app.set_mode(Mode::Split, window, cx))).unwrap();
+        for _ in 0..4 { draw(cx, handle); }
+        let (editor, reader) = cx.update(|cx| {
+            let doc = &view.read(cx).documents[0];
+            assert!(doc.live.is_none());
+            (doc.editor.clone(), doc.large_reader.clone().unwrap())
+        });
+        for marker in ["# Heading", "Paragraph with", "- First item", "```rust"] {
+            let start = source.find(marker).unwrap();
+            let mut visual = gpui_kit::VisualTestContext::from_window(handle, cx);
+            let block = visual.debug_bounds(format!("large-preview-block-{start}").leak()).expect(marker);
+            visual.simulate_click(block.center(), gpui_kit::Modifiers::default());
+            draw(cx, handle);
+            assert_eq!(cx.update(|cx| editor.read(cx).cursor()), start, "{marker}");
+            assert!(cx.update(|cx| view.read(cx).editor_flash.is_some()), "{marker} flashes its Markdown");
+        }
+        // Jump into a split fence far below the viewport. Its synthetic opening
+        // fence must not shift the source offset or be included in the flash.
+        cx.update(|cx| reader.update(cx, |reader, cx| reader.reveal_source(code_start + 6000, cx)));
+        for _ in 0..4 { draw(cx, handle); }
+        let range = cx.update(|cx| reader.read(cx).visible_source_range().unwrap());
+        assert!(range.start > code_start);
+        let mut visual = gpui_kit::VisualTestContext::from_window(handle, cx);
+        let block = visual.debug_bounds(format!("large-preview-block-{}", range.start).leak()).unwrap();
+        visual.simulate_click(gpui_kit::point(block.center().x, block.top() + px(15.)), gpui_kit::Modifiers::default());
+        draw(cx, handle);
+        assert_eq!(cx.update(|cx| editor.read(cx).cursor()), range.start);
+        assert!(cx.update(|cx| editor.read(cx).scroll_offset().y < px(0.)));
+        assert!(cx.update(|cx| view.read(cx).editor_flash.is_some()));
+        assert_eq!(cx.update(|cx| editor.read(cx).value().to_string()), source);
+        assert_eq!(cx.update(|cx| reader.read(cx).visible_source_range()), Some(range), "clicking does not move the preview");
+        cx.update_window(handle, |_, window, _| window.remove_window()).unwrap();
     }
 
     #[gpui_kit::test]
