@@ -8728,6 +8728,40 @@ mod transition_tests {
     }
 
     #[gpui_kit::test]
+    fn fullscreen_svg_images_stay_inside_the_viewport(cx: &mut TestAppContext) {
+        cx.update(|cx| { gpui_kit::init(cx); bind_view_keys(cx); });
+        let path = std::env::temp_dir().join(format!("enso-fullscreen-{}.svg", std::process::id()));
+        let svg = br##"<svg xmlns="http://www.w3.org/2000/svg" width="100%" height="100%" viewBox="0 0 2000 1000"><rect width="2000" height="1000" fill="#f97316"/></svg>"##;
+        std::fs::write(&path, svg).unwrap();
+        assert!(image::image_dimensions(&path).is_err(), "SVG uses the unknown-dimensions path");
+        let (handle, view) = cx.update(|cx| gpui_kit::open_window(WindowOptions {
+            window_bounds: Some(WindowBounds::Windowed(Bounds { origin: Default::default(), size: size(px(1000.), px(700.)) })),
+            ..Default::default()
+        }, cx, |window, cx| cx.new(|cx| {
+            let mut app = Enso::new(window, cx);
+            app.open_lightbox(super::media::Lightbox::Image(path.clone()), window, cx);
+            app
+        })).unwrap());
+        for viewport in [size(px(1000.), px(700.)), size(px(520.), px(700.)), size(px(1400.), px(800.))] {
+            cx.simulate_window_resize(handle, viewport);
+            for _ in 0..4 { draw(cx, handle); }
+            let mut visual = gpui_kit::VisualTestContext::from_window(handle, cx);
+            let frame = visual.debug_bounds("lightbox-image-frame").unwrap();
+            let picture = visual.debug_bounds("lightbox-picture").unwrap();
+            assert!(frame.size.width <= viewport.width * 0.9 + px(1.));
+            assert!(frame.size.height <= viewport.height * 0.86 + px(1.));
+            assert!(picture.left() >= px(0.) && picture.right() <= viewport.width);
+            assert!(picture.top() >= px(0.) && picture.bottom() <= viewport.height);
+        }
+        cx.simulate_keystrokes(handle, "escape");
+        draw(cx, handle);
+        assert!(cx.update(|cx| view.read(cx).lightbox.is_none()));
+        assert_eq!(std::fs::read(&path).unwrap(), svg);
+        cx.update_window(handle, |_, window, _| window.remove_window()).unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[gpui_kit::test]
     fn diagrams_copy_save_and_open_full_size(cx: &mut TestAppContext) {
         cx.update(|cx| { gpui_kit::init(cx); bind_view_keys(cx); });
         let dir = std::env::temp_dir().join(format!("enso-media-{}", std::process::id()));
