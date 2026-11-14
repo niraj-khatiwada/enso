@@ -255,10 +255,22 @@ impl Enso {
                     .map(|(w, h)| (w as f32, h as f32))
                     .unwrap_or((f32::from(max_w), f32::from(max_h)));
                 let scale = (f32::from(max_w) / w).min(f32::from(max_h) / h).min(2.);
-                img(path.clone())
+                // SVG dimensions are not supported by image_dimensions (and
+                // can be percentages). Give the image a definite, clipped
+                // containing block rather than letting its intrinsic size
+                // influence the overlay's flex layout.
+                div()
+                    .debug_selector(|| "lightbox-image-frame".into())
                     .w(px(w * scale))
                     .h(px(h * scale))
+                    .flex_shrink_0()
+                    .overflow_hidden()
                     .rounded(px(6.))
+                    .child(img(path.clone())
+                        .size_full()
+                        .min_w_0()
+                        .min_h_0()
+                        .object_fit(ObjectFit::Contain))
                     .into_any_element()
             }
         };
@@ -266,6 +278,7 @@ impl Enso {
             div()
                 .absolute()
                 .inset_0()
+                .overflow_hidden()
                 .occlude()
                 .key_context("Lightbox")
                 .track_focus(&focus)
@@ -277,6 +290,8 @@ impl Enso {
                 .justify_center()
                 .child(
                     div()
+                        .debug_selector(|| "lightbox-picture".into())
+                        .flex_shrink_0()
                         .opacity(presence)
                         // A soft zoom in as it opens.
                         .mt(px(12. * (1. - presence)))

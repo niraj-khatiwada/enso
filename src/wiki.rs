@@ -156,6 +156,7 @@ impl Enso {
                 .spawn(async move {
                     let mut index = worker_index.lock().unwrap();
                     let changes = index.observe(&worker_root, moves);
+                    let icons = crate::file_icons::reconcile_with_index(&worker_root, &changes.moves, &changes.copies, &index).map(|_| ());
                     for note in &mut worker_open {
                         note.path = links::moved(&note.path, &changes.external_moves);
                     }
@@ -224,10 +225,16 @@ impl Enso {
                         }
                     }
                     index.refresh_paths(&affected);
-                    (index.snapshot(), live, errors, changes.external_moves)
+                    (index.snapshot(), live, errors, changes.external_moves, icons)
                 })
                 .await;
-            let (mut snapshot, repairs, errors, external_moves) = result;
+            let (mut snapshot, repairs, errors, external_moves, icons) = result;
+            let _ = this.update(cx, |app, cx| {
+                if app.root.as_ref() == Some(&root) {
+                    let icons = icons.and_then(|_| crate::file_icons::load(&root));
+                    app.refresh_file_icons(icons, cx);
+                }
+            });
             if !external_moves.is_empty() {
                 let _ = this.update(cx, |app, cx| {
                     if app.root.as_ref() == Some(&root) {
@@ -1118,7 +1125,7 @@ mod ui_tests {
             let source = format!(
                 "{tag}\n\n{}",
                 if large {
-                    "Paragraph.\n\n".repeat(25_000)
+                    "Paragraph.\n\n".repeat(reader::LARGE_DOCUMENT_BYTES / "Paragraph.\n\n".len() + 1)
                 } else {
                     String::new()
                 }

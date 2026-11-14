@@ -228,23 +228,39 @@ impl Enso {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        self.open_insert_popover(false, window, cx)
+        self.open_insert_popover(false, None, window, cx)
     }
 
     pub(super) fn open_insert_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        self.open_insert_popover(true, window, cx)
+        self.open_insert_popover(true, None, window, cx)
+    }
+
+    /// `/` typed in Live Preview at `caret` (the page's caret, drawn at
+    /// `anchor`): the same insert menu, working on the note at that place.
+    pub(crate) fn open_live_insert_menu(
+        &mut self,
+        caret: usize,
+        anchor: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(doc) = self.active.map(|i| &self.documents[i]) else { return false };
+        doc.editor.update(cx, |editor, cx| editor.set_selected_range(caret..caret, cx));
+        self.open_insert_popover(true, Some(anchor), window, cx)
     }
 
     fn open_insert_popover(
         &mut self,
         replace_slash: bool,
+        at: Option<Point<Pixels>>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
+        let live = self.live_view(cx);
         let Some(doc) = self.active.map(|i| &self.documents[i]) else {
             return false;
         };
-        if !doc.markdown || self.mode == Mode::Read || doc.locked {
+        if !doc.markdown || (self.mode == Mode::Read && !live) || doc.locked {
             return false;
         }
         let editor = doc.editor.clone();
@@ -270,6 +286,8 @@ impl Enso {
                     .map(|(bounds, _)| point(bounds.left(), bounds.bottom() + px(6.)))
             })
             .unwrap_or(point(px(100.), px(120.)));
+        // Live Preview's page draws the caret, not the editor.
+        let anchor = at.unwrap_or(anchor);
         if replace_slash {
             editor.update(cx, |state, cx| state.replace("/", window, cx));
         }
@@ -304,9 +322,10 @@ impl Enso {
         self.closing_palette = None;
         ensure_history(cx);
         // A locked note offers nothing to insert or format.
+        let live = self.live_view(cx);
         let target = self.active.and_then(|i| {
             let doc = &self.documents[i];
-            (doc.markdown && self.mode != Mode::Read && !doc.locked)
+            (doc.markdown && (self.mode != Mode::Read || live) && !doc.locked)
                 .then(|| (doc.editor.clone(), doc.editor.read(cx).selected_range()))
         });
         let mut insert = Vec::new();
@@ -463,8 +482,8 @@ impl Enso {
         if self.active.is_some_and(|i| self.documents[i].markdown) {
             app.extend([
                 entry(
-                    "Read View",
-                    &["preview", "reading"],
+                    "View",
+                    &["preview", "reading", "read", "page", "live"],
                     Choice::Mode(Mode::Read),
                     None,
                 ),
@@ -2449,7 +2468,8 @@ mod ui_tests {
         draw(cx, handle);
         cx.update(|cx| {
             let p = view.read(cx).palette.as_ref().unwrap();
-            assert!(p.groups[1].is_empty() && p.groups[2].is_empty());
+            // View edits the page: inserting and formatting are offered.
+            assert!(!p.groups[1].is_empty() && !p.groups[2].is_empty());
         });
         cx.simulate_keystrokes(handle, "escape");
         cx.update_window(handle, |_, window, cx| {

@@ -92,9 +92,21 @@ Write inline math as `$x^2$` and display equations between `$$` lines. Fractions
 
 Type `[[` in Edit or Split view to search for another note in the current workspace. Use ↑/↓ and Enter or Tab to insert it, or click a suggestion. `[[Note.md|Display name]]` gives a link a different label; folder paths distinguish notes with the same name. New links include the file extension; older extensionless links remain supported.
 
-Click a link in Read view to open its note. **Linked from** at the end of a note lists the notes that refer to it. The workspace watcher scans new and changed notes regardless of whether they arrive through enso, a file manager, or sync. It updates links for detected moves and renames, rebases copies when their origin can be identified, and repairs broken local paths with a unique workspace match. Ambiguous targets are left unchanged. Code examples and web URLs are left alone.
+Click a link in View to open its note. **Linked from** at the end of a note lists the notes that refer to it. The workspace watcher scans new and changed notes regardless of whether they arrive through enso, a file manager, or sync. It updates links for detected moves and renames, rebases copies when their origin can be identified, and repairs broken local paths with a unique workspace match. Ambiguous targets are left unchanged. Code examples and web URLs are left alone.
 
 Link indexing and repairs run in the background. The index retains destinations and byte ranges, reparses only changed notes, and uses reverse references to find affected files. Large closed notes are rewritten through a temporary file without constructing a second full copy in memory.
+
+### File icons
+
+Click a file’s icon in the sidebar to choose from GPUI Kit’s bundled icon catalog or Unicode emoji. Icons support preset and custom colors; emoji use the system fonts and macOS also offers its native character picker. Reset restores the default file icon.
+
+Choices live in the workspace’s `.assets/file-icons.json`, using relative paths. Markdown stays unchanged. Icons follow file and folder moves and copies. Deleted files’ icons are archived by filesystem identity so restoring the same file can restore its icon, while a new file with the same name starts with the default icon.
+
+### Diagnostic logs
+
+Settings → About → **Show Log Files** opens the local diagnostic logs. On macOS these are in `~/Library/Logs/enso/`; on Windows, `%LOCALAPPDATA%\enso\`; on Linux, `${XDG_STATE_HOME:-~/.local/state}/enso/`.
+
+Logs record startup and shutdown, opening and closing notes, view changes, saves, external file conflicts, and errors. Routine records contain paths, sizes, and timings rather than note bodies or keystrokes. Rust panics have separate reports with their location and backtrace. Timestamps are UTC. Rotation retains five app logs and two panic logs, each limited to about 2 MiB.
 
 ### FAQs
 <details>
