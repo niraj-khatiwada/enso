@@ -626,6 +626,13 @@ impl SettingsWindow {
                         }).into_any_element()))
                 .child(row("Changelog".into(), "What’s new in every version of enso.".into(),
                     link("about-changelog", "View changelog", "https://github.com/niraj-khatiwada/enso/releases")))
+                .child(row("Diagnostic Logs".into(), "Local logs for troubleshooting errors and crashes.".into(),
+                    Button::new("show-log-files").small().label("Show Log Files")
+                        .icon(IconName::FolderOpen)
+                        .disabled(crate::logging::log_file().is_none())
+                        .on_click(|_, _, cx| {
+                            if let Some(path) = crate::logging::log_file() { cx.reveal_path(path); }
+                        }).into_any_element()))
                 .child(row("Website".into(), "Downloads, features and documentation.".into(),
                     link("about-website", "enso.codeforreal.com", "https://enso.codeforreal.com")))
                 .child(row("Free and open-source".into(), "Licensed under MIT.".into(),

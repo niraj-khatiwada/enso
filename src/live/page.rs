@@ -107,6 +107,32 @@ pub struct Page {
 }
 
 impl Page {
+    /// Ticking a known task changes one byte and no text layout. Preserve
+    /// every other block and its source map instead of reparsing the note.
+    pub fn update_checkbox(&mut self, old: &str, new: &str) -> bool {
+        if old.len() != new.len() { return false; }
+        let at = old.bytes().zip(new.bytes()).take_while(|(a, b)| a == b).count();
+        if at == old.len() || old.as_bytes()[at + 1..] != new.as_bytes()[at + 1..] { return false; }
+        let Some((leaf, range)) = self.leaves.iter().enumerate().find_map(|(leaf, l)| {
+            let Kind::Item(item) = &l.kind else { return None };
+            let (range, _) = item.checkbox.as_ref()?;
+            (range.start + 1 == at).then_some((leaf, range.clone()))
+        }) else { return false };
+        let done = match new.get(range.clone()) {
+            Some("[ ]") => false,
+            Some("[x]" | "[X]") => true,
+            _ => return false,
+        };
+        let Some(row) = self.blocks.iter_mut().find_map(|(_, shape)| {
+            let Shape::List(rows) = shape else { return None };
+            rows.iter_mut().find(|row| row.leaf == leaf && matches!(row.marker, Marker::Task(_)))
+        }) else { return false };
+        row.marker = Marker::Task(done);
+        let Kind::Item(item) = &mut self.leaves[leaf].kind else { unreachable!() };
+        item.checkbox = Some((range, done));
+        true
+    }
+
     #[cfg(test)]
     pub fn read(source: &str) -> Self {
         Self::read_with_raw(source, None)
@@ -115,10 +141,7 @@ impl Page {
     /// The page, with the blocks in `raw` shown as their Markdown, edited
     /// as text (⌘⇧E).
     pub fn read_with_raw(source: &str, raw: Option<Range<usize>>) -> Self {
-        let mut options = markdown::ParseOptions::gfm();
-        options.constructs.math_flow = true;
-        options.constructs.math_text = true;
-        let Ok(tree) = markdown::to_mdast(source, &options) else { return Page::default() };
+        let tree = parse(source);
         // The note's `[id]: url` definitions, for reference links.
         let definitions = tree
             .children()
@@ -365,6 +388,132 @@ fn code_content(source: &str, range: Range<usize>, value: &str, lead: &str) -> O
     (written == *value).then_some(content)
 }
 
+/// Parse independent blocks separately to keep ordinary long notes fast.
+/// Definitions and raw HTML can carry context across blank lines, so those
+/// documents use the complete parser while keeping virtualized layout.
+pub(crate) fn parse(source: &str) -> Node {
+    let mut options = markdown::ParseOptions::gfm();
+    options.constructs.math_flow = true;
+    options.constructs.math_text = true;
+    if source.lines().any(|line| {
+        let t = line.trim_start();
+        t.contains("]:") || t.starts_with('<')
+    }) {
+        return markdown::to_mdast(source, &options).unwrap_or_else(|_| {
+            Node::Root(markdown::mdast::Root { children: Vec::new(), position: None })
+        });
+    }
+    let mut children = Vec::new();
+    let (mut line_offset, mut previous) = (0, 0);
+    for part in chunks(source) {
+        line_offset += source[previous..part.start].bytes().filter(|b| *b == b'\n').count();
+        previous = part.start;
+        let text = &source[part.clone()];
+        let parsed = markdown::to_mdast(text, &options);
+        let Ok(Node::Root(root)) = parsed else { continue };
+        for mut node in root.children {
+            if node.position().is_none_or(|p| p.start.offset >= text.len()) {
+                continue;
+            }
+            shift(&mut node, part.start, text.len(), line_offset);
+            children.push(node);
+        }
+    }
+    Node::Root(markdown::mdast::Root { children, position: None })
+}
+
+/// Move a parsed part's positions by `by`, to where it is in the note.
+fn shift(node: &mut Node, by: usize, limit: usize, lines: usize) {
+    if let Some(position) = node.position_mut() {
+        // Positions must stay inside the original part of the note.
+        position.start.offset = position.start.offset.min(limit) + by;
+        position.end.offset = position.end.offset.min(limit) + by;
+        position.start.line += lines;
+        position.end.line += lines;
+    }
+    if let Some(children) = node.children_mut() {
+        for child in children {
+            shift(child, by, limit, lines);
+        }
+    }
+}
+
+/// Where the note can be cut into parts parsed alone: at blank lines, but
+/// not inside a code fence or `$$` block, nor before an indented line (a
+/// list item's or footnote's more) or the next item of a list.
+fn chunks(source: &str) -> Vec<Range<usize>> {
+    let marker = |t: &str| {
+        let after = |tail: &str| tail.is_empty() || tail.starts_with([' ', '\t']);
+        matches!(t.as_bytes().first(), Some(b'-' | b'*' | b'+')) && after(&t[1..]) || {
+            let digits = t.chars().take_while(|c| c.is_ascii_digit()).count();
+            digits > 0 && t[digits..].starts_with(['.', ')']) && after(&t[digits + 1..])
+        }
+    };
+    let mut out = Vec::new();
+    let (mut start, mut end) = (None::<usize>, 0);
+    let mut fence: Option<(char, usize)> = None;
+    let mut math = false;
+    let mut blank = false;
+    let mut at = 0;
+    for line in source.split_inclusive('\n') {
+        let line_start = at;
+        at += line.len();
+        let l = line.trim_end_matches(['\n', '\r']);
+        let t = l.trim_start();
+        let indent = l.len() - t.len();
+        if let Some((c, n)) = fence {
+            end = at;
+            let run = t.chars().take_while(|x| *x == c).count();
+            if indent < 4 && run >= n && t[run..].trim().is_empty() {
+                fence = None;
+            }
+            continue;
+        }
+        if math {
+            end = at;
+            if t.starts_with("$$") {
+                math = false;
+            }
+            continue;
+        }
+        if t.is_empty() {
+            blank = start.is_some();
+            continue;
+        }
+        if blank {
+            blank = false;
+            if !(indent >= 2 || marker(t)) {
+                if let Some(s) = start.take() {
+                    out.push(s..end);
+                }
+            }
+        }
+        if start.is_none() {
+            start = Some(line_start);
+        }
+        end = at;
+        if indent < 4 {
+            let c = t.chars().next().unwrap_or(' ');
+            let run = t.chars().take_while(|x| *x == c).count();
+            if matches!(c, '`' | '~') && run >= 3 && (c != '`' || !t[run..].contains('`')) {
+                fence = Some((c, run));
+            } else if t.starts_with("$$") && !t[2..].contains("$$") {
+                math = true;
+            }
+        }
+    }
+    if let Some(s) = start {
+        out.push(s..end.max(s));
+    }
+    // Each part runs up to the next (its blank lines with it), as a block's
+    // end in the whole note can take the line break after it.
+    let starts: Vec<usize> = out.iter().skip(1).map(|r| r.start).chain(std::iter::once(source.len())).collect();
+    for (part, next) in out.iter_mut().zip(starts) {
+        part.end = next;
+    }
+    out
+}
+
 fn text(page: &mut Page, source: &str, heading: Option<u8>, children: &[Node], range: Range<usize>) -> Shape {
     let end = range.end;
     match flow::from_inline(source, heading, children, end) {
@@ -560,6 +709,108 @@ mod tests {
         let Shape::List(rows) = &page.blocks[1].1 else { panic!() };
         assert_eq!(rows[3].quote, Some((0, true)));
         assert!(matches!(rows[4].marker, Marker::Continue) && rows[4].quote.is_none());
+    }
+
+    #[test]
+    fn checkbox_updates_match_a_full_parse_and_reject_other_edits() {
+        for source in ["- [ ] task\n", "- [ ]\n", "> - [ ] quoted\n", "- parent\n  - [ ] nested\n", "A [link][r].\n\n- [ ] task\n\n[r]: /target\n"] {
+            let mut page = Page::read(source);
+            let checked = source.replacen("[ ]", "[x]", 1);
+            assert!(page.update_checkbox(source, &checked));
+            assert_eq!(format!("{page:?}"), format!("{:?}", Page::read(&checked)));
+            assert!(page.update_checkbox(&checked, source));
+            assert_eq!(format!("{page:?}"), format!("{:?}", Page::read(source)));
+            assert!(!page.update_checkbox(source, &source.replace("task", "work")));
+            assert!(!page.update_checkbox(source, &source.replace("[ ]", "[?]")));
+        }
+    }
+
+    #[test]
+    fn chunked_parsing_preserves_markdown_context() {
+        let cases = [
+            ("multiline references", "A [link][a b].\n\n[A   B]:\n  /target\n  \"The title\"\n"),
+            ("definition in code", "```md\n[fake]: /wrong\n```\n\nA [fake].\n"),
+            ("footnotes", "A note.[^ONE]\n\n[^one]: First.\n\n    Second paragraph.\n"),
+            ("HTML across blank lines", "<script>\nlet x = 1;\n\nlet y = 2;\n</script>\n\nAfter.\n"),
+            ("HTML comments", "<!-- a comment\n\n# not a heading\n-->\n\nAfter.\n"),
+            ("loose list after heading", "# Heading\n- one\n\n- two\n\nAfter.\n"),
+            ("nested fences", "- outer\n  - inner\n\n    ```rust\n    fn a() {}\n\n    fn b() {}\n    ```\n\n- next\n"),
+            ("mixed fence characters", "```~~~\nnot code\n\na paragraph\n\n~~~\ncode\n\nmore\n~~~\n"),
+            ("CRLF and Unicode", "# नेपाली\r\n\r\nA café 😀.\r\n\r\n- first\r\n\r\n- second\r\n"),
+            ("nested quotes", "> - one\n>\n>   ```sh\n>   run\n>\n>   more\n>   ```\n\nAfter.\n"),
+            ("math and inline HTML", "A <b>word</b> and $x^2$.\n\n$$\nx+y\n\nz\n$$\n\nAfter.\n"),
+        ];
+        let mut options = markdown::ParseOptions::gfm();
+        options.constructs.math_flow = true;
+        options.constructs.math_text = true;
+        let mut failed = Vec::new();
+        for (name, source) in cases {
+            let whole = markdown::to_mdast(source, &options).unwrap();
+            let parts = parse(source);
+            if whole.children() != parts.children() { failed.push(name); }
+        }
+        assert!(failed.is_empty(), "context changed in {failed:?}");
+    }
+
+    #[test]
+    fn adjacent_chunk_boundaries_preserve_structure_and_positions() {
+        let fragments = [
+            "A **paragraph** with café and 😀.", "# Heading", "# Heading\n- one",
+            "- one\n\n- two", "1. one\n2. two", "- outer\n  - inner",
+            "> quote\n>\n> more", "    indented\n\n    code", "Setext\n------",
+            "| a | b |\n|---|---|\n| 1 | 2 |", "```rust\nfn a() {}\n\nfn b() {}\n```",
+            "~~~text\ncode\n\nmore\n~~~", "```unclosed\ncode", "$$\nx^2\n\ny\n$$",
+            "---", "-", "1.", "- item\n\n  continuation", "> - item\n>   more",
+        ];
+        let mut options = markdown::ParseOptions::gfm();
+        options.constructs.math_flow = true;
+        options.constructs.math_text = true;
+        for first in fragments {
+            for second in fragments {
+                let source = format!("{first}\n\n{second}\n\nEnd.\n");
+                let whole = markdown::to_mdast(&source, &options).unwrap();
+                let parts = parse(&source);
+                assert_eq!(parts.children(), whole.children(), "boundary in {source:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn parsing_in_parts_reads_as_the_whole() {
+        let source = "# Title\n\nA [ref link][gfm] and a note.[^1]\n\n```rust\nfn a() {}\n\nfn b() {}\n```\n\n$$\nx^2\n\ny\n$$\n\n- one\n\n- two\n  more of two\n\n  ```sh\n  run\n  ```\n- three\n\n1. first\n2. second\n\n> quote\n>\n> more\n\n| a | b |\n|---|---|\n| 1 | 2 |\n\n<div>\nhtml\n</div>\n\n    indented code\n\n    more of it\n\nSetext\n------\n\n[gfm]: https://github.github.com/gfm/\n\n[^1]: The note,\n    on two lines.\n\nEnd.\n";
+        let mut options = markdown::ParseOptions::gfm();
+        options.constructs.math_flow = true;
+        options.constructs.math_text = true;
+        let whole = markdown::to_mdast(source, &options).unwrap();
+        let parts = parse(source);
+        let shape = |tree: &Node| -> Vec<(String, usize, usize)> {
+            tree.children()
+                .unwrap()
+                .iter()
+                .map(|n| {
+                    let p = n.position().unwrap();
+                    (format!("{:?}", std::mem::discriminant(n)), p.start.offset, p.end.offset)
+                })
+                .collect()
+        };
+        assert_eq!(shape(&parts), shape(&whole));
+        // Reference links and footnotes still find what they refer to.
+        let page = Page::read(source);
+        let linked = page.leaves.iter().find(|l| l.flow.text.contains("ref link")).unwrap();
+        assert!(linked.flow.link_at(3).is_some());
+        assert!(linked.flow.text.contains('¹'));
+    }
+
+    #[test]
+    #[ignore]
+    fn timing_reading_large_pages() {
+        let unit = "# Heading\n\nSome **bold** and *italic* text with a [link](https://x.y) and `code`.\n\n- [ ] a task\n- item two\n\n> a quote\n\n| a | b |\n|---|---|\n| 1 | 2 |\n\n```rust\nfn main() {}\n```\n\n";
+        for kb in [256usize, 1024, 4096] {
+            let source = unit.repeat(kb * 1024 / unit.len());
+            let started = std::time::Instant::now();
+            let page = Page::read(&source);
+            eprintln!("{kb} KB: {} blocks, {} leaves, read in {:?}", page.blocks.len(), page.leaves.len(), started.elapsed());
+        }
     }
 
     #[test]

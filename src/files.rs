@@ -393,19 +393,35 @@ pub fn changed_folders(shown: Vec<(PathBuf, Option<std::time::SystemTime>)>) -> 
 }
 
 pub fn save(path: &Path, expected: &str, content: &str) -> io::Result<()> {
-    if read_text(path)? != expected {
-        return Err(io::Error::other(
-            "The file changed on disk. Automatic saving stopped to preserve both versions; your edits remain open in enso.",
-        ));
+    log::info!(target: "enso::files", "file.save.begin path={path:?} bytes={}", content.len());
+    let result = (|| {
+        if read_text(path)? != expected {
+            return Err(io::Error::other(
+                "The file changed on disk. Automatic saving stopped to preserve both versions; your edits remain open in enso.",
+            ));
+        }
+        replace(path, content)
+    })();
+    match &result {
+        Ok(()) => log::info!(target: "enso::files", "file.save.complete path={path:?} bytes={}", content.len()),
+        Err(error) => log::error!(target: "enso::files", "file.save.failed path={path:?} error={error:?}"),
     }
-    replace(path, content)
+    result
 }
 
 pub fn save_as(path: &Path, content: &str) -> io::Result<()> {
+    log::info!(target: "enso::files", "file.create.begin path={path:?} bytes={}", content.len());
     // A new path must never overwrite another document accidentally.
-    let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
-    file.write_all(content.as_bytes())?;
-    file.sync_all()
+    let result = (|| {
+        let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
+        file.write_all(content.as_bytes())?;
+        file.sync_all()
+    })();
+    match &result {
+        Ok(()) => log::info!(target: "enso::files", "file.create.complete path={path:?}"),
+        Err(error) => log::error!(target: "enso::files", "file.create.failed path={path:?} error={error:?}"),
+    }
+    result
 }
 
 fn replace(path: &Path, content: &str) -> io::Result<()> {

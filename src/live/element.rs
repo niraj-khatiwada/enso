@@ -78,6 +78,7 @@ impl Element for LiveElement {
         let decorations = self.decorations.take().unwrap_or_default();
         let (_, leaves) = collect_leaf_geometry(decorations, || child.prepaint(window, cx));
         *self.geometry.borrow_mut() = leaves;
+        self.view.update(cx, |view, cx| view.finish_reveal(cx));
     }
 
     fn paint(

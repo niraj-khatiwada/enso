@@ -1118,7 +1118,7 @@ mod ui_tests {
             let source = format!(
                 "{tag}\n\n{}",
                 if large {
-                    "Paragraph.\n\n".repeat(25_000)
+                    "Paragraph.\n\n".repeat(reader::LARGE_DOCUMENT_BYTES / "Paragraph.\n\n".len() + 1)
                 } else {
                     String::new()
                 }

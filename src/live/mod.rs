@@ -33,7 +33,7 @@ use gpui_kit::assets::IconName;
 use gpui_kit::component::Sizable;
 use gpui_kit::prelude::FluentBuilder;
 use page::{Align, Kind, Marker, Page, Shape};
-use std::{cell::RefCell, collections::HashMap, ops::Range, path::PathBuf, rc::Rc, time::Instant};
+use std::{cell::{Cell, RefCell}, collections::HashMap, hash::{Hash, Hasher}, ops::Range, path::PathBuf, rc::Rc, time::Instant};
 
 actions!(
     live,
@@ -314,6 +314,19 @@ pub struct LiveView {
     /// A block without text (an image, a diagram) picked by a click, by its
     /// start: Backspace or Delete removes it.
     picked: Option<usize>,
+    /// Each block's height as last drawn (a long page draws only the blocks
+    /// near the screen; the others stand in at these heights).
+    heights: Rc<RefCell<Vec<Pixels>>>,
+    height_measured: Rc<RefCell<Vec<bool>>>,
+    height_keys: Vec<u64>,
+    height_revision: u64,
+    height_raw: Option<Range<usize>>,
+    height_layout: Option<(Pixels, Pixels, typography::ReadingStyle, SharedString)>,
+    height_anchor: Rc<RefCell<Option<(usize, Pixels, u8)>>>,
+    height_jump: Cell<Option<usize>>,
+    /// Blocks above the screen found taller (or shorter) than they stood in
+    /// at: the scroll moves by this, so what's on screen stays put.
+    height_drift: Rc<RefCell<Pixels>>,
     /// An edit of its own in flight (its undo still applies after it).
     own_edit: bool,
     /// Find's matches on the page (in the note), and which is the current.
@@ -381,6 +394,15 @@ impl LiveView {
             picked_at: None,
             found: Vec::new(),
             own_edit: false,
+            heights: Rc::default(),
+            height_measured: Rc::default(),
+            height_keys: Vec::new(),
+            height_revision: u64::MAX,
+            height_raw: None,
+            height_layout: None,
+            height_anchor: Rc::default(),
+            height_jump: Cell::new(None),
+            height_drift: Rc::default(),
             found_current: None,
             closing: None,
             geometry: Rc::default(),
@@ -405,6 +427,7 @@ impl LiveView {
                 self.undo.clear();
                 self.redo.clear();
             }
+            let checkbox = self.page.update_checkbox(&self.source, value.as_ref());
             self.source = value.to_string();
             self.revision += 1;
             // Changed from elsewhere: the raw block may be gone.
@@ -413,7 +436,10 @@ impl LiveView {
             }) {
                 self.raw = None;
             }
-            self.page = Page::read_with_raw(&self.source, self.raw.clone());
+            if !checkbox {
+                self.page = Page::read_with_raw(&self.source, self.raw.clone());
+                self.geometry.borrow_mut().clear();
+            }
             if self.caret.is_some() {
                 let at = self.editor.read(cx).selected_range().end;
                 self.caret = Some(floor_boundary(&self.source, at.min(self.source.len())));
@@ -636,6 +662,28 @@ impl LiveView {
     #[cfg(all(test, feature = "ui-tests"))]
     pub(crate) fn set_scroll_for_test(&self, y: Pixels) {
         self.scroll.set_offset(point(px(0.), -y));
+    }
+
+    /// Where the line holding `at` was drawn, if it was.
+    #[cfg(all(test, feature = "ui-tests"))]
+    pub(crate) fn drawn_at_for_test(&self, at: usize) -> Option<Bounds<Pixels>> {
+        let leaf = self.page.leaf_at(at)?;
+        self.geometry.borrow().get(&leaf_key(leaf)).map(|g| g.bounds())
+    }
+
+    #[cfg(all(test, feature = "ui-tests"))]
+    pub(crate) fn view_for_test(&self) -> Bounds<Pixels> {
+        self.scroll.bounds()
+    }
+
+    #[cfg(all(test, feature = "ui-tests"))]
+    pub(crate) fn first_visible_for_test(&self) -> Option<usize> {
+        let view = self.scroll.bounds();
+        let geometry = self.geometry.borrow();
+        self.page.leaves.iter().enumerate().filter_map(|(i, leaf)| {
+            let bounds = geometry.get(&leaf_key(i))?.bounds();
+            (bounds.bottom() > view.top() && bounds.top() < view.bottom()).then_some((leaf.span.start, bounds.top()))
+        }).min_by_key(|(_, top)| *top).map(|(at, _)| at)
     }
 
     #[cfg(all(test, feature = "ui-tests"))]
@@ -925,6 +973,25 @@ impl LiveView {
         let Some(mark) = flow.mark_at(flow.shown_for(caret), false) else { return false };
         self.open_mark_card(mark, i, false, pinned, window, cx);
         true
+    }
+
+    /// Right-click opens the same actions as ⌘/, keeping selected text.
+    fn context_actions(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.editor.read(cx).is_editable() {
+            return;
+        }
+        self.close_actions(window, cx);
+        if !self.has_selection() && self.picked.is_none()
+            && let Some(leaf) = self.leaf_near(event.position)
+        {
+            self.mouse_down(leaf, event, window, cx);
+        }
+        self.dragging = false;
+        self.open_actions(&OpenActions, window, cx);
+        if let Some(menu) = &mut self.action_menu {
+            menu.at = event.position;
+        }
+        cx.stop_propagation();
     }
 
     /// ⌘/: what can be done to what the caret is in.
@@ -1275,7 +1342,7 @@ impl LiveView {
         self.found = found;
         self.found_current = current;
         if let Some(at) = at {
-            self.reveal(at);
+            self.reveal(at, cx);
         }
         cx.notify();
     }
@@ -1287,7 +1354,7 @@ impl LiveView {
             || self.page.leaves.iter().find(|l| l.span.start >= at).map_or(at, |l| l.span.start),
             |_| at,
         );
-        self.reveal(at);
+        self.reveal(at, cx);
         cx.notify();
     }
 
@@ -1301,6 +1368,7 @@ impl LiveView {
 
     /// The outline's heading at `at` (in the note): the caret on it, in view.
     pub(crate) fn jump_to(&mut self, at: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.refresh(cx);
         let leaf = self.page.leaf_at(at).or_else(|| self.page.leaves.iter().position(|l| l.span.start >= at));
         let Some(leaf) = leaf else { return };
         let flow = &self.page.leaves[leaf].flow;
@@ -1309,17 +1377,38 @@ impl LiveView {
         self.picked = None;
         self.caret = Some(to);
         self.parked = None;
-        self.reveal(to);
+        self.reveal(to, cx);
         window.focus(&self.focus, cx);
         cx.notify();
     }
 
     /// Scroll so the line holding `at` (in the note) is in view, a third of
     /// the way down, when it isn't already.
-    fn reveal(&self, at: usize) {
+    fn reveal(&self, at: usize, cx: &App) {
+        *self.height_anchor.borrow_mut() = None;
+        *self.height_drift.borrow_mut() = px(0.);
+        if self.page.blocks.len() > 300 && (self.height_revision != self.revision || self.height_raw != self.raw) {
+            // An editor change can request a jump before the next render has
+            // moved the cached measurements to their new blocks.
+            self.height_jump.set(Some(at));
+        }
         let Some(leaf) = self.page.leaf_at(at) else { return };
         let geometry = self.geometry.borrow();
-        let Some(g) = geometry.get(&leaf_key(leaf)) else { return };
+        let Some(g) = geometry.get(&leaf_key(leaf)) else {
+            self.height_jump.set(Some(at));
+            // Not drawn (a long page draws only what's near the screen): to
+            // where its block stands, a third of the way down; it's drawn there.
+            let Some(b) = self.page.blocks.iter().position(|(r, _)| r.start <= at && at <= r.end) else { return };
+            let size = typography::current(cx).size as f32;
+            let mut y = px(crate::reader::TEXT_INSET_Y);
+            for (i, (range, _)) in self.page.blocks.iter().enumerate().take(b) {
+                y += self.block_height(i, range, size);
+            }
+            let view = self.scroll.bounds().size.height;
+            let offset = self.scroll.offset();
+            self.scroll.set_offset(point(offset.x, (-(y - view / 3.)).min(px(0.))));
+            return;
+        };
         let flow = &self.page.leaves[leaf].flow;
         let y = g.position_for_index(flow.shown_for(at)).y;
         let view = self.scroll.bounds();
@@ -1331,6 +1420,128 @@ impl LiveView {
         let max = self.scroll.max_offset();
         let moved = offset.y - (y - (view.top() + view.size.height / 3.));
         self.scroll.set_offset(point(offset.x, moved.min(px(0.)).max(-max.y.abs())));
+    }
+
+    /// A virtual jump first uses estimates. Once its line has been laid
+    /// out, align that actual line instead of leaving it at the estimate.
+    fn finish_reveal(&mut self, cx: &mut Context<Self>) {
+        if let Some(at) = self.height_jump.take() {
+            self.reveal(at, cx);
+            cx.notify();
+        }
+    }
+
+    /// Which blocks a long page draws: those within a screen of what's in
+    /// view, and the caret's. `None`: a page short enough to draw whole.
+    fn blocks_to_draw(&self, size: f32) -> Option<Vec<bool>> {
+        const DRAW_WHOLE: usize = 300;
+        let blocks = &self.page.blocks;
+        if blocks.len() <= DRAW_WHOLE {
+            return None;
+        }
+        let view = self.scroll.bounds().size.height.max(px(600.));
+        let top = -self.scroll.offset().y - px(crate::reader::TEXT_INSET_Y);
+        let (from, to) = (top - view, top + view * 2.);
+        let caret = self.caret.or(self.picked);
+        let anchored = self.height_anchor.borrow().map(|(b, _, _)| b);
+        let mut drawn = vec![false; blocks.len()];
+        let mut y = px(0.);
+        for (b, (range, _)) in blocks.iter().enumerate() {
+            let height = self.block_height(b, range, size);
+            let holds_caret = caret.is_some_and(|c| range.start <= c && c <= range.end);
+            drawn[b] = (y + height >= from && y <= to) || holds_caret || anchored == Some(b);
+            y += height;
+        }
+        Some(drawn)
+    }
+
+    /// A block's height as last drawn, else a guess from its text.
+    fn block_height(&self, b: usize, range: &Range<usize>, size: f32) -> Pixels {
+        if let Some(height) = self.heights.borrow().get(b).copied().filter(|h| *h > px(0.)) {
+            return height;
+        }
+        self.estimate_height(range, size)
+    }
+
+    fn estimate_height(&self, range: &Range<usize>, size: f32) -> Pixels {
+        let line = size * 1.618;
+        let columns = (f32::from(self.line_width()) / (size * 0.5)).max(1.) as usize;
+        let lines: usize = self.source[range.clone()].lines().map(|l| l.chars().count().max(1).div_ceil(columns)).sum();
+        px(lines.max(1) as f32 * line + size * 0.9)
+    }
+
+    /// Keep measurements with their content, rather than their old block
+    /// index. A different layout needs fresh measurements throughout.
+    fn sync_heights(&mut self, window: &Window, cx: &App) {
+        if self.page.blocks.len() <= 300 {
+            self.height_keys.clear();
+            self.heights.borrow_mut().clear();
+            self.height_measured.borrow_mut().clear();
+            self.height_layout = None;
+            *self.height_anchor.borrow_mut() = None;
+            *self.height_drift.borrow_mut() = px(0.);
+            return;
+        }
+        let offset = self.scroll.offset();
+        let drift = std::mem::take(&mut *self.height_drift.borrow_mut());
+        self.scroll.set_offset(point(offset.x, offset.y - drift));
+        let reading = typography::current(cx);
+        let layout = (self.scroll.bounds().size.width, window.viewport_size().width, reading, reading.font.family(cx));
+        if self.height_revision == self.revision && self.height_raw == self.raw && self.height_layout.as_ref() == Some(&layout) {
+            return;
+        }
+        let same_layout = self.height_layout.as_ref() == Some(&layout);
+        let old = self.heights.borrow();
+        let top = -self.scroll.offset().y - px(crate::reader::TEXT_INSET_Y);
+        let mut y = px(0.);
+        let anchor = self.height_anchor.borrow().map(|(b, within, _)| (b, self.height_keys[b], within)).or_else(|| old.iter().enumerate().find_map(|(b, height)| {
+            let start = y;
+            y += *height;
+            (start <= top && top < y).then(|| (b, self.height_keys[b], top - start))
+        }));
+        let measured: HashMap<u64, Pixels> = if same_layout {
+            let known = self.height_measured.borrow();
+            self.height_keys.iter().copied().zip(old.iter().copied()).enumerate()
+                .filter_map(|(b, pair)| known.get(b).copied().unwrap_or(false).then_some(pair)).collect()
+        } else {
+            HashMap::new()
+        };
+        drop(old);
+        let mut keys = Vec::with_capacity(self.page.blocks.len());
+        let mut heights = Vec::with_capacity(self.page.blocks.len());
+        let mut previous = 0;
+        for (b, (range, shape)) in self.page.blocks.iter().enumerate() {
+            let mut hash = std::collections::hash_map::DefaultHasher::new();
+            self.source.get(previous.min(range.start)..range.end).hash(&mut hash);
+            std::mem::discriminant(shape).hash(&mut hash);
+            (b == 0, b + 1 == self.page.blocks.len()).hash(&mut hash);
+            self.raw.as_ref().is_some_and(|raw| raw.start < range.end && range.start < raw.end).hash(&mut hash);
+            if let Shape::Note { number, .. } = shape { number.hash(&mut hash); }
+            let key = hash.finish();
+            keys.push(key);
+            let blanks = blank_lines(&self.source, previous, range.start, b == 0).len();
+            heights.push(measured.get(&key).copied().unwrap_or_else(|| {
+                self.estimate_height(range, reading.size as f32) + px(blanks as f32 * reading.size as f32 * 1.618)
+            }));
+            previous = range.end;
+        }
+        if let Some((old_b, key, within)) = anchor
+            && let Some(b) = keys.iter().enumerate().filter(|(_, k)| **k == key).min_by_key(|(b, _)| b.abs_diff(old_b)).map(|(b, _)| b)
+        {
+            let before: Pixels = heights[..b].iter().copied().sum();
+            let offset = self.scroll.offset();
+            self.scroll.set_offset(point(offset.x, -(before + within + px(crate::reader::TEXT_INSET_Y))));
+            *self.height_anchor.borrow_mut() = Some((b, within, 3));
+        } else {
+            *self.height_anchor.borrow_mut() = None;
+        }
+        self.height_keys = keys;
+        self.height_measured = Rc::new(RefCell::new(self.height_keys.iter().map(|key| measured.contains_key(key)).collect()));
+        self.heights = Rc::new(RefCell::new(heights));
+        self.height_drift = Rc::default();
+        self.height_revision = self.revision;
+        self.height_raw = self.raw.clone();
+        self.height_layout = Some(layout);
     }
 
     /// How wide a line of text is on the page.
@@ -2989,6 +3200,10 @@ impl Render for LiveView {
         }
         let spot = self.spot();
         let reading = typography::current(cx);
+        self.sync_heights(window, cx);
+        if let Some(at) = self.height_jump.get() {
+            self.reveal(at, cx);
+        }
         let render_context = {
             let (owner, editor) = (self.owner.clone(), self.editor_id);
             let images = self.base.clone();
@@ -3073,7 +3288,25 @@ impl Render for LiveView {
         };
         let mut previous_end = 0;
         let blocks = self.page.blocks.clone();
+        // A long page draws only the blocks near the screen (and the caret's);
+        // the rest stand in as space of their last height.
+        let drawn = self.blocks_to_draw(reading.size as f32);
+        let mut space = px(0.);
         for (b, (range, shape)) in blocks.clone().into_iter().enumerate() {
+            if let Some(drawn) = &drawn
+                && !drawn[b]
+            {
+                space += self.block_height(b, &range, reading.size as f32);
+                previous_end = range.end;
+                continue;
+            }
+            if space > px(0.) {
+                // Spacers must keep their full height: flex shrinking them
+                // truncates the scroll range and clamps distant jumps.
+                rows.push(div().w_full().h(space).flex_shrink_0().into_any_element());
+                space = px(0.);
+            }
+            let segment = rows.len();
             for at in blank_lines(&self.source, previous_end, range.start, b == 0) {
                 if spot == Some(Spot::Gap(at)) && !gap_placed {
                     rows.push(gap(at, rows.is_empty(), window, cx));
@@ -3528,6 +3761,58 @@ impl Render for LiveView {
                 }
             };
             rows.push(element);
+            // Measured as drawn (blank lines before it included), for when it
+            // stands in as space.
+            if drawn.is_some() {
+                let parts: Vec<AnyElement> = rows.drain(segment..).collect();
+                let (heights, drift) = (self.heights.clone(), self.height_drift.clone());
+                let measured = self.height_measured.clone();
+                let anchor = self.height_anchor.clone();
+                let weak = cx.entity().downgrade();
+                let view_top = self.scroll.bounds().top();
+                rows.push(
+                    v_flex()
+                        .w_full()
+                        .flex_shrink_0()
+                        .relative()
+                        .children(parts)
+                        .child(
+                            canvas(
+                                move |bounds, _, cx| {
+                                    let mut heights = heights.borrow_mut();
+                                    if heights.len() <= b {
+                                        heights.resize(b + 1, px(0.));
+                                    }
+                                    let was = heights[b];
+                                    let mut anchor = anchor.borrow_mut();
+                                    if let Some((target, within, frames)) = *anchor {
+                                        if target == b {
+                                            let delta = bounds.top() - (view_top - within);
+                                            *drift.borrow_mut() = delta;
+                                            *anchor = (frames > 1 || delta.abs() > px(0.5)).then_some((target, within, frames.saturating_sub(1)));
+                                            let _ = weak.update(cx, |_, cx| cx.notify());
+                                        }
+                                    }
+                                    // Above the screen and now another height:
+                                    // the screen keeps its place.
+                                    if anchor.is_none() && bounds.bottom() < view_top && was != bounds.size.height {
+                                        *drift.borrow_mut() += bounds.size.height - was;
+                                        let _ = weak.update(cx, |_, cx| cx.notify());
+                                    }
+                                    heights[b] = bounds.size.height;
+                                    measured.borrow_mut()[b] = true;
+                                },
+                                |_, _, _, _| {},
+                            )
+                            .absolute()
+                            .inset_0(),
+                        )
+                        .into_any_element(),
+                );
+            }
+        }
+        if space > px(0.) {
+            rows.push(div().w_full().h(space).flex_shrink_0().into_any_element());
         }
         if !blocks.is_empty() {
             for at in blank_lines(&self.source, previous_end, self.source.len(), false) {
@@ -4189,6 +4474,7 @@ impl Render for LiveView {
             .on_action(cx.listener(Self::backspace))
             .on_action(cx.listener(Self::toggle_markdown))
             .on_action(cx.listener(Self::open_actions))
+            .on_mouse_down(MouseButton::Right, cx.listener(Self::context_actions))
             .on_action(cx.listener(Self::delete))
             .on_action(cx.listener(Self::enter))
             .on_action(cx.listener(Self::soft_break))
@@ -4224,6 +4510,12 @@ impl Render for LiveView {
             .on_action(cx.listener(|this, _: &PageStart, _, cx| this.moving(false, cx, |t, cx| t.page_edge(false, cx))))
             .on_action(cx.listener(|this, _: &PageEnd, _, cx| this.moving(false, cx, |t, cx| t.page_edge(true, cx))))
             .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, w, cx| this.mouse_drag(event, w, cx)))
+            // A long page draws what scrolls into view.
+            .on_scroll(cx.listener(|this, _: &ScrollEvent, _, cx| {
+                if this.page.blocks.len() > 300 {
+                    cx.notify();
+                }
+            }))
             .on_mouse_up(MouseButton::Left, cx.listener(|this, _, w, cx| this.mouse_up(w, cx)))
             .on_mouse_up_out(MouseButton::Left, cx.listener(|this, _, w, cx| this.mouse_up(w, cx)))
             .on_action(cx.listener(|this, _: &SelectLeft, _, cx| this.moving(true, cx, |t, cx| t.horizontal(false, cx))))
@@ -4566,11 +4858,12 @@ fn mermaid_code(block: &str) -> Option<String> {
 /// blocks one blank line is the gap Markdown needs, so it isn't one of
 /// them; at the very top every blank line is.
 fn blank_lines(source: &str, from: usize, to: usize, top: bool) -> Vec<usize> {
+    let Some(gap) = source.get(from..to).filter(|_| from < to) else { return Vec::new() };
     let mut starts: Vec<usize> = Vec::new();
     if top && from == 0 && to > 0 {
         starts.push(0);
     }
-    for (i, c) in source[from..to].char_indices() {
+    for (i, c) in gap.char_indices() {
         if c == '\n' && from + i + 1 < to {
             starts.push(from + i + 1);
         }
@@ -4631,6 +4924,28 @@ fn byte_to_utf16(text: &str, byte: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn reference_list_ranges_stay_in_the_note() {
+        let source = "- A [reference][gfm]\n- A second item\n\n[gfm]: https://example.com\n\n## Next\n";
+        let page = super::page::Page::read(source);
+        let mut previous = 0;
+        for (i, (range, _)) in page.blocks.iter().enumerate() {
+            assert!(previous <= range.start && range.end <= source.len(), "{previous} before {range:?}");
+            super::blank_lines(source, previous, range.start, i == 0);
+            previous = range.end;
+        }
+        super::blank_lines(source, previous, source.len(), false);
+        assert!(page.leaves[0].flow.link_at(3).is_some());
+    }
+
+    #[test]
+    fn overlapping_blocks_have_no_blank_lines_between_them() {
+        let source = "First\n\nSecond\n";
+        assert!(super::blank_lines(source, 8, 7, false).is_empty());
+        assert!(super::blank_lines(source, 7, 7, false).is_empty());
+        assert_eq!(super::blank_lines("First\n\n\nSecond", 5, 8, false), vec![6]);
+    }
+
     #[test]
     fn utf16_and_bytes_convert_both_ways() {
         let text = "aé😀b";

@@ -13,6 +13,7 @@ mod find;
 mod focus;
 mod http;
 mod live;
+mod logging;
 mod lock;
 mod links;
 mod wiki;
@@ -132,7 +133,7 @@ actions!(
     ]
 );
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 enum Mode {
     Read,
     Edit,
@@ -180,6 +181,18 @@ struct Document {
     _subscriptions: Vec<Subscription>,
 }
 impl Document {
+    /// Large notes retain their source without filling the editor. Reader
+    /// controls must use that source until an editing action loads it.
+    fn source_slice(&self, range: std::ops::Range<usize>, cx: &App) -> Option<String> {
+        if !self.editor_loaded {
+            return self.saved.get(range).map(str::to_owned);
+        }
+        let text = self.editor.read(cx).text();
+        // Ropey's try_slice can still panic when an endpoint exceeds len.
+        if range.start > range.end || range.end > text.len() { return None; }
+        text.try_slice(range).ok().map(|slice| slice.to_string())
+    }
+
     fn dirty(&self, _: &App) -> bool {
         self.dirty
     }
@@ -800,14 +813,20 @@ impl Enso {
             return;
         }
         if mode != Mode::Read && !self.documents[index].editor_loaded {
+            let started = std::time::Instant::now();
             let source = self.documents[index].saved.clone();
+            log::info!(target: "enso::document", "editor.load.begin path={:?} bytes={}", self.documents[index].path, source.len());
             self.documents[index].editor.update(cx, |editor, cx| {
                 editor.set_value(source.as_str(), window, cx)
             });
             self.documents[index].editor_loaded = true;
+            log::info!(target: "enso::document", "editor.load.complete path={:?} elapsed_ms={}", self.documents[index].path, started.elapsed().as_millis());
         }
         if mode == Mode::Split && self.mode != Mode::Split {
             self.previous_mode = self.mode;
+        }
+        if self.mode != mode {
+            log::info!(target: "enso::document", "view.change path={:?} from={:?} to={mode:?}", self.documents[index].path, self.mode);
         }
         self.mode = mode;
         // Hidden reader entities can retain a frame measured in a different
@@ -847,7 +866,7 @@ impl Enso {
         self.view_clock += 1;
         self.documents[active].last_viewed = self.view_clock;
         let doc = &mut self.documents[active];
-        if doc.markdown && doc.large_reader.is_none() && !doc.preview_loaded {
+        if doc.markdown && doc.live.is_none() && doc.large_reader.is_none() && !doc.preview_loaded {
             let text = doc.editor.read(cx).value();
             // Large files read through `large_reader`; their editor may not be
             // filled yet, and the preview stays empty either way.
@@ -1129,6 +1148,7 @@ impl Enso {
     /// nothing; confirmations use `toast` directly.
     fn message(&mut self, message: impl Into<String>, error: bool, cx: &mut Context<Self>) {
         let message = message.into();
+        if error && !message.is_empty() { log::error!(target: "enso::ui", "error message={message:?}"); }
         self.error = error;
         if error && !message.is_empty() {
             self.toast(ui::toast::error(message), cx);
@@ -1276,6 +1296,8 @@ impl Enso {
         }
         let markdown = path.as_ref().is_none_or(|p| files::is_markdown(p));
         let large = source.len() >= reader::LARGE_DOCUMENT_BYTES;
+        log::info!(target: "enso::document", "document.open path={path:?} bytes={} renderer={}", source.len(),
+            if !markdown { "text" } else if sections.is_some() { "large" } else if classic_reader() { "classic" } else { "live" });
         let stats = if source.is_empty() {
             stats::label(0)
         } else {
@@ -1483,6 +1505,7 @@ impl Enso {
     }
 
     fn open_path(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        log::info!(target: "enso::document", "file.open.request path={path:?}");
         if path.is_dir() {
             self.switch_workspace(path, false, window, cx);
             return;
@@ -1500,13 +1523,17 @@ impl Enso {
         let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
         let busy = self.busy(format!("open:{}", path.display()), format!("Opening “{name}”…"), cx);
         let task = cx.background_executor().spawn(async move {
-            files::read_text(&path).map(|text| {
+            let started = std::time::Instant::now();
+            files::read_text(&path).inspect_err(|error| {
+                log::error!(target: "enso::document", "file.open.failed path={path:?} error={error:?}");
+            }).map(|text| {
                 let sections =
                     if files::is_markdown(&path) && text.len() >= reader::LARGE_DOCUMENT_BYTES {
                         Some(reader::LargeReader::index(&text))
                     } else {
                         None
                     };
+                log::info!(target: "enso::document", "file.open.loaded path={path:?} bytes={} sections={} elapsed_ms={}", text.len(), sections.as_ref().map_or(0, Vec::len), started.elapsed().as_millis());
                 (path, text, sections)
             })
         });
@@ -1587,6 +1614,7 @@ impl Enso {
             return;
         };
         let ready = self.mode == Mode::Edit
+            || doc.live.is_some()
             || doc.large_reader.is_some()
             || (doc.preview_loaded && !doc.preview.read(cx).rendered_text().source().is_empty());
         if ready || frames == 0 {
@@ -1634,6 +1662,7 @@ impl Enso {
     }
 
     fn open_folder(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        log::info!(target: "enso::workspace", "workspace.open path={path:?}");
         self.link_task = None;
         self.link_index = Default::default();
         self.link_snapshot = Default::default();
@@ -1768,12 +1797,14 @@ impl Enso {
             return; // Same text as enso's copy, only the timestamp moved.
         };
         if !doc.dirty {
+            log::info!(target: "enso::document", "file.external_change path={:?} bytes={}", doc.path, text.len());
             self.reload_document(index, text, window, cx);
             return;
         }
         // Edits here that the file doesn't have yet, and a different file:
         // the user picks which one wins.
         doc.disk_prompt = true;
+        log::warn!(target: "enso::document", "file.conflict path={:?} unsaved_edits=true", doc.path);
         let title = doc.title();
         let editor_id = change.id;
         let receiver = window.prompt(
@@ -2902,6 +2933,7 @@ impl Enso {
             self.hovered_tab = None;
         }
         let doc = self.documents.remove(index);
+        log::info!(target: "enso::document", "document.close path={:?} bytes={}", doc.path, doc.saved.len());
         self.closed_tabs.push(ClosedTab {
             path: doc.path.clone(),
             source: doc.path.is_none().then(|| doc.editor.read(cx).value().to_string()),
@@ -4512,6 +4544,10 @@ impl Render for Enso {
             .active
             .map(|i| self.documents[i].stats.clone())
             .unwrap_or_default();
+        let live_edit_off = mode != Mode::Edit && self.active.is_some_and(|i| {
+            let doc = &self.documents[i];
+            doc.markdown && doc.large_reader.is_some() && doc.live.is_none()
+        });
         v_flex()
             .id("enso")
             .key_context(if self.wiki_is_open() { "Enso WikiCompleting" } else { "Enso" })
@@ -4686,8 +4722,7 @@ impl Render for Enso {
                                     h_flex().flex_1().min_h_0().min_w_0().relative().child(self.outline_rail(window,cx)).child(body.h_full().min_w_0())
                                 })
                                 .when(!focusing && self.active.is_some(), |view| view.child(
-                                    // Only the count occupies space; the document
-                                    // can use the former status bar's full height.
+                                    // A quiet status pill over the document.
                                     div()
                                         .id("word-count-pill")
                                         .absolute()
@@ -4696,12 +4731,18 @@ impl Render for Enso {
                                         .h(px(20.))
                                         .flex()
                                         .items_center()
+                                        .gap_2()
                                         .px_2()
                                         .rounded_full()
                                         .bg(theme.background)
                                         .text_size(px(10.))
                                         .line_height(relative(1.))
                                         .text_color(theme.muted_foreground)
+                                        .when(live_edit_off, |pill| pill
+                                            .child(div().id("live-edit-off")
+                                                .child("Live edit is off")
+                                                .tooltip(|window, cx| Tooltip::new("This file is too large for live editing. Use Edit or Split mode to edit.").build(window, cx)))
+                                            .child("·"))
                                         .child(stats),
                                 )),
                         ),
@@ -5125,6 +5166,7 @@ fn open_workspace_window(root: Option<PathBuf>, cx: &mut App) {
 }
 
 fn main() {
+    if let Err(error) = logging::init() { eprintln!("Could not initialize enso logging: {error}"); }
     let initial = std::env::args_os().nth(1).map(PathBuf::from);
     let app = gpui_kit::application()
         .with_assets(gpui_kit::assets::AllAssets)
@@ -5137,6 +5179,7 @@ fn main() {
         let _ = opened_tx.unbounded_send(urls);
     });
     app.run(move |cx| {
+            cx.on_app_quit(|_| { logging::shutdown(); async {} }).detach();
             gpui_kit::init(cx);
             typography::init(cx);
             app_icon::init();
@@ -5289,6 +5332,38 @@ mod transition_tests {
         })
         .unwrap();
         cx.run_until_parked();
+    }
+
+    #[gpui_kit::test]
+    fn closing_a_tab_reveals_a_live_page_with_reference_links(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            bind_view_keys(cx);
+            crate::live::init(cx);
+            crate::settings::init(cx);
+        });
+        let source = "# Links\n\n- A [reference][gfm]\n- A second item\n\n[gfm]: https://example.com\n\n## Next\n";
+        let (handle, view) = cx.update(|cx| gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+            cx.new(|cx| {
+                let mut app = Enso::new(window, cx);
+                app.add_document(Some(PathBuf::from("references.md")), source.into(), None, window, cx);
+                app.add_document(Some(PathBuf::from("other.md")), "Other note.".into(), None, window, cx);
+                app
+            })
+        }).unwrap());
+        draw(cx, handle);
+        // The tab's cross calls close_document; the newly active page must
+        // render its list and definitions without slicing an overlapping gap.
+        cx.update(|cx| view.update(cx, |app, cx| app.close_document(1, cx)));
+        for _ in 0..3 { draw(cx, handle); }
+        cx.update(|cx| {
+            let app = view.read(cx);
+            assert_eq!(app.documents.len(), 1);
+            assert_eq!(app.active, Some(0));
+            let doc = &app.documents[0];
+            assert_eq!(doc.editor.read(cx).value().as_ref(), source);
+            assert!(doc.live.as_ref().unwrap().read(cx).drawn_at_for_test(source.find("reference").unwrap()).is_some());
+        });
     }
 
     #[gpui_kit::test]
@@ -5836,9 +5911,101 @@ mod transition_tests {
     }
 
     #[gpui_kit::test]
+    fn opening_a_ten_mib_note_uses_the_large_reader(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            bind_view_keys(cx);
+            crate::live::init(cx);
+            crate::settings::init(cx);
+        });
+        let unit = format!("# Large Note\n\n{}\n\n- [ ] Task\n\n| a | b |\n|---|---|\n| 1 | 2 |\n\n```rust\nfn main() {{}}\n```\n\n", "Text with **formatting** and café 😀. ".repeat(15));
+        let source = unit.repeat(10 * 1024 * 1024 / unit.len() + 1);
+        let root = std::env::temp_dir().join(format!("enso-ten-mib-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("large.md");
+        std::fs::write(&path, &source).unwrap();
+        let (handle, view) = cx.update(|cx| gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+            cx.new(|cx| {
+                let mut app = Enso::new(window, cx);
+                app.open_path(path.clone(), window, cx);
+                app
+            })
+        }).unwrap());
+        cx.run_until_parked();
+        for _ in 0..3 { draw(cx, handle); }
+        cx.update(|cx| {
+            let app = view.read(cx);
+            let doc = &app.documents[0];
+            assert!(doc.large_reader.is_some());
+            assert!(doc.live.is_none());
+            assert!(!doc.editor_loaded);
+            let table = source.find("| a |").unwrap();
+            assert!(doc.source_slice(table..table + 9, cx).unwrap().starts_with("| a |"));
+            assert!(doc.source_slice(source.len()..source.len() + 1, cx).is_none());
+        });
+        let reader = cx.update(|cx| view.read(cx).documents[0].large_reader.clone().unwrap());
+        cx.update(|cx| reader.update(cx, |reader, cx| reader.reveal_source(source.len() - unit.len(), cx)));
+        for _ in 0..3 { draw(cx, handle); }
+        cx.update_window(handle, |_, window, cx| view.update(cx, |app, cx| app.set_mode(Mode::Edit, window, cx))).unwrap();
+        draw(cx, handle);
+        cx.update(|cx| {
+            let app = view.read(cx);
+            let doc = &app.documents[0];
+            assert!(doc.editor_loaded);
+            assert_eq!(doc.editor.read(cx).value().len(), source.len());
+            assert!(doc.source_slice(0..source.len() + 1, cx).is_none());
+        });
+        cx.update_window(handle, |_, window, _| window.remove_window()).unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn markdown_files_use_the_live_page_below_one_mib(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            bind_view_keys(cx);
+            crate::live::init(cx);
+            crate::settings::init(cx);
+        });
+        let root = std::env::temp_dir().join(format!("enso-live-limit-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        // Check the former cutoff and both sides of the new cutoff through
+        // the real file-loading path, which decides whether to index sections.
+        for bytes in [256 * 1024, 1024 * 1024 - 1, 1024 * 1024] {
+            let path = root.join(format!("{bytes}.md"));
+            let unit = "A short paragraph.\n\n";
+            let mut source = unit.repeat(bytes / unit.len());
+            source.push_str(&" ".repeat(bytes - source.len()));
+            std::fs::write(&path, &source).unwrap();
+            let (handle, view) = cx.update(|cx| gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| {
+                    let mut app = Enso::new(window, cx);
+                    app.open_path(path.clone(), window, cx);
+                    app
+                })
+            }).unwrap());
+            cx.run_until_parked();
+            cx.update(|cx| {
+                let app = view.read(cx);
+                let doc = &app.documents[0];
+                let live = bytes < 1024 * 1024;
+                assert_eq!(doc.live.is_some(), live, "{bytes} bytes");
+                assert_eq!(doc.large_reader.is_some(), !live, "{bytes} bytes");
+                assert_eq!(doc.editor_loaded, live, "{bytes} bytes");
+                if live {
+                    assert_eq!(doc.editor.read(cx).value().as_ref(), source);
+                }
+            });
+            cx.update_window(handle, |_, window, _| window.remove_window()).unwrap();
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[gpui_kit::test]
     fn find_in_a_large_note_paints_the_current_match(cx: &mut TestAppContext) {
         cx.update(|cx| { gpui_kit::init(cx); bind_view_keys(cx); });
-        let filler = "An ordinary line of a very long book.\n\n".repeat(8_000);
+        let line = "An ordinary line of a very long book.\n\n";
+        let filler = line.repeat(reader::LARGE_DOCUMENT_BYTES / (2 * line.len()) + 1);
         let source = format!("{filler}Title: The Adventures of Sherlock Holmes\n\n{filler}");
         assert!(source.len() >= reader::LARGE_DOCUMENT_BYTES);
         let sections = reader::LargeReader::index(&source);
@@ -6593,6 +6760,64 @@ mod transition_tests {
     }
 
     #[gpui_kit::test]
+    fn right_click_opens_live_formatting_and_preserves_selection(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            bind_view_keys(cx);
+            crate::live::init(cx);
+            crate::settings::init(cx);
+        });
+        let source = "First words.\n\nSecond paragraph.\n";
+        let (handle, view) = cx.update(|cx| gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+            cx.new(|cx| {
+                let mut app = Enso::new(window, cx);
+                app.add_document(Some(PathBuf::from("right-click.md")), source.into(), None, window, cx);
+                app
+            })
+        }).unwrap());
+        draw(cx, handle);
+        let (live, editor) = cx.update(|cx| {
+            let doc = &view.read(cx).documents[0];
+            (doc.live.clone().unwrap(), doc.editor.clone())
+        });
+        cx.update_window(handle, |_, window, cx| {
+            window.focus(&live.read(cx).focus.clone(), cx);
+            live.update(cx, |live, _| live.select_for_test(0..5));
+        }).unwrap();
+        draw(cx, handle);
+        // A right-click elsewhere must still format the selected words.
+        let bounds = cx.update(|cx| live.read(cx).drawn_at_for_test(source.find("Second").unwrap())).unwrap();
+        let position = gpui_kit::point(bounds.left() + px(4.), bounds.top() + px(4.));
+        let right_click = |cx: &mut TestAppContext| {
+            let mut visual = gpui_kit::VisualTestContext::from_window(handle, cx);
+            visual.simulate_event(gpui_kit::MouseDownEvent {
+                position,
+                button: gpui_kit::MouseButton::Right,
+                modifiers: gpui_kit::Modifiers::none(),
+                click_count: 1,
+                first_mouse: false,
+            });
+            draw(cx, handle);
+        };
+        right_click(cx);
+        assert!(cx.update(|cx| live.read(cx).actions_for_test()).is_some());
+        let buttons = cx.update(|cx| live.read(cx).buttons_for_test());
+        assert!(buttons.iter().any(|(label, _)| label == "Bold"));
+        assert!(buttons.iter().any(|(label, _)| label == "Underline"));
+        assert!(cx.update_window(handle, |_, window, cx| live.read(cx).selection_drawn_for_test(window)).unwrap());
+        cx.update_window(handle, |_, window, cx| live.update(cx, |live, cx| live.press_for_test("Bold", window, cx))).unwrap();
+        draw(cx, handle);
+        assert_eq!(cx.update(|cx| editor.read(cx).value().to_string()), "**First** words.\n\nSecond paragraph.\n");
+        cx.simulate_keystrokes(handle, "escape");
+        draw(cx, handle);
+        // With no selection, right-click places the caret in the clicked line.
+        cx.update(|cx| live.update(cx, |live, _| live.set_caret_for_test(0)));
+        right_click(cx);
+        assert!(cx.update(|cx| live.read(cx).actions_for_test()).is_some());
+        assert!(cx.update(|cx| live.read(cx).caret_for_test()).unwrap() >= "**First** words.\n\n".len());
+    }
+
+    #[gpui_kit::test]
     fn live_preview_formatting_buttons_know_html_marks(cx: &mut TestAppContext) {
         cx.update(|cx| {
             gpui_kit::init(cx);
@@ -7140,6 +7365,150 @@ mod transition_tests {
         });
         let (top, height) = (view.top(), view.size.height);
         assert!(caret > top + height * 0.15 && caret < top + height * 0.85, "caret {caret:?} in {view:?}");
+    }
+
+    #[gpui_kit::test]
+    #[ignore]
+    fn timing_a_large_live_page(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            bind_view_keys(cx);
+            crate::live::init(cx);
+            crate::settings::init(cx);
+        });
+        let unit = "# Heading\n\nSome **bold** and *italic* text with a [link](https://x.y) and `code`.\n\n- [ ] a task\n- item two\n\n> a quote\n\n| a | b |\n|---|---|\n| 1 | 2 |\n\n```rust\nfn main() {}\n```\n\n";
+        let kb: usize = std::env::var("ENSO_KB").ok().and_then(|v| v.parse().ok()).unwrap_or(256);
+        let source = unit.repeat(kb * 1024 / unit.len());
+        let (handle, view) = cx.update(|cx| gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+            cx.new(|cx| {
+                let mut app = Enso::new(window, cx);
+                app.add_document(Some(PathBuf::from("big.md")), source.clone().into(), None, window, cx);
+                app
+            })
+        }).unwrap());
+        let started = std::time::Instant::now();
+        draw(cx, handle);
+        eprintln!("{kb} KB: first draw {:?}", started.elapsed());
+        let started = std::time::Instant::now();
+        draw(cx, handle);
+        eprintln!("{kb} KB: next draw {:?}", started.elapsed());
+        let live = cx.update(|cx| view.read(cx).documents[0].live.clone());
+        eprintln!("live page: {}", live.is_some());
+        let live = live.unwrap();
+        for _ in 0..2 {
+            let started = std::time::Instant::now();
+            cx.update_window(handle, |_, window, cx| live.update(cx, |live, cx| live.toggle_task_for_test(2, window, cx))).unwrap();
+            draw(cx, handle);
+            eprintln!("{kb} KB: checkbox edit and draw {:?}", started.elapsed());
+        }
+        assert_eq!(cx.update(|cx| view.read(cx).documents[0].editor.read(cx).value().to_string()), source);
+    }
+
+    #[gpui_kit::test]
+    fn long_live_pages_keep_the_visible_block_through_edits_and_layout_changes(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            bind_view_keys(cx);
+            crate::live::init(cx);
+            crate::settings::init(cx);
+        });
+        let mut source = String::new();
+        for n in 0..600 {
+            source.push_str(&format!("Paragraph {n:04}. {}\n\n", "Some text to wrap. ".repeat(n % 7 + 1)));
+        }
+        let (handle, view) = cx.update(|cx| gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+            cx.new(|cx| {
+                let mut app = Enso::new(window, cx);
+                app.add_document(Some(PathBuf::from("heights.md")), source.clone(), None, window, cx);
+                app
+            })
+        }).unwrap());
+        let settle = |cx: &mut TestAppContext| { for _ in 0..5 { draw(cx, handle); } };
+        settle(cx);
+        let (live, editor) = cx.update(|cx| {
+            let doc = &view.read(cx).documents[0];
+            (doc.live.clone().unwrap(), doc.editor.clone())
+        });
+        let target = source.find("Paragraph 0448.").unwrap();
+        assert!(!cx.update(|cx| view.read(cx).documents[0].preview_loaded), "the live page must not build a duplicate classic preview");
+        cx.update(|cx| live.update(cx, |live, cx| live.reveal_source(target, cx)));
+        settle(cx);
+        let original = cx.update(|cx| live.read(cx).drawn_at_for_test(target)).unwrap();
+        let prefix = "# Inserted Above\n\n".repeat(50);
+        for value in [format!("{prefix}{source}"), source.clone(), source.replacen("Some text to wrap.", &"Changed above. ".repeat(100), 1)] {
+            let target = value.find("Paragraph 0448.").unwrap();
+            cx.update_window(handle, |_, window, cx| editor.update(cx, |editor, cx| editor.set_value(value, window, cx))).unwrap();
+            settle(cx);
+            let bounds = cx.update(|cx| live.read(cx).drawn_at_for_test(target)).expect("the reading position stays drawn");
+            assert!((bounds.top() - original.top()).abs() < px(2.), "{bounds:?} shifted from {original:?}");
+        }
+        // New font metrics and wrapping must replace old measurements, while
+        // retaining the same part of the note in view.
+        let first = cx.update(|cx| live.read(cx).first_visible_for_test()).unwrap();
+        cx.update(|cx| crate::typography::set(crate::typography::ReadingStyle {
+            font: crate::typography::ReadingFont::Mono, size: 24,
+        }, false, cx).unwrap());
+        settle(cx);
+        let target = cx.update(|cx| editor.read(cx).value().find("Paragraph 0448.").unwrap());
+        let zoomed = cx.update(|cx| live.read(cx).drawn_at_for_test(target)).expect("zoom preserves the reading position");
+        assert!(zoomed.size.height > original.size.height);
+        cx.simulate_window_resize(handle, size(px(520.), px(700.)));
+        settle(cx);
+        let bounds = cx.update(|cx| live.read(cx).drawn_at_for_test(first)).expect("resize preserves the reading position");
+        let viewport = cx.update(|cx| live.read(cx).view_for_test());
+        assert!(bounds.top() < viewport.bottom() && bounds.bottom() > viewport.top(), "{bounds:?} outside {viewport:?}");
+        // Split can request navigation immediately after an editor change,
+        // before a frame has rebuilt the cache for the changed source.
+        let value = cx.update(|cx| format!("# Added Before A Jump\n\n{}", editor.read(cx).value()));
+        let target = value.find("Paragraph 0200.").unwrap();
+        cx.update_window(handle, |_, window, cx| {
+            editor.update(cx, |editor, cx| editor.set_value(value, window, cx));
+            live.update(cx, |live, cx| live.reveal_source(target, cx));
+        }).unwrap();
+        settle(cx);
+        let bounds = cx.update(|cx| live.read(cx).drawn_at_for_test(target)).expect("an immediate jump uses the rebuilt cache");
+        assert!(bounds.top() >= viewport.top() && bounds.top() + px(30.) < viewport.bottom(), "the target line in {bounds:?} outside {viewport:?}");
+    }
+
+    #[gpui_kit::test]
+    fn a_long_page_draws_what_is_near_the_screen(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            bind_view_keys(cx);
+            crate::live::init(cx);
+            crate::settings::init(cx);
+        });
+        let mut source = String::new();
+        for n in 0..1500 {
+            source.push_str(&format!("Paragraph {n} of a long note.\n\n"));
+        }
+        let (handle, view) = cx.update(|cx| gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+            cx.new(|cx| {
+                let mut app = Enso::new(window, cx);
+                app.add_document(Some(PathBuf::from("long-page.md")), source.clone().into(), None, window, cx);
+                app
+            })
+        }).unwrap());
+        for _ in 0..3 { draw(cx, handle); cx.run_until_parked(); }
+        let live = cx.update(|cx| view.read(cx).documents[0].live.clone().unwrap());
+        let near = source.find("Paragraph 3 ").unwrap();
+        let far = source.find("Paragraph 1400 ").unwrap();
+        // The top is drawn; far below isn't.
+        assert!(cx.update(|cx| live.read(cx).drawn_at_for_test(near)).is_some());
+        assert!(cx.update(|cx| live.read(cx).drawn_at_for_test(far)).is_none());
+        // Brought into view (Find, the outline, Split): it's drawn, on screen.
+        cx.update(|cx| live.update(cx, |live, cx| live.reveal_source(far, cx)));
+        for _ in 0..3 { draw(cx, handle); cx.run_until_parked(); }
+        let bounds = cx.update(|cx| live.read(cx).drawn_at_for_test(far)).expect("drawn once brought into view");
+        let view_bounds = cx.update(|cx| live.read(cx).view_for_test());
+        assert!(bounds.top() >= view_bounds.top() && bounds.bottom() <= view_bounds.bottom(), "{bounds:?} in {view_bounds:?}");
+        assert!(cx.update(|cx| live.read(cx).drawn_at_for_test(near)).is_none());
+        // Find returns to an unmounted block with one jump too.
+        cx.update(|cx| live.update(cx, |live, cx| live.show_found(vec![near..near + 9], Some(0), cx)));
+        for _ in 0..3 { draw(cx, handle); cx.run_until_parked(); }
+        let bounds = cx.update(|cx| live.read(cx).drawn_at_for_test(near)).expect("Find draws the target");
+        assert!(bounds.top() >= view_bounds.top() && bounds.bottom() <= view_bounds.bottom(), "{bounds:?} in {view_bounds:?}");
+        assert!(cx.update(|cx| live.read(cx).drawn_at_for_test(far)).is_none());
     }
 
     #[gpui_kit::test]
@@ -8576,6 +8945,7 @@ mod transition_tests {
 
     #[gpui_kit::test]
     fn only_recently_viewed_documents_keep_a_preview(cx: &mut TestAppContext) {
+        crate::use_classic_reader_for_test();
         cx.update(|cx| gpui_kit::init(cx));
         let (handle, view) = cx.update(|cx| {
             gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {

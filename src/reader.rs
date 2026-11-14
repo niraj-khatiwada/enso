@@ -6,7 +6,9 @@ use std::{ops::Range, path::PathBuf, sync::Arc};
 
 const SECTION_BYTES: usize = 2048;
 const EXTENSION_BYTES: usize = 16 * 1024;
-pub const LARGE_DOCUMENT_BYTES: usize = 256 * 1024;
+/// Notes below 1 MiB use the editable live page; larger notes use the
+/// section-based reader to keep opening and scrolling bounded.
+pub const LARGE_DOCUMENT_BYTES: usize = 1024 * 1024;
 /// Where text starts in the reading view, matching where GPUI Kit's editor
 /// draws it with line numbers off (6 px padding + 6 px gutter margin across,
 /// 8 px padding down), so switching between Read and Edit doesn't move it.

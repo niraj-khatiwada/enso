@@ -96,6 +96,12 @@ Click a link in View to open its note. **Linked from** at the end of a note list
 
 Link indexing and repairs run in the background. The index retains destinations and byte ranges, reparses only changed notes, and uses reverse references to find affected files. Large closed notes are rewritten through a temporary file without constructing a second full copy in memory.
 
+### Diagnostic logs
+
+Settings → About → **Show Log Files** opens the local diagnostic logs. On macOS these are in `~/Library/Logs/enso/`; on Windows, `%LOCALAPPDATA%\enso\`; on Linux, `${XDG_STATE_HOME:-~/.local/state}/enso/`.
+
+Logs record startup and shutdown, opening and closing notes, view changes, saves, external file conflicts, and errors. Routine records contain paths, sizes, and timings rather than note bodies or keystrokes. Rust panics have separate reports with their location and backtrace. Timestamps are UTC. Rotation retains five app logs and two panic logs, each limited to about 2 MiB.
+
 ### FAQs
 <details>
 <summary>

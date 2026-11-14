@@ -26,6 +26,21 @@ Features:
 - Cmd/Ctrl + = and − make the reading text larger and smaller, as the ⋯ menu's size slider does; Cmd/Ctrl + 0 resets it.
 - Find (Cmd/Ctrl + F) highlights its matches on the page in View and scrolls to each; a search result opened flashes its match there; and a heading picked in the outline puts the caret on it.
 
+Enhancements:
+
+- Long live pages render nearby blocks, retaining their position through edits, zoom, font changes and window resizing. Checkbox toggles update their state without reparsing the whole note.
+- Live editing supports notes below 1 MiB. Larger notes use the bounded reader, with a muted “Live edit is off” label beside the word count and a tooltip directing you to Edit or Split.
+- Right-click opens the same formatting actions as Cmd/Ctrl + / while preserving selected text.
+- Live View no longer builds an unused classic preview alongside the editable page.
+- Rotating local diagnostic logs record important file operations, errors and Rust panics with backtraces. Open them through Settings → About → Show Log Files.
+
+Fixes:
+
+- Fixed jumps to off-screen blocks on virtualized pages and navigation immediately after source edits.
+- Preserved Markdown context for reference links, footnotes, raw HTML, loose lists and code fences when parsing long notes.
+- Fixed a tab-close crash caused by overlapping parsed block ranges.
+- Fixed opening large notes containing tables before their source editor was loaded.
+
 ### 1.2.0
 
 Features:

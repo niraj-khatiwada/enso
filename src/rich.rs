@@ -345,8 +345,8 @@ pub(crate) fn decorate_mapped(
                     .iter()
                     .find(|doc| doc.editor.entity_id() == editor_id && !doc.locked)
                     .and_then(|doc| {
-                        let slice = doc.editor.read(cx).text().try_slice(range).ok()?;
-                        EditableTable::parse(&slice.to_string())
+                        let source = doc.source_slice(range, cx)?;
+                        EditableTable::parse(&source)
                     })
                     .is_some()
             });
